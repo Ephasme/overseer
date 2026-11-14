@@ -5,6 +5,7 @@ use crate::fleet::{self, Event, Fleet};
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use crate::tools;
+use crate::version;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -24,7 +25,7 @@ pub(crate) fn run(
     ui: Sender<UiEvent>,
 ) {
     let debug = std::env::var_os(config::DEBUG).is_some();
-    let _ = ui.send(UiEvent::Notice(format!("worker logs in {}", log_dir.display())));
+    let _ = ui.send(UiEvent::Notice(format!("{} · worker logs in {}", version::VERSION, log_dir.display())));
     let mut fleet = Fleet::new(Arc::clone(&llm), cfg.roots.clone(), cfg.home.clone(), log_dir, input);
     // The overseer's calls stream into the transcript; the fleet keeps the raw client so worker
     // output does not also arrive as overseer text.

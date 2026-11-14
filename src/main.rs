@@ -10,6 +10,7 @@ mod secrets;
 mod session;
 mod tools;
 mod tui;
+mod version;
 
 use anyhow::{Context, Result};
 use event::UiEvent;
