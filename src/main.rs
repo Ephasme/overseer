@@ -7,6 +7,7 @@ mod llm;
 mod mcp;
 mod names;
 mod plain;
+mod profiles;
 mod prompt;
 mod repos;
 mod secrets;

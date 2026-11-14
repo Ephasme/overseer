@@ -43,6 +43,7 @@
 | `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
 | `src/slash.rs` | the slash-command table the composer's completion popup reads |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
+| `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in orchestrator, and the text `profile://` reads |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
@@ -60,6 +61,8 @@
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
 - `Control::set_policy` has exactly one caller, `Swarm::spawn`, before the thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- The root agent always runs the built-in `orchestrator` profile; a `~/.overseer/agent/profiles/orchestrator.md` replaces its text, model and effort, never its role.
+- A profile can only tighten: its rights merge through `Policy::inherit`, so `spawn_agent` arguments can add restrictions but never take one back.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
