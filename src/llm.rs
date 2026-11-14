@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{env, time::Duration};
+use std::time::Duration;
 
 /// One chat message in the chat-completions wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,8 +38,11 @@ pub(crate) struct ToolCall {
     pub(crate) function: FunctionCall,
 }
 
+/// The only tool-call type the chat-completions API defines.
+const FUNCTION_KIND: &str = "function";
+
 fn function_kind() -> String {
-    "function".into()
+    FUNCTION_KIND.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,20 +63,21 @@ pub(crate) struct OpenAiClient {
     base_url: String,
     api_key: String,
     model: String,
+    verbose: bool,
 }
 
 impl OpenAiClient {
-    pub(crate) fn new(base_url: &str, api_key: String, model: String) -> Result<Self> {
+    pub(crate) fn new(base_url: &str, api_key: String, model: String, verbose: bool) -> Result<Self> {
         // reqwest's 30 s default is shorter than a long model answer.
         let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
-        Ok(Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model })
+        Ok(Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, verbose })
     }
 }
 
 impl Llm for OpenAiClient {
     fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
         let payload = json!({ "model": self.model, "messages": messages, "tools": tools });
-        if env::var_os("OVERSEER_DEBUG").is_some() {
+        if self.verbose {
             eprintln!("request: {payload}");
         }
         let response = self
@@ -116,7 +120,7 @@ pub(crate) mod testing {
     pub(crate) fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
         ToolCall {
             id: id.into(),
-            kind: "function".into(),
+            kind: FUNCTION_KIND.into(),
             function: FunctionCall { name: name.into(), arguments: args.to_string() },
         }
     }

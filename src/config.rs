@@ -17,55 +17,44 @@ struct RawConfig {
 
 #[derive(Debug)]
 pub(crate) struct Config {
-    /// Canonical directories under which workers may operate.
+    /// Directories scanned for repositories by `list_repos` and listed in the overseer prompt; not a sandbox.
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) base_url: String,
     pub(crate) model: String,
+    /// Resolved once at startup, so no later call re-reads the environment.
+    pub(crate) home: PathBuf,
 }
 
-pub(crate) fn path() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("overseer/config.toml")
+/// The user's home directory; an unset or empty `HOME` is an error, not a relative path.
+pub(crate) fn home() -> Result<PathBuf> {
+    env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from).context("HOME is not set")
 }
 
-pub(crate) fn state_dir() -> PathBuf {
-    xdg("XDG_STATE_HOME", ".local/state").join("overseer")
+pub(crate) fn path(home: &Path) -> PathBuf {
+    xdg("XDG_CONFIG_HOME", ".config", home).join("overseer/config.toml")
 }
 
-fn home() -> PathBuf {
-    env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from)
+pub(crate) fn state_dir(home: &Path) -> PathBuf {
+    xdg("XDG_STATE_HOME", ".local/state", home).join("overseer")
 }
 
-fn xdg(var: &str, fallback: &str) -> PathBuf {
-    env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home().join(fallback), PathBuf::from)
+/// The `<path>: <os error>` shape every tool, log and path error uses.
+pub(crate) fn io_error(path: impl std::fmt::Display, e: &std::io::Error) -> String {
+    format!("{path}: {e}")
 }
 
-pub(crate) fn load(path: &Path) -> Result<Config> {
-    let text = fs::read_to_string(path)
+/// Environment variable that echoes model requests and tool results to stderr.
+pub(crate) const DEBUG: &str = "OVERSEER_DEBUG";
+
+fn xdg(var: &str, fallback: &str, home: &Path) -> PathBuf {
+    env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(fallback), PathBuf::from)
+}
+
+pub(crate) fn load(home: &Path) -> Result<Config> {
+    let path = path(home);
+    let text = fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}; create it with:\n{EXAMPLE}", path.display()))?;
-    parse(&text, &home()).with_context(|| format!("invalid config {}", path.display()))
-}
-
-/// `OVERSEER_API_KEY` from the environment, else from `~/.config/overseer/.env`.
-pub(crate) fn api_key() -> Result<String> {
-    if let Some(key) = env_var("OVERSEER_API_KEY") {
-        return Ok(key);
-    }
-    let path = path().with_file_name(".env");
-    let context = || format!("OVERSEER_API_KEY is not set; set it in the environment or in {}", path.display());
-    if !path.exists() {
-        return Err(anyhow::Error::msg(context()));
-    }
-    for item in dotenvy::from_path_iter(&path).with_context(|| format!("reading {}", path.display()))? {
-        let (key, value) = item.with_context(|| format!("reading {}", path.display()))?;
-        if key == "OVERSEER_API_KEY" && !value.trim().is_empty() {
-            return Ok(value.trim().to_string());
-        }
-    }
-    Err(anyhow::Error::msg(context()))
-}
-
-fn env_var(name: &str) -> Option<String> {
-    env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    parse(&text, home).with_context(|| format!("invalid config {}", path.display()))
 }
 
 fn parse(text: &str, home: &Path) -> Result<Config> {
@@ -82,7 +71,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         }
         roots.push(canonical);
     }
-    Ok(Config { roots, base_url: raw.base_url, model: raw.model })
+    Ok(Config { roots, base_url: raw.base_url, model: raw.model, home: home.to_path_buf() })
 }
 
 fn expand_home(path: &str, home: &Path) -> PathBuf {
@@ -94,9 +83,9 @@ fn expand_home(path: &str, home: &Path) -> PathBuf {
 }
 
 /// Canonical directory a worker works in, or why the path is unusable.
-pub(crate) fn resolve_dir(path: &str) -> Result<PathBuf, String> {
-    let expanded = expand_home(path, &home());
-    let canonical = fs::canonicalize(&expanded).map_err(|e| format!("{}: {e}", expanded.display()))?;
+pub(crate) fn resolve_dir(path: &str, home: &Path) -> Result<PathBuf, String> {
+    let expanded = expand_home(path, home);
+    let canonical = fs::canonicalize(&expanded).map_err(|e| io_error(expanded.display(), &e))?;
     if !canonical.is_dir() {
         return Err(format!("{} is not a directory", canonical.display()));
     }
@@ -115,6 +104,7 @@ mod tests {
         assert_eq!(config.roots, [fs::canonicalize(home.path().join("code")).unwrap()]);
         assert_eq!(config.base_url, "https://api.openai.com/v1");
         assert_eq!(config.model, "gpt-4.1");
+        assert_eq!(config.home, home.path());
     }
 
     #[test]
@@ -137,12 +127,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("file");
         fs::write(&file, "").unwrap();
-        assert_eq!(resolve_dir(dir.path().to_str().unwrap()).unwrap(), fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(
+            resolve_dir(dir.path().to_str().unwrap(), dir.path()).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
         let canonical = fs::canonicalize(&file).unwrap();
         assert_eq!(
-            resolve_dir(file.to_str().unwrap()).unwrap_err(),
+            resolve_dir(file.to_str().unwrap(), dir.path()).unwrap_err(),
             format!("{} is not a directory", canonical.display())
         );
-        assert!(resolve_dir("/nonexistent/overseer").unwrap_err().starts_with("/nonexistent/overseer:"));
+        assert!(resolve_dir("/nonexistent/overseer", dir.path()).unwrap_err().starts_with("/nonexistent/overseer:"));
+    }
+
+    #[test]
+    fn resolve_dir_expands_home_against_the_given_home() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join("code")).unwrap();
+        assert_eq!(resolve_dir("~/code", home.path()).unwrap(), fs::canonicalize(home.path().join("code")).unwrap());
     }
 }

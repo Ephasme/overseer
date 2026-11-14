@@ -1,6 +1,6 @@
 # overseer
 
-A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it spawns, messages and lists workers, and reads the list of git repositories already sitting under the directories you configure, which starts it with its fleet inventory and refills it through `list_repos`. Each worker starts in one existing repository under those directories, with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
+A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it spawns, messages and lists workers, and reads the list of git repositories already sitting under the directories you configure, which starts it with its fleet inventory and refills it through `list_repos`. Each worker starts in an existing directory you name — the overseer picks one of the repositories listed under those roots — with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
 
 ## Install
 
@@ -15,7 +15,7 @@ Prebuilt for macOS (Apple silicon and Intel) and Linux (x86_64). From source: `c
 `~/.config/overseer/config.toml`:
 
 ```toml
-roots = ["~/code"]                    # each worker starts in an existing repository under one of these
+roots = ["~/code"]                    # repositories under these are listed for the overseer; not a sandbox
 base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions endpoint
 model = "gpt-4.1"
 ```
