@@ -24,14 +24,19 @@
 
 | Path | Contents |
 |------|----------|
-| `src/main.rs` | event loop: stdin and worker events drive overseer turns |
+| `src/main.rs` | picks the frontend, creates both channels, starts the session thread |
+| `src/session.rs` | the blocking core loop: one overseer turn per event, reported as `UiEvent`s |
+| `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
+| `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
+| `src/tui/mod.rs` | terminal lifecycle, the event loop, key bindings |
+| `src/tui/app.rs` | transcript entries, composer, worker panel, status line, wrapping |
 | `src/fleet.rs` | worker registry, worker threads, worker events, overseer tool dispatch |
 | `src/prompt.rs` | both system prompts, tool schemas, tool-name constants, `DEFAULT_WORKDIR` |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop shared by overseer and workers |
 | `src/tools.rs` | worker tools `bash`, `read_file`, `write_file` |
-| `src/llm.rs` | chat-completions wire types, HTTP client, `testing::Scripted` model double |
+| `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
 | `src/config.rs` | `config.toml`, roots, `home`, `resolve_dir`, state directory, `io_error` |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
 | `.github/scripts/update-formula.sh` | rewrites the tap's formula from a release |
@@ -45,6 +50,8 @@
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - A worker's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
-- Worker tool calls emit `Event::Progress` (start, then elapsed); `main` prints those to stderr and does not wake the overseer model with them.
+- The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
+- Worker model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the worker panel and the core never feeds back to the overseer.
+- Worker tool calls emit `Event::Progress` (start, then elapsed); it wakes nothing.
 - Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.

@@ -32,7 +32,19 @@ OVERSEER_API_KEY=...
 overseer
 ```
 
-Talk to the overseer on stdin; `/resume <id>` re-tasks a worker without spending a model call. Worker reports wake the overseer on their own, and every worker tool call prints to stderr as `[worker N]` when it starts and with its duration when it returns. A worker's `bash` command is killed after 300 seconds. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it. `exit` quits at once; Ctrl-D quits once no worker is busy.
+On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Overseer answers stream in as they are generated, and each worker's live output shows under its row in the panel. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
+
+|Key|Effect|
+|---|---|
+|enter|send the prompt|
+|ctrl+j|new line in the prompt|
+|PageUp / PageDown|scroll the transcript; End follows new output again|
+|F2|hide or show the worker panel|
+|ctrl+p / ctrl+n|recall the previous or next prompt|
+|ctrl+d|quit once no worker is busy|
+|ctrl+c|quit now|
+
+With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, worker activity and tool calls on stderr. Either way, worker reports wake the overseer on their own. A worker's `bash` command is killed after 300 seconds. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it.
 
 ## Release
 
