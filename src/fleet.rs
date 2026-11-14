@@ -2,8 +2,10 @@ use crate::agent::Turn;
 use crate::config;
 use crate::conflict;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
+use crate::mcp;
 use crate::prompt;
 use crate::repos;
+use crate::skills;
 use crate::tools;
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -258,6 +260,10 @@ pub(crate) enum Event {
     Resume(String),
     /// User typed `/schemes`: which internal URIs resolve, without a model call.
     Schemes,
+    /// User typed `/mcp`: the server list, handled without a model call.
+    Mcp,
+    /// User typed `/login <server>`: the argument, handled without a model call.
+    Login(String),
     Worker {
         id: usize,
         kind: WorkerEvent,
@@ -291,6 +297,12 @@ impl Event {
         }
         if let Some(arg) = line.strip_prefix("/resume") {
             return Some(Event::Resume(arg.to_string()));
+        }
+        if line == "/mcp" {
+            return Some(Event::Mcp);
+        }
+        if let Some(arg) = line.strip_prefix("/login") {
+            return Some(Event::Login(arg.trim().to_string()));
         }
         Some(Event::User(line.to_string()))
     }
@@ -407,6 +419,8 @@ pub(crate) struct Fleet {
     log_dir: PathBuf,
     sender: Sender<Event>,
     workers: Vec<Worker>,
+    /// Every worker shares the servers the process connected; a late one reaches the next turn.
+    mcp: Arc<mcp::Registry>,
 }
 
 impl Fleet {
@@ -416,8 +430,9 @@ impl Fleet {
         home: PathBuf,
         log_dir: PathBuf,
         sender: Sender<Event>,
+        mcp: Arc<mcp::Registry>,
     ) -> Self {
-        Self { llm, roots, home, log_dir, sender, workers: Vec::new() }
+        Self { llm, roots, home, log_dir, sender, workers: Vec::new(), mcp }
     }
 
     /// The roster as the frontends draw it.
@@ -551,11 +566,15 @@ impl Fleet {
             }),
         ));
         let worker_dir = working_dir.to_path_buf();
+        let home = self.home.clone();
+        let mcp = Arc::clone(&self.mcp);
         let handle = thread::spawn(move || {
             let mut log = log;
             let mut run = WorkerRun {
                 id,
                 working_dir: &worker_dir,
+                home: &home,
+                mcp: mcp.as_ref(),
                 sender: &sender,
                 log: &mut log,
                 calls: 0,
@@ -749,6 +768,9 @@ fn resume_id(arg: &str) -> Result<usize, String> {
 struct WorkerRun<'a> {
     id: usize,
     working_dir: &'a Path,
+    /// The user's home, where the user-wide skill roots live.
+    home: &'a Path,
+    mcp: &'a mcp::Registry,
     sender: &'a Sender<Event>,
     log: &'a mut File,
     control: &'a Control,
@@ -762,7 +784,9 @@ impl WorkerRun<'_> {
     /// Runs every instruction the worker receives until Overseer stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let tool_defs = prompt::worker_tool_definitions();
+        let mcp = self.mcp;
+        // Discovered once per worker: a skill installed mid-session needs a new worker.
+        let skills = skills::Catalogue::in_dir(self.home, self.working_dir);
         let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the worker.
         while let Some(input) = control.next(instructions) {
@@ -771,18 +795,22 @@ impl WorkerRun<'_> {
                 history.clear();
             }
             // The prompt carries the restrictions, so a policy changed between turns reaches the model.
-            let prompt = prompt::worker_prompt(self.working_dir, &control.policy());
+            let policy = control.policy();
+            let prompt = prompt::worker_prompt(self.working_dir, &policy, &skills, mcp);
             if let Some(first) = history.first_mut() {
                 first.content = Some(prompt);
             } else {
                 history.push(Message::system(prompt));
             }
+            // Rebuilt per instruction: a server that connected after this worker started must reach it.
+            let tool_defs = prompt::worker_tool_definitions(mcp, &policy);
             let _ = writeln!(self.log, "> {input}");
             let result = {
+                let context = tools::Context { skills: &skills, mcp };
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
-                    execute: &mut |call: &ToolCall| self.execute(call, control),
+                    execute: &mut |call: &ToolCall| self.execute(call, control, &context),
                     cancel: Some(control.flag()),
                 };
                 turn.run(&mut history, &input)
@@ -800,7 +828,7 @@ impl WorkerRun<'_> {
     }
 
     /// Runs one tool call under the worker's policy, logging it and reporting its progress to the user.
-    fn execute(&mut self, call: &ToolCall, control: &Control) -> String {
+    fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
         let _ = writeln!(self.log, "· {} {}", call.function.name, call.function.arguments);
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
@@ -833,6 +861,7 @@ impl WorkerRun<'_> {
                 &policy,
                 Some(control.flag()),
                 &mut self.conflicts,
+                context,
             )
         };
         let _ = writeln!(self.log, "{output}");
@@ -902,7 +931,8 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let (sender, queue) = mpsc::channel();
         let roots = vec![fs::canonicalize(root.path()).unwrap()];
-        let fleet = Fleet::new(llm, roots, root.path().to_path_buf(), logs.path().to_path_buf(), sender);
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let fleet = Fleet::new(llm, roots, root.path().to_path_buf(), logs.path().to_path_buf(), sender, mcp);
         Harness { fleet, queue, repo, logs, root }
     }
 
@@ -992,19 +1022,24 @@ mod tests {
         let h = harness(vec![]);
         fs::create_dir(h.repo.join(".git")).unwrap();
         let roots = vec![fs::canonicalize(h.root.path()).unwrap()];
-        let rendered = prompt::overseer_prompt(&roots);
+        let skills = skills::Catalogue::user(h.root.path());
+        let mcp = mcp::Registry::load(h.root.path());
+        let rendered = prompt::overseer_prompt(&roots, &skills, &mcp);
         assert!(rendered.contains(&fs::canonicalize(&h.repo).unwrap().display().to_string()), "{rendered}");
     }
 
     #[test]
     fn prompts_render_every_tool_from_its_definitions() {
-        let rendered = prompt::overseer_prompt(&[]);
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let rendered = prompt::overseer_prompt(&[], &skills, &mcp);
         for tool in prompt::overseer_tool_definitions().as_array().unwrap() {
             let name = tool.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             assert!(rendered.contains(name), "{name} missing from the overseer prompt");
         }
-        let rendered = prompt::worker_prompt(Path::new("/tmp"), &tools::Policy::default());
-        for tool in prompt::worker_tool_definitions().as_array().unwrap() {
+        let rendered = prompt::worker_prompt(Path::new("/tmp"), &tools::Policy::default(), &skills, &mcp);
+        for tool in prompt::worker_tool_definitions(&mcp, &tools::Policy::default()).as_array().unwrap() {
             let name = tool.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             assert!(rendered.contains(name), "{name} missing from the worker prompt");
         }

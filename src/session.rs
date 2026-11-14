@@ -3,7 +3,9 @@ use crate::config;
 use crate::event::UiEvent;
 use crate::fleet::{self, Event, Fleet};
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
+use crate::mcp;
 use crate::prompt;
+use crate::skills;
 use crate::tools;
 use crate::url;
 use crate::version;
@@ -24,10 +26,13 @@ pub(crate) fn run(
     input: Sender<Event>,
     events: Receiver<Event>,
     ui: Sender<UiEvent>,
+    mcp: Arc<mcp::Registry>,
 ) {
     let debug = std::env::var_os(config::DEBUG).is_some();
     let _ = ui.send(UiEvent::Notice(format!("{} · worker logs in {}", version::VERSION, log_dir.display())));
-    let mut fleet = Fleet::new(Arc::clone(&llm), cfg.roots.clone(), cfg.home.clone(), log_dir, input);
+    let mut fleet = Fleet::new(Arc::clone(&llm), cfg.roots.clone(), cfg.home.clone(), log_dir, input, Arc::clone(&mcp));
+    // The skills the overseer can name in a task; a worker discovers its own, project roots included.
+    let skills = skills::Catalogue::user(&cfg.home);
     // The overseer's calls stream into the transcript; the fleet keeps the raw client so worker
     // output does not also arrive as overseer text.
     let stream_ui = ui.clone();
@@ -41,7 +46,7 @@ pub(crate) fn run(
             let _ = stream_ui.send(event);
         }),
     ));
-    let mut history = vec![Message::system(prompt::overseer_prompt(&cfg.roots))];
+    let mut history = vec![Message::system(prompt::overseer_prompt(&cfg.roots, &skills, &mcp))];
     let tool_defs = prompt::overseer_tool_definitions();
     let mut draining = false;
     let mut tool_id = 0_usize;
@@ -55,6 +60,22 @@ pub(crate) fn run(
                     continue;
                 }
                 break;
+            }
+            Event::Mcp => {
+                let _ = ui.send(UiEvent::Notice(mcp.summary()));
+                continue;
+            }
+            Event::Login(arg) => {
+                let line = if arg.is_empty() {
+                    "usage: /login <server>".to_string()
+                } else {
+                    let notice = ui.clone();
+                    mcp.login(&arg, &|url| {
+                        let _ = notice.send(UiEvent::Notice(format!("open this URL to sign in: {url}")));
+                    })
+                };
+                let _ = ui.send(UiEvent::Notice(line));
+                continue;
             }
             Event::Resume(arg) => {
                 let line = fleet.resume(&arg);
@@ -122,7 +143,8 @@ pub(crate) fn run(
             break;
         }
     }
-    // Quitting must not leave a worker's `cargo build` running without its owner.
+    // Quitting must not leave a worker's `cargo build` running without its owner, nor an MCP server.
     tools::kill_running();
+    mcp.kill_all();
     let _ = ui.send(UiEvent::Done);
 }

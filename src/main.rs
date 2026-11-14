@@ -5,11 +5,13 @@ mod conflict;
 mod event;
 mod fleet;
 mod llm;
+mod mcp;
 mod plain;
 mod prompt;
 mod repos;
 mod secrets;
 mod session;
+mod skills;
 mod tools;
 mod tui;
 mod url;
@@ -44,12 +46,14 @@ fn main() -> Result<()> {
     };
     let llm: Arc<dyn llm::Llm> = Arc::new(llm::OpenAiClient::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
 
+    // Started before the core loop: a server that is slow to connect must not delay startup.
+    let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
     let session_input = input_tx.clone();
     let stop = input_tx.clone();
     let model = cfg.model.clone();
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
-    let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx));
+    let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx, mcp));
 
     let frontend = if tui_available() {
         tui::run(ui_rx, input_tx, &model, theme)
