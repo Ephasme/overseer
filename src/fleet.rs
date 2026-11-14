@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Instant;
 
 /// Arguments of each overseer tool. `deny_unknown_fields` turns a wrong key into an error naming the right ones.
 #[derive(Deserialize)]
@@ -55,11 +56,33 @@ pub(crate) enum Event {
     Exit,
     /// Stdin closed: quit once no worker is busy.
     Eof,
+    /// User typed `/resume <id>`: the argument, handled without a model call.
+    Resume(String),
     Worker {
         id: usize,
         kind: WorkerEvent,
         text: String,
     },
+    /// Worker tool activity: shown to the user, never fed to the overseer model.
+    Progress {
+        id: usize,
+        text: String,
+    },
+}
+
+/// Sends a progress line the user sees, without waking the overseer model.
+fn progress(sender: &Sender<Event>, id: usize, text: &str) {
+    let _ = sender.send(Event::Progress { id, text: text.to_string() });
+}
+
+/// First line of a tool's arguments, short enough for one terminal line.
+fn summarise(arguments: &str) -> String {
+    let line = arguments.lines().next().unwrap_or_default();
+    let mut text: String = line.chars().take(100).collect();
+    if line.chars().count() > 100 {
+        text.push('…');
+    }
+    text
 }
 
 struct Worker {
@@ -95,6 +118,31 @@ impl Fleet {
             worker.pending = worker.pending.saturating_sub(1);
             worker.failed = kind == WorkerEvent::Failed;
         }
+    }
+
+    /// Re-tasks a worker with a continue message, clearing a previous failure. Returns the line to print.
+    pub(crate) fn resume(&mut self, arg: &str) -> String {
+        let id = match resume_id(arg) {
+            Ok(id) => id,
+            Err(e) => return format!("error: {e}; worker ids: {}", self.ids()),
+        };
+        match self.message(id, CONTINUE) {
+            Ok(_) => {
+                if let Some(worker) = id.checked_sub(1).and_then(|i| self.workers.get_mut(i)) {
+                    worker.failed = false;
+                }
+                format!("worker {id} resumed")
+            }
+            Err(e) => format!("error: {e}; worker ids: {}", self.ids()),
+        }
+    }
+
+    /// Ids that exist, so an error can name the ones `/resume` accepts.
+    fn ids(&self) -> String {
+        if self.workers.is_empty() {
+            return "none".into();
+        }
+        self.workers.iter().map(|w| w.id.to_string()).collect::<Vec<String>>().join(", ")
     }
 
     /// Runs one overseer tool call; the returned string goes back to the overseer model.
@@ -180,6 +228,19 @@ impl Fleet {
             lines.push(format!("[{total} repositories found; the first {MAX_REPOS} are listed]"));
         }
         lines.join("\n")
+    }
+}
+
+/// Message `/resume` sends: the worker keeps its history, so its task is already in it.
+const CONTINUE: &str = "continue";
+
+/// Reads the one worker id `/resume` takes, or why the argument is unusable.
+fn resume_id(arg: &str) -> Result<usize, String> {
+    let mut parts = arg.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (None, _) => Err("usage: /resume <id>".into()),
+        (Some(id), None) => id.parse::<usize>().map_err(|_| format!("not a worker id: {id}")),
+        (Some(_), Some(_)) => Err(format!("expected one worker id, got: {}", arg.trim())),
     }
 }
 
@@ -270,7 +331,7 @@ Roots you know about:\n{}\n\
 Repositories that exist right now:\n{}\n\
 Delegate every request to a worker, one worker per independent task, and give each worker complete instructions: it sees nothing else.\n\
 Never ask the user for a path, a command output or any other fact a worker could find.\n\
-Reuse an idle worker for follow-ups in the same directory instead of starting another.\n\
+Reuse an idle worker for follow-ups in the same directory instead of starting another. Put a task in the repository listed above when one matches; start a repository hunt only when none does.\n\
 Messages that start with [worker N ...] come from workers, not the user: \"says\" is a progress note or question, \"finished\" carries the worker's final report, \"failed\" an error. \
 Answer a worker question yourself when you can; otherwise ask the user. Report results to the user concisely.",
         tool_section(&overseer_tool_definitions()),
@@ -283,6 +344,7 @@ fn worker_prompt(dir: &Path) -> String {
     format!(
         "You are a worker agent working in the directory {}; relative paths resolve there. Overseer, a coordinator, sends you instructions.\n{}\n\
 Do the work yourself and keep Overseer informed as you go. When you stop calling tools, your final answer is delivered to Overseer, so make it a complete report. \
+Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes. \
 If you need a decision to continue, end your turn with the question as your final answer.",
         dir.display(),
         tool_section(&worker_tool_definitions())
@@ -342,6 +404,11 @@ fn run_worker(
         let result = {
             let mut execute = |call: &ToolCall| {
                 let _ = writeln!(log, "· {} {}", call.function.name, call.function.arguments);
+                let started = Instant::now();
+                let tracked = call.function.name != "reply";
+                if tracked {
+                    progress(sender, id, &format!("{} {}", call.function.name, summarise(&call.function.arguments)));
+                }
                 let output = if call.function.name == "reply" {
                     match reply_text(&call.function.arguments) {
                         Ok(text) => {
@@ -354,6 +421,10 @@ fn run_worker(
                     tools::execute(dir, &call.function.name, &call.function.arguments)
                 };
                 let _ = writeln!(log, "{output}");
+                if tracked {
+                    let secs = started.elapsed().as_secs_f64();
+                    progress(sender, id, &format!("{} done in {secs:.1}s", call.function.name));
+                }
                 output
             };
             agent::run_turn(llm, &mut history, &input, &tool_defs, &mut execute)
@@ -504,5 +575,55 @@ mod tests {
             h.fleet.execute(&tool_call("s", "spawn_worker", &json!({"path": "/nonexistent/x", "task": "x"}))),
             "error: /nonexistent/x: No such file or directory (os error 2)"
         );
+    }
+
+    #[test]
+    fn resume_retasks_an_idle_worker() {
+        let mut h = harness(vec![text("first"), text("second")]);
+        spawn(&mut h.fleet, &h.repo);
+        h.queue.recv_timeout(WAIT).unwrap();
+        h.fleet.record(1, WorkerEvent::Finished);
+        assert_eq!(h.fleet.resume("1"), "worker 1 resumed");
+        assert!(list(&mut h.fleet).starts_with("worker 1 [working]"));
+        let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "second".into() };
+        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), finished);
+    }
+
+    #[test]
+    fn resume_clears_a_failed_worker() {
+        let mut h = harness(vec![text("first"), text("second")]);
+        spawn(&mut h.fleet, &h.repo);
+        h.queue.recv_timeout(WAIT).unwrap();
+        h.fleet.record(1, WorkerEvent::Failed);
+        assert!(list(&mut h.fleet).starts_with("worker 1 [failed]"));
+        assert_eq!(h.fleet.resume("1"), "worker 1 resumed");
+        // Idle again with no failure recorded: the resume cleared the flag.
+        h.fleet.workers.get_mut(0).unwrap().pending = 0;
+        assert!(list(&mut h.fleet).starts_with("worker 1 [idle]"));
+    }
+
+    #[test]
+    fn resume_rejects_bad_arguments_without_messaging() {
+        let mut h = harness(vec![text("first")]);
+        assert_eq!(h.fleet.resume("1"), "error: no worker 1; worker ids: none");
+        spawn(&mut h.fleet, &h.repo);
+        h.queue.recv_timeout(WAIT).unwrap();
+        h.fleet.record(1, WorkerEvent::Finished);
+        assert_eq!(h.fleet.resume(""), "error: usage: /resume <id>; worker ids: 1");
+        assert_eq!(h.fleet.resume("x"), "error: not a worker id: x; worker ids: 1");
+        assert_eq!(h.fleet.resume("1 2"), "error: expected one worker id, got: 1 2; worker ids: 1");
+        assert_eq!(h.fleet.resume("9"), "error: no worker 9; worker ids: 1");
+        assert!(!h.fleet.busy());
+        assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn resume_tolerates_surrounding_whitespace() {
+        let mut h = harness(vec![text("first"), text("second")]);
+        spawn(&mut h.fleet, &h.repo);
+        h.queue.recv_timeout(WAIT).unwrap();
+        h.fleet.record(1, WorkerEvent::Finished);
+        assert_eq!(h.fleet.resume(" 1 "), "worker 1 resumed");
+        assert_eq!(resume_id("\t1\n"), Ok(1));
     }
 }

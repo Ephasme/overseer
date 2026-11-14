@@ -40,5 +40,7 @@
 - A tool failure goes back to the model as text starting `error: `; it never aborts a turn.
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
+- A worker's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
+- Worker tool calls emit `Event::Progress` (start, then elapsed); `main` prints those to stderr and does not wake the overseer model with them.
 - Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.

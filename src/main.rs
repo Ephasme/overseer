@@ -30,7 +30,13 @@ fn main() -> Result<()> {
             if line.is_empty() {
                 continue;
             }
-            let event = if line == "exit" { Event::Exit } else { Event::User(line.to_string()) };
+            let event = if line == "exit" {
+                Event::Exit
+            } else if let Some(arg) = line.strip_prefix("/resume") {
+                Event::Resume(arg.to_string())
+            } else {
+                Event::User(line.to_string())
+            };
             let exit = event == Event::Exit;
             if stdin_sender.send(event).is_err() || exit {
                 return;
@@ -52,6 +58,14 @@ fn main() -> Result<()> {
                     continue;
                 }
                 break;
+            }
+            Event::Resume(arg) => {
+                println!("{}", fleet.resume(&arg));
+                continue;
+            }
+            Event::Progress { id, text } => {
+                eprintln!("[worker {id}] {text}");
+                continue;
             }
             Event::User(text) => text,
             Event::Worker { id, kind, text } => {

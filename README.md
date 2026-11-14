@@ -32,7 +32,7 @@ OVERSEER_API_KEY=...
 overseer
 ```
 
-Talk to the overseer on stdin. Worker reports wake it on their own. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it. `exit` quits at once; Ctrl-D quits once no worker is busy.
+Talk to the overseer on stdin; `/resume <id>` re-tasks a worker without spending a model call. Worker reports wake the overseer on their own, and every worker tool call prints to stderr as `[worker N]` when it starts and with its duration when it returns. A worker's `bash` command is killed after 300 seconds. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it. `exit` quits at once; Ctrl-D quits once no worker is busy.
 
 ## Release
 
