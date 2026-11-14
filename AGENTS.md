@@ -2,8 +2,10 @@
 
 ## Critical constraints
 
-- The overseer agent never does work itself: `prompt::overseer_tool_definitions` holds only fleet tools. Never give it `bash`, `read_file`, `write_file` or any other tool that touches files or runs commands; `list_repos`, which only names directories under the configured roots, is the one read the overseer gets.
-- Each worker starts in an existing directory: `config::resolve_dir` canonicalises it and rejects a non-directory. `roots` in `~/.config/overseer/config.toml` bounds only repository discovery (`list_repos` and the overseer prompt); it is not a sandbox. Never add a tool that clones a repository. Workers are not sandboxed, so `bash` and absolute paths reach the whole filesystem.
+- Every agent is the same implementation with the same tools: `swarm::AgentRun` runs one turn for the root and for the deepest child alike, and `prompt::agent_tool_definitions` is the only tool set. An agent may `spawn_agent`, `message_agent`, `control_agent` and `list_agents` only for agents strictly below it in the tree (`Swarm::owns`); the root is agent 1, the one the user talks to.
+- An agent's `Policy` is merged once, before its thread starts, and never changes: there is no tool that restricts a running agent, and `control_agent` has no `restart`. Changing rights means stopping an agent (which stops its whole subtree) and spawning a new one.
+- `max_depth` in `config.toml` counts delegations below the root and defaults to 3; a spawn past it is refused, never clamped.
+- Each agent starts in an existing directory: `config::resolve_dir` canonicalises it and rejects a non-directory. `roots` in `~/.config/overseer/config.toml` bounds only repository discovery (`list_repos`); it is not a sandbox. Never add a tool that clones a repository. Agents are not sandboxed, so `bash` and absolute paths reach the whole filesystem.
 - Release only by pushing a `v<version>` tag that equals `version` in `Cargo.toml`; CI rejects any other tag, publishes the GitHub release and updates `Ephasme/homebrew-tap`.
 
 ## Commands
@@ -24,23 +26,25 @@
 
 | Path | Contents |
 |------|----------|
-| `src/main.rs` | picks the frontend, creates both channels, starts the session thread |
-| `src/session.rs` | the blocking core loop: one overseer turn per event, reported as `UiEvent`s |
+| `src/main.rs` | picks the frontend, creates both channels, connects the MCP servers, starts the session thread |
+| `src/session.rs` | the router: user input to the root, agent events to their owner and the frontends |
 | `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
 | `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
 | `src/tui/mod.rs` | terminal lifecycle and its panic hook, the event loop, key bindings, the mouse capture F5 hands back |
-| `src/tui/app.rs` | transcript entries, composer, worker panel, status line, wrapping |
+| `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
-| `src/fleet.rs` | worker registry, worker threads, worker events, overseer tool dispatch |
-| `src/prompt.rs` | both system prompts, tool schemas, tool-name constants, `DEFAULT_WORKDIR` |
+| `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
+| `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
-| `src/agent.rs` | `Turn::run`, the model ↔ tools loop shared by overseer and workers |
-| `src/tools.rs` | worker tools `bash`, `read_file`, `write_file` |
-| `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks a worker resolves by `conflict://<N>` |
+| `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |
+| `src/tools.rs` | the file tools `bash`, `read_file`, `write_file`, and the `Policy` that guards them |
+| `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
+| `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
+| `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
-| `src/config.rs` | `config.toml`, roots, `home`, `resolve_dir`, state directory, `io_error` |
+| `src/config.rs` | `config.toml`, roots, `max_depth`, the root's `dir`, `home`, `resolve_dir`, state directory, `io_error` |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
 | `.github/scripts/update-formula.sh` | rewrites the tap's formula from a release |
 | `justfile` | `just install`, `just run`, `just check` |
@@ -51,17 +55,17 @@
 - A tool failure goes back to the model as text starting `error: `; it never aborts a turn.
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
-- A worker's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
-- An overseer order reaches a worker through `fleet::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused worker is not busy, so ctrl+D stops waiting on it.
-- A worker's `Policy` is checked on every tool call and rewritten into its system prompt each turn, so a restriction takes effect without a restart. `read_only` matches `bash` commands as text against a fixed list: a guard, not a sandbox.
-- A conflict id belongs to one worker's `conflict::Registry`, not the process: ids never collide across workers, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
+- An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
+- An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
+- `Control::set_policy` has exactly one caller, `Swarm::spawn`, before the thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
-- Quitting calls `tools::kill_running`: without it a worker's `cargo build` outlives the process, because the session never reaps a group that is still running.
-- A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
+- Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build` or an MCP server outlives the process.
+- An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
-- Worker model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the worker panel and the core never feeds back to the overseer.
-- A worker view owns the keys while it is open (`tui::app::App::worker_key`): `esc` leaves it and never quits, and no key typed there reaches the overseer's prompt. Quitting stays on ctrl+c and ctrl+d.
-- A `UiEvent` carrying a worker id goes to that worker's `Stream` only; the lead's stream (`App::lead`) gets one lifecycle line per worker event and never a worker's tool call or message. `Stream` holds the entries, the flatten cache and the scroll position, so switching views loses neither buffer nor position. F3 is the one verbosity flag: it re-flows every stream.
-- Worker tool calls emit `Event::Progress` (start, then elapsed); it wakes nothing.
+- Agent model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the agent panel and the core never feeds back up the tree.
+- A `UiEvent` carrying a non-root agent id goes to that agent's `Stream` only; the lead's stream (`App::lead`) gets one lifecycle line per agent event and never an agent's tool call or message. The root's own events go straight into the lead's stream. `Stream` holds the entries, the flatten cache and the scroll position, so switching views loses neither buffer nor position. F3 is the one verbosity flag: it re-flows every stream.
+- An agent's view owns the keys while it is open (`tui::app::App::worker_key`): `esc` leaves it and never quits, and no key typed there reaches the root's prompt. Quitting stays on ctrl+c and ctrl+d.
+- Tool calls emit `Event::Progress` (start, then elapsed) for every agent, the root's included; it wakes nothing.
 - Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.
