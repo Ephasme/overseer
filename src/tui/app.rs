@@ -1,6 +1,7 @@
 use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
+use crate::version;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -34,7 +35,7 @@ const TICK: Duration = Duration::from_millis(120);
 const PREVIEW_CHARS: usize = 400;
 
 /// Key hints on the right of the status line.
-const HINT: &str = "enter send · F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+d quit";
+const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+d quit";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -712,7 +713,7 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = Vec::new();
+        let mut spans = vec![Span::styled(version::VERSION, DIM), Span::styled(" │ ", DIM)];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
             spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(YELLOW)));
@@ -1110,6 +1111,7 @@ mod tests {
         assert!(screen.contains("overseer"), "{screen}");
         assert!(screen.contains("idle"), "{screen}");
         assert!(screen.contains("message · test-model"), "{screen}");
+        assert!(screen.contains(version::VERSION), "{screen}");
     }
 
     #[test]
