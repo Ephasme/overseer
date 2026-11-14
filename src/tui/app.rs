@@ -742,6 +742,11 @@ impl App {
     fn progress(&mut self, id: usize, progress: Progress) {
         match progress {
             Progress::Started { call, tool, summary } => {
+                // The card ends the paragraph above it: what the next model call streams belongs
+                // below the card, not glued into the entry it would otherwise still be writing to.
+                if id == Swarm::ROOT {
+                    self.live = None;
+                }
                 let index = self.stream_mut(id).push(Entry::tool(tool, summary));
                 self.calls.push((id, call, index));
                 if id != Swarm::ROOT {
@@ -860,6 +865,9 @@ impl App {
 
     /// A line in the lead's stream: the only stream the overseer's own events reach.
     fn push(&mut self, role: Role, title: String, body: String) {
+        // Anything landing in the transcript closes the streamed paragraph, so no later delta is
+        // appended above the line that interrupted it.
+        self.live = None;
         self.lead.push(Entry::new(role, title, body));
     }
 
@@ -1917,6 +1925,29 @@ mod tests {
         delta(&mut app, "second call");
         assert_eq!(app.lead.entries[0].body, "first call\n\nsecond call");
         assert_eq!(app.lead.entries[0].lines(40, 0, true).len(), 3);
+    }
+
+    #[test]
+    fn text_streamed_after_a_tool_call_lands_below_its_card() {
+        let mut app = App::new("m");
+        delta(&mut app, "checking the config");
+        tool_call(&mut app, 0, "bash", "cargo test");
+        tool_result(&mut app, 0, "bash", "ok", 1.0);
+        app.apply(UiEvent::TurnBoundary);
+        delta(&mut app, "all green");
+        app.apply(UiEvent::Answer("all green".into()));
+        let bodies: Vec<&str> = app.lead.entries.iter().map(|entry| entry.body.as_str()).collect();
+        assert_eq!(bodies, ["checking the config", "cargo test", "all green"]);
+    }
+
+    #[test]
+    fn a_notice_ends_the_streamed_paragraph() {
+        let mut app = App::new("m");
+        delta(&mut app, "before");
+        app.apply(UiEvent::Notice("agent 2 started".into()));
+        delta(&mut app, "after");
+        let bodies: Vec<&str> = app.lead.entries.iter().map(|entry| entry.body.as_str()).collect();
+        assert_eq!(bodies, ["before", "agent 2 started", "after"]);
     }
 
     #[test]
