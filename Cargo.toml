@@ -7,8 +7,11 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = { version = "3", default-features = false }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 dotenvy = "0.15.7"
+# Already in the tree through arboard's image-data feature; named here only to encode
+# the RGBA it hands back as PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }

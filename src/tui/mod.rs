@@ -88,9 +88,11 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
         }
         KeyCode::Char('j') if ctrl => app.insert("\n"),
         KeyCode::Char('v') if ctrl => app.paste(),
+        KeyCode::Char('x') if ctrl => app.detach(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
         KeyCode::Char('n') if ctrl => app.recall_next(),
         KeyCode::Enter if !alt && !shift => submit(app, input),
+        KeyCode::Backspace => app.backspace(key),
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
         KeyCode::Home => app.scroll_top(),
