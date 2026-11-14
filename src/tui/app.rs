@@ -3007,6 +3007,7 @@ mod tests {
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: task.into(),
+            profile: None,
             pending: 0,
             failed: false,
             finished: false,

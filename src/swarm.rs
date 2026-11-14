@@ -1,9 +1,11 @@
 use crate::agent::{INTERRUPTED, Turn};
 use crate::config;
 use crate::conflict;
+use crate::llm;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::mcp;
 use crate::names;
+use crate::profiles;
 use crate::prompt;
 use crate::repos;
 use crate::skills;
@@ -52,6 +54,7 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 struct SpawnArgs {
     path: Option<String>,
     task: String,
+    profile: Option<String>,
     read_only: Option<bool>,
     deny_tools: Option<Vec<String>>,
     allow_commands: Option<Vec<String>>,
@@ -336,6 +339,8 @@ pub(crate) struct AgentView {
     pub(crate) dir: PathBuf,
     /// The instruction the agent was started with.
     pub(crate) task: String,
+    /// The profile it runs; `None` for a plain spawn.
+    pub(crate) profile: Option<String>,
     /// Instructions sent but not yet finished.
     pub(crate) pending: usize,
     pub(crate) failed: bool,
@@ -418,6 +423,8 @@ struct Agent {
     working_dir: PathBuf,
     /// The instruction the agent was started with; follow-up messages do not replace it.
     initial_task: String,
+    /// The profile it runs; `None` for a plain spawn.
+    profile: Option<String>,
     /// Instructions sent but not yet finished. A `Reply` does not count.
     pending: usize,
     failed: bool,
@@ -450,7 +457,8 @@ impl Agent {
 /// A worker thread reaches it through a `Weak` (`spawn_thread`): the tree owns every worker's inbox,
 /// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
-    llm: Arc<dyn Llm>,
+    models: Arc<dyn llm::Models>,
+    profiles: Arc<profiles::Catalogue>,
     roots: Vec<PathBuf>,
     home: PathBuf,
     log_dir: PathBuf,
@@ -467,8 +475,10 @@ impl Swarm {
     /// The agent the user talks to.
     pub(crate) const ROOT: usize = 1;
 
+    #[allow(clippy::too_many_arguments)] // one call site: the session wires the tree together.
     pub(crate) fn new(
-        llm: Arc<dyn Llm>,
+        models: Arc<dyn llm::Models>,
+        profiles: Arc<profiles::Catalogue>,
         roots: Vec<PathBuf>,
         home: PathBuf,
         log_dir: PathBuf,
@@ -476,7 +486,7 @@ impl Swarm {
         max_depth: usize,
         mcp: Arc<mcp::Registry>,
     ) -> Self {
-        Self { llm, roots, home, log_dir, sender, max_depth, agents: Vec::new(), mcp }
+        Self { models, profiles, roots, home, log_dir, sender, max_depth, agents: Vec::new(), mcp }
     }
 
     /// The tree as the frontends draw it.
@@ -491,6 +501,7 @@ impl Swarm {
                 depth: agent.depth,
                 dir: agent.working_dir.clone(),
                 task: agent.initial_task.clone(),
+                profile: agent.profile.clone(),
                 pending: agent.pending,
                 failed: agent.failed,
                 finished: agent.finished(),
@@ -632,28 +643,39 @@ impl Swarm {
         id.checked_sub(1).and_then(|index| self.agents.get(index))
     }
 
-    /// Starts the agent the user talks to: id 1, depth 0, no parent and no first instruction. Its
-    /// rights are empty: nobody owns it, so nothing could restrict it.
+    /// Starts the agent the user talks to: id 1, depth 0, no parent and no first instruction. It
+    /// runs the built-in orchestrator profile, whose policy is set before the thread exists, so a
+    /// user's `orchestrator.md` cannot narrow a live agent mid-turn.
     ///
     /// The log and the thread start with the tree lock released, as in `spawn`.
     pub(crate) fn start_root(swarm: &Arc<Mutex<Swarm>>, dir: PathBuf) -> Result<usize, String> {
         let _reserved = spawning();
-        let (id, log_path, control, llm, sender) = {
+        let (id, log_path, control, llm, sender, profile) = {
             let tree = lock(swarm);
             if !tree.agents.is_empty() {
                 return Err("the root is already running".to_string());
             }
             let id = Swarm::ROOT;
+            let orchestrator = tree
+                .profiles
+                .get(profiles::ORCHESTRATOR)
+                .ok_or_else(|| format!("the built-in {} profile is missing from this build", profiles::ORCHESTRATOR))?;
+            let effort = orchestrator.effort()?;
+            let control = Arc::new(Control::default());
+            // The root has no owner; its profile is the user's own instruction, so it applies.
+            control.set_policy(tools::Policy::default().inherit(&orchestrator.policy));
             (
                 id,
                 tree.log_dir.join(format!("agent-{id}.log")),
-                Arc::new(Control::default()),
-                Arc::clone(&tree.llm),
+                Arc::clone(&control),
+                tree.models.get(orchestrator.model.as_deref(), effort),
                 tree.sender.clone(),
+                Some(orchestrator.name.clone()),
             )
         };
+        let recorded = profile.clone();
         let (inbox, handle) =
-            spawn_thread(llm, sender, id, 0, None, &dir, Arc::clone(&control), None, &log_path, swarm)?;
+            spawn_thread(llm, sender, id, 0, None, &dir, Arc::clone(&control), None, profile, &log_path, swarm)?;
         lock(swarm).agents.push(Agent {
             id,
             name: None,
@@ -661,6 +683,7 @@ impl Swarm {
             depth: 0,
             working_dir: dir,
             initial_task: String::new(),
+            profile: recorded,
             pending: 0,
             failed: false,
             stopped: false,
@@ -744,7 +767,7 @@ impl Swarm {
     /// both block and every other agent's dispatch, the session's events and `snapshot()` wait on it.
     fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
         let _reserved = spawning();
-        let (depth, dir, home, id, log_path, control, llm, sender) = {
+        let (depth, dir, home, id, log_path, control, llm, sender, profile) = {
             let tree = lock(swarm);
             let parent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let depth = parent.depth.saturating_add(1);
@@ -755,8 +778,23 @@ impl Swarm {
                     tree.max_depth
                 ));
             }
+            let profile = match args.profile.as_deref() {
+                Some(name) => Some(
+                    tree.profiles
+                        .get(name)
+                        .ok_or_else(|| format!("unknown profile {name}; available: {}", tree.profiles.names()))?,
+                ),
+                None => None,
+            };
+            let effort = match profile {
+                Some(profile) => profile.effort()?,
+                None => None,
+            };
+            let llm = tree.models.get(profile.and_then(|profile| profile.model.as_deref()), effort);
+            let profile_policy = profile.map_or_else(tools::Policy::default, |profile| profile.policy.clone());
             let control = Arc::new(Control::default());
-            control.set_policy(parent.control.policy().inherit(&args.policy()));
+            // The arguments tighten the profile, the pair tightens the parent: nothing here can loosen.
+            control.set_policy(parent.control.policy().inherit(&args.policy().inherit(&profile_policy)));
             let dir = args.path.clone().unwrap_or_else(|| parent.working_dir.display().to_string());
             let id = tree.agents.len() + 1;
             (
@@ -765,12 +803,14 @@ impl Swarm {
                 tree.home.clone(),
                 id,
                 tree.log_dir.join(format!("agent-{id}.log")),
-                control,
-                Arc::clone(&tree.llm),
+                Arc::clone(&control),
+                llm,
                 tree.sender.clone(),
+                profile.map(|profile| profile.name.clone()),
             )
         };
         let working_dir = config::resolve_dir(&dir, &home)?;
+        let recorded = profile.clone();
         let (inbox, handle) = spawn_thread(
             llm,
             sender,
@@ -780,6 +820,7 @@ impl Swarm {
             &working_dir,
             Arc::clone(&control),
             Some(args.task.clone()),
+            profile,
             &log_path,
             swarm,
         )?;
@@ -790,6 +831,7 @@ impl Swarm {
             depth,
             working_dir,
             initial_task: args.task,
+            profile: recorded,
             pending: 1,
             failed: false,
             stopped: false,
@@ -979,6 +1021,7 @@ fn spawn_thread(
     working_dir: &Path,
     control: Arc<Control>,
     task: Option<String>,
+    profile: Option<String>,
     log_path: &Path,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
@@ -1012,6 +1055,7 @@ fn spawn_thread(
             id,
             depth,
             parent,
+            profile,
             working_dir: &agent_dir,
             sender: &sender,
             log: &mut log,
@@ -1046,6 +1090,8 @@ struct AgentRun<'a> {
     id: usize,
     depth: usize,
     parent: Option<usize>,
+    /// The profile this agent runs, by name; `None` for a plain spawn.
+    profile: Option<String>,
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
     log: &'a mut File,
@@ -1197,8 +1243,10 @@ impl AgentRun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm;
     use crate::llm::testing::{Scripted, call, text};
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::fs;
     use std::time::Duration;
 
@@ -1251,11 +1299,61 @@ mod tests {
         }
     }
 
-    fn harness(replies: Vec<Message>) -> Harness {
-        harness_with(Arc::new(Scripted::new(replies)))
+    /// Records what each agent asked for, and hands out one scripted client per `(model, effort)`
+    /// pair, so the root and a profiled child never consume each other's replies.
+    #[derive(Default)]
+    struct Recording {
+        seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        clients: Mutex<HashMap<String, Arc<dyn Llm>>>,
+    }
+
+    impl Recording {
+        /// The key a pair is scripted under; an absent half is spelled `default`.
+        fn key(model: Option<&str>, effort: Option<&str>) -> String {
+            format!("{}/{}", model.unwrap_or("default"), effort.unwrap_or("default"))
+        }
+
+        fn seed(&self, model: Option<&str>, effort: Option<&str>, script: Vec<Message>) {
+            self.clients.lock().unwrap().insert(Self::key(model, effort), Arc::new(Scripted::new(script)));
+        }
+
+        fn seen(&self) -> Vec<(Option<String>, Option<String>)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl llm::Models for Recording {
+        fn get(&self, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm> {
+            self.seen.lock().unwrap().push((model.map(str::to_string), effort.map(str::to_string)));
+            let key = Self::key(model, effort);
+            let found = self.clients.lock().unwrap().get(&key).cloned();
+            found.unwrap_or_else(|| panic!("no script for {key}"))
+        }
+    }
+
+    /// Writes the profiles a test names under `home`, then loads them the way startup does.
+    fn catalogue(home: &Path, files: &[(&str, &str)]) -> Arc<profiles::Catalogue> {
+        if !files.is_empty() {
+            let dir = home.join(".overseer/agent/profiles");
+            fs::create_dir_all(&dir).unwrap();
+            for (name, frontmatter) in files {
+                let text = format!("---\n{frontmatter}\n---\nprofile {name} body\n");
+                fs::write(dir.join(format!("{name}.md")), text).unwrap();
+            }
+        }
+        Arc::new(profiles::Catalogue::load(home))
+    }
+
+    fn harness(script: Vec<Message>) -> Harness {
+        harness_with(Arc::new(Scripted::new(script)))
     }
 
     fn harness_with(llm: Arc<dyn Llm>) -> Harness {
+        harness_full(Arc::new(llm::testing::Fixed(llm)), &[])
+    }
+
+    /// The one builder: a tree whose profiles come from `files`, started at its root.
+    fn harness_full(models: Arc<dyn llm::Models>, files: &[(&str, &str)]) -> Harness {
         let root = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
@@ -1263,8 +1361,10 @@ mod tests {
         let (sender, queue) = mpsc::channel();
         let roots = vec![fs::canonicalize(root.path()).unwrap()];
         let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let profiles = catalogue(root.path(), files);
         let swarm = Arc::new(Mutex::new(Swarm::new(
-            llm,
+            models,
+            profiles,
             roots,
             root.path().to_path_buf(),
             logs.path().to_path_buf(),
@@ -1274,6 +1374,80 @@ mod tests {
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
+    }
+
+    const REVIEWER: &str =
+        "description: Reviews a diff.\nkeywords: [review, audit]\nmodel: main/coding\neffort: high\nread_only: true";
+
+    #[test]
+    fn the_root_is_an_orchestrator_and_a_profile_chooses_the_model() {
+        let recording = Arc::new(Recording::default());
+        recording.seed(
+            None,
+            None,
+            vec![call("t1", prompt::SPAWN_AGENT, &json!({"task": "review", "profile": "reviewer"})), text("spawned")],
+        );
+        recording.seed(Some("main/coding"), Some("high"), vec![text("reviewed")]);
+        let recorder: Arc<Recording> = Arc::clone(&recording);
+        let models: Arc<dyn llm::Models> = recorder;
+        let h = harness_full(models, &[("reviewer", REVIEWER)]);
+        h.swarm.lock().unwrap().tell_root("go").unwrap();
+        // A spawned agent's client is resolved as it starts: wait for that resolution, rather than
+        // for a fixed duration that could pass on a slow machine.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recording.seen().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let seen = recording.seen();
+        assert_eq!(seen.first(), Some(&(None, None)), "the root asked for the default pair: {seen:?}");
+        assert_eq!(
+            seen.get(1),
+            Some(&(Some("main/coding".into()), Some("high".into()))),
+            "the reviewer asked for its profile's model and effort: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_profile_is_refused_with_the_known_names() {
+        let h = harness(vec![]);
+        let refused =
+            tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"path": h.repo, "task": "x", "profile": "ghost"}));
+        assert!(refused.starts_with("error: unknown profile ghost"), "{refused}");
+        assert!(refused.contains(profiles::ORCHESTRATOR), "the error lists what exists: {refused}");
+    }
+
+    #[test]
+    fn a_profile_tightens_the_child_and_the_arguments_cannot_loosen_it() {
+        let h = harness_full(Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))), &[("reviewer", REVIEWER)]);
+        let spawned = tool(
+            &h.swarm,
+            Swarm::ROOT,
+            prompt::SPAWN_AGENT,
+            &json!({"path": h.repo, "task": "review", "profile": "reviewer", "read_only": false}),
+        );
+        assert_eq!(spawned, "agent 2 started");
+        let policy = h.swarm.lock().unwrap().agent(2).unwrap().control.policy();
+        assert!(policy.read_only, "read_only from the profile sticks");
+        assert!(policy.refuse(tools::WRITE_FILE, &json!({"path": "x", "content": ""}).to_string()).is_some());
+    }
+
+    #[test]
+    fn a_profile_effort_is_checked_at_the_spawn() {
+        let h = harness_full(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[("fast", "description: x\neffort: ultra")],
+        );
+        let refused =
+            tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"path": h.repo, "task": "x", "profile": "fast"}));
+        assert!(refused.starts_with("error: profile fast: effort"), "{refused}");
+        assert!(refused.contains("low, medium, high"), "{refused}");
+    }
+
+    #[test]
+    fn the_root_view_names_its_orchestrator_profile() {
+        let h = harness(vec![]);
+        let view = h.swarm.lock().unwrap().snapshot();
+        assert_eq!(view[0].profile.as_deref(), Some(profiles::ORCHESTRATOR));
     }
 
     /// One tree tool call, as an agent makes it.
@@ -1697,7 +1871,7 @@ mod tests {
         );
         assert!(
             tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"repo": "/tmp", "task": "x"})).starts_with(
-                "error: invalid arguments: unknown field `repo`, expected one of `path`, `task`, `read_only`, `deny_tools`, `allow_commands`, `deny_commands`"
+                "error: invalid arguments: unknown field `repo`, expected one of `path`, `task`, `profile`, `read_only`, `deny_tools`, `allow_commands`, `deny_commands`"
             )
         );
         assert_eq!(

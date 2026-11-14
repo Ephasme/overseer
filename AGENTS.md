@@ -60,7 +60,7 @@
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
-- `Control::set_policy` has exactly one caller, `Swarm::spawn`, before the thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
 - The root agent always runs the built-in `orchestrator` profile; a `~/.overseer/agent/profiles/orchestrator.md` replaces its text, model and effort, never its role.
 - A profile can only tighten: its rights merge through `Policy::inherit`, so `spawn_agent` arguments can add restrictions but never take one back.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
