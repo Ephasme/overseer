@@ -159,21 +159,27 @@ fn first_line(value: Option<&String>) -> &str {
     field(value).lines().next().unwrap_or_default()
 }
 
-/// One line naming what a tool call acts on: the transcript header and the worker panel both show it.
+/// What a tool call acts on: the transcript header and the worker panel both show it.
+///
+/// An instruction the overseer sends a worker is kept whole, so the user can read what was
+/// actually said; every other summary is one capped line.
 pub(crate) fn describe(name: &str, arguments: &str) -> String {
     let args: Described = serde_json::from_str(arguments).unwrap_or_default();
     let line = match name {
         prompt::SPAWN_WORKER => {
             let path = field(args.path.as_ref());
             let dir = if path.is_empty() { prompt::DEFAULT_WORKING_DIR } else { path };
-            format!("{dir} · {}", first_line(args.task.as_ref()))
+            format!("{dir} · {}", field(args.task.as_ref()))
         }
-        prompt::MESSAGE_WORKER => format!("#{} · {}", args.id.unwrap_or_default(), first_line(args.text.as_ref())),
+        prompt::MESSAGE_WORKER => format!("#{} · {}", args.id.unwrap_or_default(), field(args.text.as_ref())),
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => first_line(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
         _ => String::new(),
     };
+    if matches!(name, prompt::SPAWN_WORKER | prompt::MESSAGE_WORKER) {
+        return line;
+    }
     tools::shorten(&line, PROGRESS_WIDTH)
 }
 
@@ -579,7 +585,9 @@ mod tests {
     fn describe_names_what_a_tool_call_acts_on() {
         assert_eq!(describe(prompt::SPAWN_WORKER, &json!({"task": "x"}).to_string()), "/tmp · x");
         let nested = json!({"path": "/repo", "task": "a\nb"}).to_string();
-        assert_eq!(describe(prompt::SPAWN_WORKER, &nested), "/repo · a");
+        assert_eq!(describe(prompt::SPAWN_WORKER, &nested), "/repo · a\nb", "the whole task, newlines kept");
+        let message = json!({"id": 4, "text": "one\ntwo"}).to_string();
+        assert_eq!(describe(prompt::MESSAGE_WORKER, &message), "#4 · one\ntwo");
         let command = json!({"command": "cargo test\nls"}).to_string();
         assert_eq!(describe(tools::BASH, &command), "cargo test");
         assert_eq!(describe(prompt::LIST_REPOS, "{}"), "");
@@ -588,6 +596,8 @@ mod tests {
         let summary = describe(tools::BASH, &long);
         assert_eq!(summary.chars().count(), 101);
         assert!(summary.ends_with('…'));
+        let long = json!({"id": 1, "text": "y".repeat(400)}).to_string();
+        assert_eq!(describe(prompt::MESSAGE_WORKER, &long).chars().count(), 405, "no cap on an instruction");
     }
 
     #[test]

@@ -179,16 +179,32 @@ impl Entry {
         let verb = verb(&self.title);
         let lead = 1 + text_width(glyph);
         let room = width.saturating_sub(lead + text_width(verb) + 1 + text_width(&chips)).max(12);
-        let mut spans = vec![
-            Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-            Span::styled(verb.to_string(), Style::new().fg(theme::MUTED)),
-        ];
-        if !self.body.is_empty() {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(truncate(&self.body, room), Style::new().fg(theme::TEXT)));
+        // The whole body, wrapped: an instruction sent to a worker is shown as written, not cut.
+        let mut rows: Vec<String> = Vec::new();
+        for source in self.body.split('\n') {
+            rows.extend(wrap(source, room));
         }
-        spans.push(Span::styled(chips, Style::new().fg(theme::FAINT)));
-        let mut lines = vec![Line::from(spans)];
+        let pad = " ".repeat(lead + text_width(verb) + 1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(pad.clone(), Style::new()),
+                    Span::styled(row, Style::new().fg(theme::TEXT)),
+                ]));
+                continue;
+            }
+            let mut spans = vec![
+                Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+                Span::styled(verb.to_string(), Style::new().fg(theme::MUTED)),
+            ];
+            if !row.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(row, Style::new().fg(theme::TEXT)));
+            }
+            spans.push(Span::styled(chips.clone(), Style::new().fg(theme::FAINT)));
+            lines.push(Line::from(spans));
+        }
         let Some(output) = &self.output else { return lines };
         if !expand {
             return lines;
@@ -1693,6 +1709,22 @@ mod tests {
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap("  indented", 20), ["  indented"]);
         assert_eq!(wrap("", 10), [""]);
+    }
+
+    #[test]
+    fn an_instruction_to_a_worker_is_shown_whole_across_rows() {
+        let mut app = App::new("m");
+        let text = format!("first line\n{}tail", "word ".repeat(40));
+        app.apply(UiEvent::ToolStarted { id: 0, tool: "message_worker".into(), summary: format!("#2 · {text}") });
+        let lines = app.lead.entries[0].lines(40, 0, false);
+        assert!(lines.len() > 2, "a long instruction wraps: {}", lines.len());
+        let joined = row_text(&lines);
+        assert!(joined.contains("first line"), "{joined}");
+        assert!(joined.contains("tail"), "the end of the message is not cut: {joined}");
+        assert!(!joined.contains('…'), "nothing is elided: {joined}");
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains("first line"), "{rendered}");
+        assert!(rendered.contains("tail"), "the rendered screen shows the end: {rendered}");
     }
 
     #[test]
