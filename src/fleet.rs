@@ -1,5 +1,6 @@
 use crate::agent::Turn;
 use crate::config;
+use crate::conflict;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use crate::repos;
@@ -547,8 +548,15 @@ impl Fleet {
         let worker_dir = working_dir.to_path_buf();
         let handle = thread::spawn(move || {
             let mut log = log;
-            let mut run =
-                WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log, calls: 0, control: &control };
+            let mut run = WorkerRun {
+                id,
+                working_dir: &worker_dir,
+                sender: &sender,
+                log: &mut log,
+                calls: 0,
+                control: &control,
+                conflicts: conflict::Registry::default(),
+            };
             run.run(streamed.as_ref(), &instructions);
         });
         // The thread is already waiting on the channel, so a closed receiver here means it died on
@@ -739,6 +747,8 @@ struct WorkerRun<'a> {
     sender: &'a Sender<Event>,
     log: &'a mut File,
     control: &'a Control,
+    /// Conflict blocks this worker has read, by id: resolving one writes only its marker lines.
+    conflicts: conflict::Registry,
     /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
     calls: usize,
 }
@@ -817,6 +827,7 @@ impl WorkerRun<'_> {
                 &call.function.arguments,
                 &policy,
                 Some(control.flag()),
+                &mut self.conflicts,
             )
         };
         let _ = writeln!(self.log, "{output}");

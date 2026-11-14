@@ -1,6 +1,8 @@
 use crate::config;
+use crate::conflict;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::{
     fs,
     io::Read,
@@ -19,6 +21,9 @@ const MAX_OUTPUT_BYTES: usize = 30_000;
 
 /// Longest file body `read_file` returns, leaving room for its truncation note.
 const MAX_READ_BYTES: usize = 28_000;
+
+/// Largest file `read_file`'s `:conflicts` selector scans whole, so listing blocks cannot exhaust memory.
+const MAX_SCAN_BYTES: u64 = 8 << 20;
 
 /// A command that outlives this is killed: one stuck worker must not stall the fleet forever.
 const BASH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -261,12 +266,12 @@ pub(crate) fn definitions() -> Value {
         }},
         {"type": "function", "function": {
             "name": READ_FILE,
-            "description": "Read a UTF-8 text file. Relative paths resolve against the working directory.",
+            "description": "Read a UTF-8 text file. Relative paths resolve against the working directory. A file holding merge-conflict markers gets every block an id, listed after the text: resolve one by writing to `conflict://<id>`, and read `conflict://<id>` (or `/ours`, `/theirs`, `/base`) to inspect it. `<path>:conflicts` registers and lists every block of a file.",
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
         }},
         {"type": "function", "function": {
             "name": WRITE_FILE,
-            "description": "Create or overwrite a file with the given content. Creates missing parent directories. Relative paths resolve against the working directory.",
+            "description": "Create or overwrite a file with the given content. Creates missing parent directories. Relative paths resolve against the working directory. A path of `conflict://<id>` instead replaces only that conflict block's marker lines, keeping the code around it: `content` is the replacement, or `@ours` / `@theirs` / `@both`. `conflict://*` resolves many at once from `content` lines of `<id>: @ours`.",
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
         }}
     ])
@@ -309,10 +314,11 @@ pub(crate) fn execute_guarded(
     arguments: &str,
     policy: &Policy,
     cancel: Option<&AtomicBool>,
+    conflicts: &mut conflict::Registry,
 ) -> String {
     match policy.refuse(name, arguments) {
         Some(refusal) => outcome(Err(refusal)),
-        None => outcome(run(working_dir, name, arguments, BASH_TIMEOUT, cancel)),
+        None => outcome(run(working_dir, name, arguments, conflicts, BASH_TIMEOUT, cancel)),
     }
 }
 
@@ -320,13 +326,14 @@ fn run(
     working_dir: &Path,
     name: &str,
     arguments: &str,
+    conflicts: &mut conflict::Registry,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<String, String> {
     match name {
         BASH => parse_args::<BashArgs>(arguments).and_then(|args| bash(working_dir, &args, timeout, cancel)),
-        READ_FILE => parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args)),
-        WRITE_FILE => parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args)),
+        READ_FILE => parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts)),
+        WRITE_FILE => parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts)),
         _ => Err(format!("unknown tool {name}")),
     }
 }
@@ -458,7 +465,15 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
 }
 
 /// Reads a UTF-8 file, keeping the head of a file larger than the read budget.
-fn read_file(working_dir: &Path, args: &ReadArgs) -> Result<String, String> {
+///
+/// Every conflict block the read shows is registered, so a later write can address it by id.
+fn read_file(working_dir: &Path, args: &ReadArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
+    if let Some(rest) = args.path.strip_prefix(conflict::SCHEME) {
+        return conflicts.read(rest);
+    }
+    if let Some(display) = args.path.strip_suffix(conflict::LIST_SUFFIX) {
+        return list_conflicts(working_dir, display, conflicts);
+    }
     let full = working_dir.join(&args.path);
     let file = fs::File::open(&full).map_err(|e| config::io_error(&args.path, &e))?;
     let limit = u64::try_from(MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
@@ -473,16 +488,52 @@ fn read_file(working_dir: &Path, args: &ReadArgs) -> Result<String, String> {
         bytes.truncate(end);
     }
     let text = String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", args.path))?;
-    if cut {
+    let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(&args.path, &e))?;
+    conflicts.reconcile(&absolute, &args.path, &text);
+    let mut out = if cut {
         let shown = text.len();
-        return Ok(format!(
+        format!(
             "{text}\n[truncated: first {shown} bytes shown; {MAX_READ_BYTES} is the read budget, not the file size]"
-        ));
+        )
+    } else {
+        text
+    };
+    let summary = conflicts.summary(&absolute);
+    if !summary.is_empty() {
+        out.push('\n');
+        out.push_str(&summary);
+        if cut {
+            let _ = writeln!(
+                out,
+                "(only the blocks above the truncation point are registered; `read_file` on `{}:conflicts` registers them all)",
+                args.path
+            );
+        }
     }
-    Ok(text)
+    Ok(out)
 }
 
-fn write_file(working_dir: &Path, args: &WriteArgs) -> Result<String, String> {
+/// Registers every block of a file, past the read budget, and lists them.
+fn list_conflicts(working_dir: &Path, display: &str, conflicts: &mut conflict::Registry) -> Result<String, String> {
+    let full = working_dir.join(display);
+    let size = fs::metadata(&full).map_err(|e| config::io_error(display, &e))?.len();
+    if size > MAX_SCAN_BYTES {
+        return Err(format!("{display}: {size} bytes is past the {MAX_SCAN_BYTES}-byte conflict-scan budget"));
+    }
+    let text = fs::read_to_string(&full).map_err(|e| config::io_error(display, &e))?;
+    let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(display, &e))?;
+    conflicts.reconcile(&absolute, display, &text);
+    let summary = conflicts.summary(&absolute);
+    if summary.is_empty() {
+        return Ok(format!("no conflict markers in {display}"));
+    }
+    Ok(summary)
+}
+
+fn write_file(working_dir: &Path, args: &WriteArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
+    if let Some(rest) = args.path.strip_prefix(conflict::SCHEME) {
+        return conflicts.write(rest, &args.content);
+    }
     let full = working_dir.join(&args.path);
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).map_err(|e| config::io_error(parent.display(), &e))?;
@@ -528,9 +579,19 @@ fn ceil_boundary(s: &str, at: usize) -> usize {
 mod tests {
     use super::*;
 
-    /// A tool call with no policy and no cancellation, as a worker runs one outside any restriction.
+    /// A registry per call: a policy test never resolves a conflict.
+    fn registry() -> conflict::Registry {
+        conflict::Registry::default()
+    }
+
+    /// A tool call with no policy, no cancellation and a fresh registry: each test sees its own ids.
     fn execute(dir: &Path, name: &str, arguments: &str) -> String {
-        execute_guarded(dir, name, arguments, &Policy::default(), None)
+        execute_guarded(dir, name, arguments, &Policy::default(), None, &mut registry())
+    }
+
+    /// One tool call against a registry the caller keeps, for a read that a later write resolves.
+    fn with_registry(dir: &Path, name: &str, arguments: &str, conflicts: &mut conflict::Registry) -> String {
+        execute_guarded(dir, name, arguments, &Policy::default(), None, conflicts)
     }
 
     #[test]
@@ -548,7 +609,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let command = r#"{"command":"echo before; sleep 30"}"#;
-        let out = outcome(run(dir.path(), BASH, command, Duration::from_millis(200), None));
+        let mut conflicts = conflict::Registry::default();
+        let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -585,6 +647,33 @@ mod tests {
                 "{name} is defined but not dispatched"
             );
         }
+    }
+
+    #[test]
+    fn a_read_numbers_conflicts_and_a_write_resolves_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src.rs");
+        fs::write(&file, "<<<<<<< HEAD\nlet x = 1;\n=======\nlet x = 2;\n>>>>>>> other\n").unwrap();
+        let mut conflicts = conflict::Registry::default();
+        let read = with_registry(dir.path(), READ_FILE, r#"{"path":"src.rs"}"#, &mut conflicts);
+        assert!(read.contains("⚠ 1 unresolved conflict in src.rs"), "{read}");
+        assert!(read.contains("- #1: lines 1–5 (ours \"HEAD\", theirs \"other\")"), "{read}");
+        let write = json!({"path": "conflict://1", "content": "@theirs"}).to_string();
+        let out = with_registry(dir.path(), WRITE_FILE, &write, &mut conflicts);
+        assert!(out.starts_with("resolved conflict #1 at lines 1–5 in src.rs"), "{out}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "let x = 2;\n");
+        assert!(!out.contains("error"), "{out}");
+    }
+
+    #[test]
+    fn a_plain_file_read_carries_no_conflict_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"plain.rs"}"#), "fn main() {}\n");
+        assert_eq!(
+            execute(dir.path(), READ_FILE, r#"{"path":"plain.rs:conflicts"}"#),
+            "no conflict markers in plain.rs"
+        );
     }
 
     #[test]
@@ -655,17 +744,17 @@ mod tests {
         let policy = Policy { read_only: true, ..Policy::default() };
         let write = json!({"path": "x", "content": "y"}).to_string();
         assert!(
-            execute_guarded(dir.path(), WRITE_FILE, &write, &policy, None)
+            execute_guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
                 .starts_with("error: this worker is read-only"),
             "write_file ran in a read-only worker"
         );
         for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
             let args = json!({"command": command}).to_string();
-            let out = execute_guarded(dir.path(), BASH, &args, &policy, None);
+            let out = execute_guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
             assert!(out.starts_with("error: this worker is read-only"), "`{command}` ran: {out}");
         }
         let read = json!({"command": "ls | head -5"}).to_string();
-        let out = execute_guarded(dir.path(), BASH, &read, &policy, None);
+        let out = execute_guarded(dir.path(), BASH, &read, &policy, None, &mut registry());
         assert!(!out.starts_with("error:"), "a read-only pipeline was refused: {out}");
     }
 
@@ -680,21 +769,21 @@ mod tests {
         };
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), READ_FILE, &read, &policy, None),
+            execute_guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
             "error: tool read_file is banned for this worker"
         );
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), BASH, &denied, &policy, None),
+            execute_guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
             "error: this worker may not run commands starting with `echo secret`"
         );
         let outside = json!({"command": "pwd"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), BASH, &outside, &policy, None),
+            execute_guarded(dir.path(), BASH, &outside, &policy, None, &mut registry()),
             "error: this worker runs only: ls · echo"
         );
         let allowed = json!({"command": "ls"}).to_string();
-        assert!(!execute_guarded(dir.path(), BASH, &allowed, &policy, None).starts_with("error:"));
+        assert!(!execute_guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
     }
 
     #[test]
@@ -702,7 +791,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
-        let out = execute_guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &Policy::default(), Some(&cancel));
+        let out = execute_guarded(
+            dir.path(),
+            BASH,
+            r#"{"command":"sleep 30"}"#,
+            &Policy::default(),
+            Some(&cancel),
+            &mut registry(),
+        );
         assert!(out.contains("interrupted by overseer"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
