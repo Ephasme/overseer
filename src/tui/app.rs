@@ -2,14 +2,16 @@ use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
 use crate::version;
+use anyhow::{Context, Result, bail};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tui_textarea::{TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
 
@@ -35,7 +37,10 @@ const TICK: Duration = Duration::from_millis(120);
 const PREVIEW_CHARS: usize = 400;
 
 /// Key hints on the right of the status line.
-const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+d quit";
+const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+x drop image · ctrl+d quit";
+
+/// Said out loud, because a paste that does nothing looks like a broken key.
+const EMPTY_CLIPBOARD: &str = "clipboard has no image or text";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -318,6 +323,8 @@ pub(super) struct App {
     flattened: usize,
     dirty_from: usize,
     composer: TextArea<'static>,
+    /// PNG saved from the clipboard, sent with the next message and then dropped.
+    attachment: Option<PathBuf>,
     model: String,
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
@@ -364,6 +371,7 @@ impl App {
             flattened: 0,
             dirty_from: 0,
             composer: composer(model),
+            attachment: None,
             model: model.to_string(),
             history: Vec::new(),
             recall: None,
@@ -616,10 +624,16 @@ impl App {
 
     pub(super) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        let attached = u16::from(self.attachment.is_some());
         let rows = self.composer.measure(area.width).preferred_rows;
-        let rows = rows.clamp(3, area.height.saturating_sub(4).max(3));
-        let [body, input, status] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(rows), Constraint::Length(1)]).areas(area);
+        let rows = rows.clamp(3, area.height.saturating_sub(4 + attached).max(3));
+        let [body, chip, input, status] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(attached),
+            Constraint::Length(rows),
+            Constraint::Length(1),
+        ])
+        .areas(area);
         let transcript = if self.worker_panel && body.width > WORKERS_WIDTH + 40 {
             let [left, right] =
                 Layout::horizontal([Constraint::Min(40), Constraint::Length(WORKERS_WIDTH)]).areas(body);
@@ -631,6 +645,7 @@ impl App {
             body
         };
         self.render_transcript(frame, transcript);
+        self.render_attachment(frame, chip);
         frame.render_widget(&self.composer, input);
         self.render_status(frame, status);
     }
@@ -712,6 +727,17 @@ impl App {
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
+    /// The pending image, one compact chip above the composer.
+    fn render_attachment(&self, frame: &mut Frame, area: Rect) {
+        let Some(path) = &self.attachment else { return };
+        let line = Line::from(vec![
+            Span::styled(" image ", Style::new().fg(Color::Black).bg(YELLOW)),
+            Span::styled(format!(" {}", path.display()), DIM),
+            Span::styled(" · ctrl+x removes", DIM),
+        ]);
+        frame.render_widget(Paragraph::new(line).block(Block::new().padding(Padding::horizontal(1))), area);
+    }
+
     fn render_status(&self, frame: &mut Frame, area: Rect) {
         let mut spans = vec![Span::styled(version::VERSION, DIM), Span::styled(" │ ", DIM)];
         if self.busy {
@@ -738,7 +764,13 @@ impl App {
 
     /// The prompt as submitted, trimmed; the composer keeps its settings but starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
-        let text = self.composer.lines().join("\n").trim().to_string();
+        let mut text = self.composer.lines().join("\n").trim().to_string();
+        if let Some(path) = self.attachment.take() {
+            // The chat-completions request carries text only: the picture rides along as the path of a
+            // file the model can open with its own tools.
+            let note = format!("[attached image: {}]", path.display());
+            text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
+        }
         self.composer = composer(&self.model);
         self.recall = None;
         if !text.is_empty() {
@@ -760,11 +792,48 @@ impl App {
 
     /// Ctrl+V: the system clipboard, which a terminal withholds from a TUI outside bracketed paste.
     pub(super) fn paste(&mut self) {
-        if let Ok(mut clipboard) = arboard::Clipboard::new()
-            && let Ok(text) = clipboard.get_text()
-        {
-            self.insert(&text);
+        let dir = crate::config::home().map_or_else(
+            |_| std::env::temp_dir().join("overseer/pastes"),
+            |home| crate::config::state_dir(&home).join("pastes"),
+        );
+        self.apply_paste(Paste::read(), &dir);
+    }
+
+    /// Applies one paste: an image becomes a pending attachment, text goes in the composer, and a
+    /// clipboard holding neither says so instead of doing nothing.
+    fn apply_paste(&mut self, paste: Paste, dir: &Path) {
+        match paste {
+            Paste::Image { width, height, bytes } => match save_paste(dir, width, height, &bytes) {
+                Ok(path) => {
+                    self.attachment = Some(path);
+                    self.dirty = true;
+                }
+                Err(e) => self.notice(&format!("cannot save the pasted image: {e}")),
+            },
+            Paste::Text(text) => self.insert(&text),
+            Paste::Nothing => self.notice(EMPTY_CLIPBOARD),
         }
+    }
+
+    /// Drops the pending attachment: ctrl+x, or backspace on an empty composer.
+    pub(super) fn detach(&mut self) {
+        if self.attachment.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Backspace drops the pending attachment once the composer is empty, before it eats nothing.
+    pub(super) fn backspace(&mut self, key: KeyEvent) {
+        if self.attachment.is_some() && self.composer.lines().iter().all(String::is_empty) {
+            self.detach();
+        } else {
+            self.input(key);
+        }
+    }
+
+    fn notice(&mut self, text: &str) {
+        self.push(Role::Notice, String::new(), text.to_string());
+        self.dirty = true;
     }
 
     /// A left click in the worker panel picks that worker and prints what it is doing in the transcript.
@@ -922,6 +991,99 @@ fn last_line(text: &str) -> Option<&str> {
 /// The last component of the worker's directory, so a narrow panel stays readable.
 fn short_dir(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// What the clipboard held, decided once so the branch that acts on it is testable without one.
+#[derive(Debug, PartialEq)]
+enum Paste {
+    /// Raw RGBA8 pixels, as arboard hands them back.
+    Image {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
+    Text(String),
+    Nothing,
+}
+
+impl Paste {
+    /// Reads the clipboard, image first: a screenshot has no text form, and `get_text` fails on one.
+    fn read() -> Self {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else { return Self::Nothing };
+        if let Ok(image) = clipboard.get_image() {
+            return Self::Image { width: image.width, height: image.height, bytes: image.bytes.into_owned() };
+        }
+        match clipboard.get_text() {
+            Ok(text) if !text.trim().is_empty() => Self::Text(text),
+            _ => Self::Nothing,
+        }
+    }
+}
+
+/// Writes clipboard RGBA pixels as `paste-<millis>.png` under `dir` and returns its path.
+fn save_paste(dir: &Path, width: usize, height: usize, bytes: &[u8]) -> Result<PathBuf> {
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        bail!("the clipboard image is larger than 65535×65535");
+    };
+    let buffer =
+        image::RgbaImage::from_raw(width, height, bytes.to_vec()).context("the clipboard image is not RGBA8")?;
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let path = dir.join(format!("paste-{stamp}.png"));
+    buffer
+        .save_with_format(&path, image::ImageFormat::Png)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+    use image::GenericImageView;
+
+    fn two_by_two() -> Vec<u8> {
+        vec![
+            255, 0, 0, 255, 0, 255, 0, 255, //
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ]
+    }
+
+    #[test]
+    fn a_pasted_screenshot_is_written_as_a_png_and_attached() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        app.apply_paste(Paste::Image { width: 2, height: 2, bytes: two_by_two() }, dir.path());
+        let path = app.attachment.clone().expect("an attachment");
+        assert!(path.starts_with(dir.path()), "{}", path.display());
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        let png = fs::read(&path).expect("the png");
+        assert_eq!(png.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
+        assert_eq!(image::load_from_memory(&png).expect("decodable").dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn an_empty_clipboard_says_so_instead_of_doing_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        app.apply_paste(Paste::Nothing, dir.path());
+        assert!(app.attachment.is_none());
+        let last = app.entries.last().expect("a notice");
+        assert_eq!(last.role, Role::Notice);
+        assert_eq!(last.body, EMPTY_CLIPBOARD);
+    }
+
+    #[test]
+    fn an_attachment_rides_one_message_as_its_absolute_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        app.apply_paste(Paste::Image { width: 1, height: 1, bytes: vec![0, 0, 0, 255] }, dir.path());
+        app.insert("what is this?");
+        let prompt = app.take_prompt();
+        assert!(prompt.starts_with("what is this?"), "{prompt}");
+        assert!(prompt.contains("[attached image: "), "{prompt}");
+        assert!(prompt.contains(".png]"), "{prompt}");
+        assert!(app.attachment.is_none(), "the attachment belongs to one message");
+    }
 }
 
 #[cfg(test)]
