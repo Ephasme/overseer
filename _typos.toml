@@ -1,0 +1,3 @@
+# `PNGf` is AppleScript's PNG class name, not a misspelling.
+[default.extend-identifiers]
+PNGf = "PNGf"
