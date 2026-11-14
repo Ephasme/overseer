@@ -3,8 +3,8 @@ use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 use std::path::Path;
@@ -34,7 +34,7 @@ const TICK: Duration = Duration::from_millis(120);
 const PREVIEW_CHARS: usize = 400;
 
 /// Key hints on the right of the status line.
-const HINT: &str = "enter send · F2 workers · F3 output · ctrl+j newline · ctrl+d quit";
+const HINT: &str = "enter send · F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+d quit";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -339,6 +339,11 @@ pub(super) struct App {
     worker_panel: bool,
     /// Show what each tool call returned; off shows one row per call.
     tool_output: bool,
+    /// The worker panel's inner area and each worker block's rows in it, so a click can hit-test.
+    workers_area: Rect,
+    worker_rows: Vec<(u16, u16)>,
+    /// Index into `workers` of the worker a click picked.
+    selected: Option<usize>,
     busy: bool,
     busy_since: Instant,
     last_tick: Instant,
@@ -371,6 +376,9 @@ impl App {
             view: (0, 0),
             worker_panel: true,
             tool_output: true,
+            workers_area: Rect::ZERO,
+            worker_rows: Vec::new(),
+            selected: None,
             busy: false,
             busy_since: Instant::now(),
             last_tick: Instant::now(),
@@ -617,6 +625,8 @@ impl App {
             self.render_workers(frame, right);
             left
         } else {
+            self.workers_area = Rect::ZERO;
+            self.worker_rows.clear();
             body
         };
         self.render_transcript(frame, transcript);
@@ -649,10 +659,12 @@ impl App {
         frame.render_widget(paragraph, inner);
     }
 
-    fn render_workers(&self, frame: &mut Frame, area: Rect) {
+    fn render_workers(&mut self, frame: &mut Frame, area: Rect) {
         let panel = Block::bordered().border_style(DIM).title(" workers ");
         let inner = panel.inner(area);
         frame.render_widget(panel, area);
+        self.workers_area = inner;
+        self.worker_rows.clear();
         if self.workers.is_empty() {
             frame.render_widget(Paragraph::new(Span::styled("none yet", DIM)), inner);
             return;
@@ -660,18 +672,26 @@ impl App {
         let width = usize::from(inner.width.saturating_sub(2));
         let room = usize::from(inner.height);
         let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
         let mut hidden = false;
-        for worker in &self.workers {
+        for (index, worker) in self.workers.iter().enumerate() {
             let (glyph, colour, state) = worker_state(worker);
             let preview = self.preview_of(worker.id).and_then(last_line);
             let height = if preview.is_some() { 5 } else { 4 };
-            if rows.len() + height > room {
+            if rows.len() + usize::from(height) > room {
                 hidden = true;
                 break;
             }
+            let top = inner.y.saturating_add(u16::try_from(rows.len()).unwrap_or(u16::MAX));
+            ranges.push((top, top.saturating_add(height)));
+            let head = if self.selected == Some(index) {
+                Style::new().fg(colour).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new().fg(colour)
+            };
             rows.push(Line::from(vec![
-                Span::styled(format!("{} {glyph} ", worker.id), Style::new().fg(colour)),
-                Span::styled(state, Style::new().fg(colour)),
+                Span::styled(format!("{} {glyph} ", worker.id), head),
+                Span::styled(state, head),
             ]));
             rows.push(Line::from(Span::styled(format!("  {}", short_dir(&worker.dir)), DIM)));
             let task = worker.task.lines().next().unwrap_or_default();
@@ -687,6 +707,7 @@ impl App {
         if hidden {
             rows.push(Line::from(Span::styled("…", DIM)));
         }
+        self.worker_rows = ranges;
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
@@ -734,6 +755,40 @@ impl App {
     pub(super) fn insert(&mut self, text: &str) {
         self.composer.insert_str(text);
         self.dirty = true;
+    }
+
+    /// Ctrl+V: the system clipboard, which a terminal withholds from a TUI outside bracketed paste.
+    pub(super) fn paste(&mut self) {
+        if let Ok(mut clipboard) = arboard::Clipboard::new()
+            && let Ok(text) = clipboard.get_text()
+        {
+            self.insert(&text);
+        }
+    }
+
+    /// A left click in the worker panel picks that worker and prints what it is doing in the transcript.
+    pub(super) fn click(&mut self, column: u16, row: u16) {
+        if !self.workers_area.contains(Position::new(column, row)) {
+            return;
+        }
+        let Some(index) = self.worker_rows.iter().position(|&(top, bottom)| (top..bottom).contains(&row)) else {
+            return;
+        };
+        self.selected = Some(index);
+        self.dirty = true;
+        let Some(worker) = self.workers.get(index) else { return };
+        let (_, _, state) = worker_state(worker);
+        let mut body = format!("worker {} · {state} · {}", worker.id, worker.dir.display());
+        let task = worker.task.trim();
+        if !task.is_empty() {
+            body.push('\n');
+            body.push_str(task);
+        }
+        if let Some(preview) = self.preview_of(worker.id).map(str::trim).filter(|text| !text.is_empty()) {
+            body.push_str("\n▸ ");
+            body.push_str(preview);
+        }
+        self.push(Role::Notice, String::new(), body);
     }
 
     pub(super) fn input(&mut self, key: KeyEvent) {
@@ -1147,5 +1202,46 @@ mod tests {
         assert!(app.draining);
         app.apply(UiEvent::Busy(true));
         assert!(!app.draining);
+    }
+
+    #[test]
+    fn clicking_a_worker_prints_its_task_and_preview() {
+        let mut app = App::new("m");
+        app.workers = vec![WorkerView {
+            id: 7,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "run the tests".into(),
+            pending: 1,
+            failed: false,
+            finished: false,
+            busy_for: Some(Duration::from_secs(3)),
+        }];
+        app.apply(UiEvent::WorkerDelta { id: 7, text: "reading src/main.rs".into() });
+        screen(&mut app, 100, 24);
+        let (top, _) = app.worker_rows[0];
+        app.click(app.workers_area.x + 2, top);
+        assert_eq!(app.selected, Some(0));
+        let detail = &app.entries.last().expect("a click prints the worker").body;
+        assert!(detail.contains("run the tests"), "{detail}");
+        assert!(detail.contains("reading src/main.rs"), "{detail}");
+    }
+
+    #[test]
+    fn a_click_outside_the_worker_panel_picks_nothing() {
+        let mut app = App::new("m");
+        app.workers = vec![WorkerView {
+            id: 1,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "job".into(),
+            pending: 0,
+            failed: false,
+            finished: false,
+            busy_for: None,
+        }];
+        screen(&mut app, 100, 24);
+        let (top, _) = app.worker_rows[0];
+        app.click(1, top);
+        assert_eq!(app.selected, None);
+        assert!(app.entries.is_empty());
     }
 }
