@@ -1,6 +1,7 @@
 mod agent;
 mod clipboard;
 mod config;
+mod conflict;
 mod event;
 mod fleet;
 mod llm;
