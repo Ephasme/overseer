@@ -86,6 +86,8 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
             let _ = input.send(Event::Eof);
             app.drain();
         }
+        // A worker view owns the keys while it is open: esc returns to the fleet from there.
+        _ if app.in_worker_view() => app.worker_key(key),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
         KeyCode::Char('v') if ctrl => app.paste(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
@@ -97,6 +99,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
         KeyCode::End => app.scroll_bottom(),
         KeyCode::F(2) => app.toggle_workers(),
         KeyCode::F(3) => app.toggle_tool_output(),
+        KeyCode::F(4) => app.toggle_worker_view(),
         _ => app.input(key),
     }
 }
@@ -118,5 +121,43 @@ fn submit(app: &mut App, input: &Sender<Event>) {
             let _ = input.send(event);
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::WorkerView;
+    use std::path::PathBuf;
+
+    fn press(app: &mut App, code: KeyCode) {
+        let (input, queue) = mpsc::channel();
+        handle_key(app, &input, KeyEvent::from(code));
+        assert!(queue.try_recv().is_err(), "a key pressed in a worker view wakes the core");
+    }
+
+    /// Esc inside a worker view returns to the fleet: it neither types into the prompt nor quits.
+    #[test]
+    fn escape_leaves_a_worker_view_without_quitting() {
+        let mut app = App::new("m");
+        let worker = WorkerView {
+            id: 1,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "do it".into(),
+            pending: 0,
+            failed: false,
+            finished: false,
+            busy_for: None,
+        };
+        app.apply(UiEvent::Workers(vec![worker]));
+        press(&mut app, KeyCode::F(4));
+        assert!(app.in_worker_view(), "F4 opens a worker's view");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.take_prompt().is_empty(), "no key reaches the prompt from a worker view");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_worker_view(), "esc returns to the fleet");
+        assert!(!app.quit, "esc never quits the app");
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.take_prompt(), "x", "the prompt takes keys again once the view is closed");
     }
 }

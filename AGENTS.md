@@ -54,6 +54,8 @@
 - A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
 - Worker model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the worker panel and the core never feeds back to the overseer.
+- A worker view owns the keys while it is open (`tui::app::App::worker_key`): `esc` leaves it and never quits, and no key typed there reaches the overseer's prompt. Quitting stays on ctrl+c and ctrl+d.
+- A `UiEvent` carrying a worker id goes to that worker's `Stream` only; the lead's stream (`App::lead`) gets one lifecycle line per worker event and never a worker's tool call or message. `Stream` holds the entries, the flatten cache and the scroll position, so switching views loses neither buffer nor position. F3 is the one verbosity flag: it re-flows every stream.
 - Worker tool calls emit `Event::Progress` (start, then elapsed); it wakes nothing.
 - Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.

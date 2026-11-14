@@ -32,15 +32,20 @@ OVERSEER_API_KEY=...
 overseer
 ```
 
-On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Overseer answers stream in as they are generated, and each worker's live output shows under its row in the panel. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
+On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Overseer answers stream in as they are generated, and each worker's live output shows under its row in the panel. The transcript is the lead's own stream: a worker's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`). Every worker has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the worker panel counts the lines a closed view missed. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
 
 |Key|Effect|
 |---|---|
 |enter|send the prompt|
 |ctrl+j|new line in the prompt|
-|PageUp / PageDown|scroll the transcript; End follows new output again|
+|PageUp / PageDown|scroll the view you are in; End follows new output again|
 |F2|hide or show the worker panel|
 |F3|hide or show what tool calls returned, leaving one row per call|
+|F4|open the picked worker's view, or close it|
+|click a worker row|open that worker's view; click its `‹ fleet (esc)` line to come back|
+|↑ / ↓|inside a worker view: the previous or next worker|
+|PageUp / Home|inside a worker view: scroll its own stream|
+|esc|inside a worker view: back to the lead's stream; it never quits the app|
 |ctrl+p / ctrl+n|recall the previous or next prompt|
 |ctrl+d|quit once no worker is busy|
 |ctrl+c|quit now|
