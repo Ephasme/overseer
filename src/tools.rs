@@ -7,7 +7,10 @@ use std::{
     os::unix::process::CommandExt,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -49,6 +52,140 @@ pub(crate) fn kill_running() {
 pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
+/// Programs a read-only worker may still run.
+const READ_ONLY_PROGRAMS: &[&str] =
+    &["ls", "cat", "head", "tail", "wc", "stat", "file", "tree", "pwd", "rg", "grep", "diff", "jq", "git"];
+
+/// `git` subcommands a read-only worker may run; everything else writes to the repository.
+const READ_ONLY_GIT: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "branch",
+    "remote",
+    "ls-files",
+    "rev-parse",
+    "cat-file",
+    "grep",
+    "describe",
+    "shortlog",
+    "tag",
+];
+
+/// Shell syntax that writes, feeds a program or hides what runs.
+const WRITING_SHELL: &[&str] = &[">", "<", ";", "&&", "||", "&", "`", "$(", "\n"];
+
+/// What one worker may do, as Overseer set it.
+///
+/// A guard, not a sandbox: a `bash` command is matched as text, so the lists are only as good as
+/// they are tight. Workers already run unsandboxed, with the user's own rights.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Policy {
+    /// `write_file` is refused and `bash` runs only `READ_ONLY_PROGRAMS`.
+    pub(crate) read_only: bool,
+    /// Tool names this worker may never call.
+    pub(crate) deny_tools: Vec<String>,
+    /// When non-empty, a `bash` command must start with one of these.
+    pub(crate) allow_commands: Vec<String>,
+    /// A `bash` command that starts with one of these never runs. Deny beats allow.
+    pub(crate) deny_commands: Vec<String>,
+}
+
+impl Policy {
+    /// This policy with the fields that are given replaced; an omitted field keeps its value.
+    pub(crate) fn set(
+        &self,
+        read_only: Option<bool>,
+        deny_tools: Option<Vec<String>>,
+        allow_commands: Option<Vec<String>>,
+        deny_commands: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            read_only: read_only.unwrap_or(self.read_only),
+            deny_tools: deny_tools.unwrap_or_else(|| self.deny_tools.clone()),
+            allow_commands: allow_commands.unwrap_or_else(|| self.allow_commands.clone()),
+            deny_commands: deny_commands.unwrap_or_else(|| self.deny_commands.clone()),
+        }
+    }
+
+    /// The restriction lines a worker reads in its prompt; empty when nothing is restricted.
+    pub(crate) fn describe(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        if self.read_only {
+            lines.push(format!(
+                "- read-only: write_file is refused, and bash runs only {} (git only: {}).",
+                READ_ONLY_PROGRAMS.join(" "),
+                READ_ONLY_GIT.join(" ")
+            ));
+        }
+        if !self.deny_tools.is_empty() {
+            lines.push(format!("- banned tools: {}.", self.deny_tools.join(" ")));
+        }
+        if !self.allow_commands.is_empty() {
+            lines.push(format!("- bash commands must start with one of: {}.", self.allow_commands.join(" · ")));
+        }
+        if !self.deny_commands.is_empty() {
+            lines.push(format!("- banned bash commands: {}.", self.deny_commands.join(" · ")));
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!(
+            "Restrictions Overseer set on you; a call that breaks one comes back as an error:\n{}\n",
+            lines.join("\n")
+        )
+    }
+
+    /// Why this call may not run, or `None` when it may.
+    pub(crate) fn refuse(&self, name: &str, arguments: &str) -> Option<String> {
+        if self.deny_tools.iter().any(|tool| tool == name) {
+            return Some(format!("tool {name} is banned for this worker"));
+        }
+        if name == WRITE_FILE && self.read_only {
+            return Some("this worker is read-only: write_file is refused".into());
+        }
+        if name != BASH {
+            return None;
+        }
+        // Bad arguments are the dispatcher's error to report, not a policy decision.
+        let Ok(args) = serde_json::from_str::<BashArgs>(arguments) else { return None };
+        let command = args.command.trim();
+        if let Some(rule) = self.deny_commands.iter().find(|rule| command.starts_with(rule.as_str())) {
+            return Some(format!("this worker may not run commands starting with `{rule}`"));
+        }
+        if !self.allow_commands.is_empty() && !self.allow_commands.iter().any(|rule| command.starts_with(rule.as_str()))
+        {
+            return Some(format!("this worker runs only: {}", self.allow_commands.join(" · ")));
+        }
+        self.read_only.then(|| read_only_refusal(command)).flatten()
+    }
+}
+
+/// Why this command is not read-only, or `None` when every pipeline segment is.
+fn read_only_refusal(command: &str) -> Option<String> {
+    if let Some(token) = WRITING_SHELL.iter().find(|token| command.contains(*token)) {
+        return Some(format!("this worker is read-only: shell syntax `{token}` is not allowed"));
+    }
+    for segment in command.split('|') {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(program) = words.first() else { continue };
+        if !READ_ONLY_PROGRAMS.contains(program) {
+            return Some(format!(
+                "this worker is read-only: `{program}` is not on its list ({})",
+                READ_ONLY_PROGRAMS.join(" ")
+            ));
+        }
+        if *program == "git" {
+            let sub = words.get(1).copied().unwrap_or_default();
+            if !READ_ONLY_GIT.contains(&sub) {
+                return Some(format!("this worker is read-only: `git {sub}` writes ({})", READ_ONLY_GIT.join(" ")));
+            }
+        }
+    }
+    None
+}
 
 /// Output lines a tool result shows before the rest is only counted.
 pub(crate) const PREVIEW_LINES: usize = 4;
@@ -165,22 +302,47 @@ pub(crate) fn outcome(result: Result<String, String>) -> String {
     truncate(result.unwrap_or_else(|e| format!("error: {e}")))
 }
 
-/// Runs one tool call inside `working_dir`; the returned string goes back to the model as the tool result.
-pub(crate) fn execute(working_dir: &Path, name: &str, arguments: &str) -> String {
-    execute_with(working_dir, name, arguments, BASH_TIMEOUT)
+/// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
+pub(crate) fn execute_guarded(
+    working_dir: &Path,
+    name: &str,
+    arguments: &str,
+    policy: &Policy,
+    cancel: Option<&AtomicBool>,
+) -> String {
+    match policy.refuse(name, arguments) {
+        Some(refusal) => outcome(Err(refusal)),
+        None => outcome(run(working_dir, name, arguments, BASH_TIMEOUT, cancel)),
+    }
 }
 
-fn execute_with(working_dir: &Path, name: &str, arguments: &str, timeout: Duration) -> String {
-    let result = match name {
-        BASH => parse_args::<BashArgs>(arguments).and_then(|args| bash(working_dir, &args, timeout)),
+fn run(
+    working_dir: &Path,
+    name: &str,
+    arguments: &str,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<String, String> {
+    match name {
+        BASH => parse_args::<BashArgs>(arguments).and_then(|args| bash(working_dir, &args, timeout, cancel)),
         READ_FILE => parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args)),
         WRITE_FILE => parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args)),
         _ => Err(format!("unknown tool {name}")),
-    };
-    outcome(result)
+    }
 }
 
-fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration) -> Result<String, String> {
+/// How a `bash` command ended.
+#[derive(Clone, Copy)]
+enum Stopped {
+    /// The command exited by itself.
+    Exited,
+    /// The command outlived its timeout.
+    TimedOut,
+    /// Overseer interrupted the turn: kill the command rather than let it run to its timeout.
+    Interrupted,
+}
+
+fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<String, String> {
     // Its own process group, so a timeout kills the command's children too: killing `sh` alone leaves a
     // grandchild holding the pipes open, and reading their output then blocks until it exits by itself.
     let mut child = Command::new("sh")
@@ -198,40 +360,57 @@ fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration) -> Result<String
     register(group);
     let mut stdout = drain(child.stdout.take());
     let mut stderr = drain(child.stderr.take());
-    let waited = wait_with_deadline(&mut child, group, timeout);
+    let waited = wait_with_deadline(&mut child, group, timeout, cancel);
     deregister(group);
-    let (status, timed_out) = waited?;
+    let (status, stopped) = waited?;
     let (out, out_cut) = stdout.take_output();
     let (err, err_cut) = stderr.take_output();
-    Ok(format_output(status, timed_out, timeout, (&out, out_cut), (&err, err_cut)))
+    Ok(format_output(status, stopped, timeout, (&out, out_cut), (&err, err_cut)))
 }
 
-/// Waits for `child` to exit, killing its process group once `timeout` elapses.
-fn wait_with_deadline(child: &mut Child, group: i32, timeout: Duration) -> Result<(ExitStatus, bool), String> {
+/// Waits for `child` to exit, killing its process group once `timeout` elapses or `cancel` is set.
+fn wait_with_deadline(
+    child: &mut Child,
+    group: i32,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<(ExitStatus, Stopped), String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Ok((status, false));
+            return Ok((status, Stopped::Exited));
         }
-        if Instant::now() >= deadline {
-            let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
-            let _ = child.kill();
-            let status = child.wait().map_err(|e| e.to_string())?;
-            return Ok((status, true));
-        }
-        thread::sleep(Duration::from_millis(20));
+        let stopped = if Instant::now() >= deadline {
+            Some(Stopped::TimedOut)
+        } else if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            Some(Stopped::Interrupted)
+        } else {
+            None
+        };
+        let Some(stopped) = stopped else {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+        let _ = child.kill();
+        let status = child.wait().map_err(|e| e.to_string())?;
+        return Ok((status, stopped));
     }
 }
 
 fn format_output(
     status: ExitStatus,
-    timed_out: bool,
+    stopped: Stopped,
     timeout: Duration,
     (out, out_cut): (&[u8], bool),
     (err, err_cut): (&[u8], bool),
 ) -> String {
     let code = status.code().map_or_else(|| "killed by signal".to_string(), |c| c.to_string());
-    let killed = if timed_out { format!("killed after {}s\n", timeout.as_secs()) } else { String::new() };
+    let killed = match stopped {
+        Stopped::Exited => String::new(),
+        Stopped::TimedOut => format!("killed after {}s\n", timeout.as_secs()),
+        Stopped::Interrupted => "interrupted by overseer\n".into(),
+    };
     let cut = if out_cut || err_cut {
         format!("\n[output truncated: only the first {MAX_OUTPUT_BYTES} bytes of each stream were kept]")
     } else {
@@ -349,6 +528,11 @@ fn ceil_boundary(s: &str, at: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// A tool call with no policy and no cancellation, as a worker runs one outside any restriction.
+    fn execute(dir: &Path, name: &str, arguments: &str) -> String {
+        execute_guarded(dir, name, arguments, &Policy::default(), None)
+    }
+
     #[test]
     fn bash_runs_in_cwd_and_reports_exit_code_and_streams() {
         let dir = tempfile::tempdir().unwrap();
@@ -363,7 +547,8 @@ mod tests {
     fn bash_is_killed_past_its_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
-        let out = execute_with(dir.path(), BASH, r#"{"command":"echo before; sleep 30"}"#, Duration::from_millis(200));
+        let command = r#"{"command":"echo before; sleep 30"}"#;
+        let out = outcome(run(dir.path(), BASH, command, Duration::from_millis(200), None));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -462,5 +647,63 @@ mod tests {
         let out = execute(dir.path(), READ_FILE, r#"{"path":"big"}"#);
         assert!(out.ends_with("28000 is the read budget, not the file size]"), "{}", &out[out.len() - 90..]);
         assert!(out.len() < MAX_OUTPUT_BYTES, "{}", out.len());
+    }
+    /// A read-only policy and the calls it must refuse.
+    #[test]
+    fn read_only_refuses_writes_and_writing_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy { read_only: true, ..Policy::default() };
+        let write = json!({"path": "x", "content": "y"}).to_string();
+        assert!(
+            execute_guarded(dir.path(), WRITE_FILE, &write, &policy, None)
+                .starts_with("error: this worker is read-only"),
+            "write_file ran in a read-only worker"
+        );
+        for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
+            let args = json!({"command": command}).to_string();
+            let out = execute_guarded(dir.path(), BASH, &args, &policy, None);
+            assert!(out.starts_with("error: this worker is read-only"), "`{command}` ran: {out}");
+        }
+        let read = json!({"command": "ls | head -5"}).to_string();
+        let out = execute_guarded(dir.path(), BASH, &read, &policy, None);
+        assert!(!out.starts_with("error:"), "a read-only pipeline was refused: {out}");
+    }
+
+    #[test]
+    fn denied_tools_and_commands_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy {
+            read_only: false,
+            deny_tools: vec![READ_FILE.into()],
+            allow_commands: vec!["ls".into(), "echo".into()],
+            deny_commands: vec!["echo secret".into()],
+        };
+        let read = json!({"path": "f"}).to_string();
+        assert_eq!(
+            execute_guarded(dir.path(), READ_FILE, &read, &policy, None),
+            "error: tool read_file is banned for this worker"
+        );
+        let denied = json!({"command": "echo secret"}).to_string();
+        assert_eq!(
+            execute_guarded(dir.path(), BASH, &denied, &policy, None),
+            "error: this worker may not run commands starting with `echo secret`"
+        );
+        let outside = json!({"command": "pwd"}).to_string();
+        assert_eq!(
+            execute_guarded(dir.path(), BASH, &outside, &policy, None),
+            "error: this worker runs only: ls · echo"
+        );
+        let allowed = json!({"command": "ls"}).to_string();
+        assert!(!execute_guarded(dir.path(), BASH, &allowed, &policy, None).starts_with("error:"));
+    }
+
+    #[test]
+    fn a_cancelled_command_is_killed_without_waiting_for_its_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let out = execute_guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &Policy::default(), Some(&cancel));
+        assert!(out.contains("interrupted by overseer"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 }

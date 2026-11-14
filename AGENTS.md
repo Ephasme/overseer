@@ -50,6 +50,8 @@
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - A worker's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
+- An overseer order reaches a worker through `fleet::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused worker is not busy, so ctrl+D stops waiting on it.
+- A worker's `Policy` is checked on every tool call and rewritten into its system prompt each turn, so a restriction takes effect without a restart. `read_only` matches `bash` commands as text against a fixed list: a guard, not a sandbox.
 - Quitting calls `tools::kill_running`: without it a worker's `cargo build` outlives the process, because the session never reaps a group that is still running.
 - A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.

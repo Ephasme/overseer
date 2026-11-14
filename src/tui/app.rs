@@ -147,6 +147,7 @@ impl Entry {
                     WorkerEvent::Reply => ("says", theme::INFO),
                     WorkerEvent::Finished => ("done", theme::SUCCESS),
                     WorkerEvent::Failed => ("failed", theme::ERROR),
+                    WorkerEvent::Interrupted => ("interrupted", theme::WARNING),
                 };
                 let prefix = format!("[{}] {label} ", self.title);
                 block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::MUTED), width)
@@ -1069,8 +1070,10 @@ impl App {
             spans.push(Span::styled("● idle", Style::new().fg(theme::MUTED)));
         }
         let working = self.workers.iter().filter(|w| w.pending > 0 && !w.finished).count();
-        let idle = self.workers.len().saturating_sub(working);
-        spans.push(Span::styled(format!(" · {working} working · {idle} idle"), Style::new().fg(theme::MUTED)));
+        let paused = self.workers.iter().filter(|w| w.paused).count();
+        let idle = self.workers.len().saturating_sub(working + paused);
+        let paused = if paused == 0 { String::new() } else { format!("{paused} paused · ") };
+        spans.push(Span::styled(format!(" · {working} working · {paused}{idle} idle"), Style::new().fg(theme::MUTED)));
         if let Some(scroll) = self.scrolled() {
             spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::WARNING)));
         }
@@ -1490,14 +1493,22 @@ impl App {
 }
 
 fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
+    if worker.stopped {
+        return ("■", theme::FAINT, "stopped".into());
+    }
+    if worker.paused {
+        return ("❚❚", theme::INFO, "paused".into());
+    }
     if worker.pending > 0 && !worker.finished {
         let secs = worker.busy_for.unwrap_or_default().as_secs();
-        return ("●", theme::WARNING, format!("working {secs}s"));
+        let read_only = if worker.read_only { " · read-only" } else { "" };
+        return ("●", theme::WARNING, format!("working {secs}s{read_only}"));
     }
     if worker.failed || worker.pending > 0 {
         return ("✕", theme::ERROR, "failed".into());
     }
-    ("○", theme::FAINT, "idle".into())
+    let read_only = if worker.read_only { " · read-only" } else { "" };
+    ("○", theme::FAINT, format!("idle{read_only}"))
 }
 
 /// The last non-empty line of a streamed preview.
@@ -1793,6 +1804,9 @@ mod tests {
             pending: 1,
             failed: false,
             finished: true,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: Some(Duration::from_secs(9)),
         }];
         app.apply(UiEvent::Workers(app.workers.clone()));
@@ -1872,6 +1886,9 @@ mod tests {
             pending: 0,
             failed: false,
             finished: true,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: None,
         }];
         let screen = screen(&mut app, 100, 24);
@@ -1895,6 +1912,9 @@ mod tests {
             pending: 1,
             failed: false,
             finished: false,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: Some(Duration::from_secs(3)),
         }];
         app.apply(UiEvent::WorkerDelta { id: 1, text: "reading the config".into() });
@@ -1915,6 +1935,9 @@ mod tests {
             pending: 1,
             failed: false,
             finished: true,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: Some(Duration::from_secs(3)),
         }];
         let screen = screen(&mut app, 100, 24);
@@ -1986,6 +2009,9 @@ mod tests {
             pending: 0,
             failed: false,
             finished: false,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: None,
         }
     }

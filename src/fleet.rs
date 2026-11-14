@@ -5,11 +5,15 @@ use crate::prompt;
 use crate::repos;
 use crate::tools;
 use serde::Deserialize;
-use std::fs::File;
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, PoisonError,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,12 +26,30 @@ const TASK_PREVIEW_WIDTH: usize = 80;
 /// Message `/resume` sends: the worker keeps its history, so its task is already in it.
 const CONTINUE: &str = "continue";
 
+/// How long a worker waits on its inbox before looking for an urgent message or a stop.
+const IDLE_POLL: Duration = Duration::from_millis(50);
+
 /// Arguments of each overseer tool. `deny_unknown_fields` turns a wrong key into an error naming the right ones.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnArgs {
     path: Option<String>,
     task: String,
+    read_only: Option<bool>,
+    deny_tools: Option<Vec<String>>,
+    allow_commands: Option<Vec<String>>,
+    deny_commands: Option<Vec<String>>,
+}
+
+impl SpawnArgs {
+    fn policy(&self) -> tools::Policy {
+        tools::Policy::default().set(
+            self.read_only,
+            self.deny_tools.clone(),
+            self.allow_commands.clone(),
+            self.deny_commands.clone(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -35,6 +57,35 @@ struct SpawnArgs {
 struct MessageArgs {
     id: usize,
     text: String,
+    #[serde(default)]
+    urgent: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlArgs {
+    id: usize,
+    action: Action,
+    task: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    Pause,
+    Resume,
+    Stop,
+    Restart,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestrictArgs {
+    id: usize,
+    read_only: Option<bool>,
+    deny_tools: Option<Vec<String>>,
+    allow_commands: Option<Vec<String>>,
+    deny_commands: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +98,123 @@ struct ReplyArgs {
     text: String,
 }
 
+/// What Overseer may do to a worker at any moment: hold it, end it, or preempt its turn.
+#[derive(Default)]
+struct Control {
+    gate: Mutex<Gate>,
+    wake: Condvar,
+    /// Set to abandon the running turn; the worker clears it when it starts an instruction.
+    interrupted: AtomicBool,
+    policy: Mutex<tools::Policy>,
+}
+
+#[derive(Default)]
+struct Gate {
+    paused: bool,
+    stopped: bool,
+    /// `restart` asked for a clean history at the next instruction.
+    reset: bool,
+    /// Urgent instructions, read before the inbox so urgency beats the backlog.
+    urgent: VecDeque<String>,
+}
+
+impl Control {
+    fn lock(&self) -> MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn paused(&self) -> bool {
+        self.lock().paused
+    }
+
+    fn pause(&self) {
+        self.lock().paused = true;
+    }
+
+    fn unpause(&self) {
+        self.lock().paused = false;
+        self.wake.notify_all();
+    }
+
+    /// Ends the worker's turn and its thread: the next instruction never comes.
+    fn stop(&self) {
+        let mut gate = self.lock();
+        gate.stopped = true;
+        gate.urgent.clear();
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    /// Delivers `text` ahead of the backlog and cuts the running turn short.
+    fn urgent(&self, text: String) {
+        let mut gate = self.lock();
+        gate.urgent.push_back(text);
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    /// Same as `urgent`, and the worker also forgets its history when it reads it.
+    fn restart(&self, text: String) {
+        let mut gate = self.lock();
+        gate.reset = true;
+        self.interrupted.store(true, Ordering::SeqCst);
+        gate.urgent.push_back(text);
+        self.wake.notify_all();
+    }
+
+    fn take_reset(&self) -> bool {
+        std::mem::take(&mut self.lock().reset)
+    }
+
+    fn clear_interrupt(&self) {
+        self.interrupted.store(false, Ordering::SeqCst);
+    }
+
+    fn flag(&self) -> &AtomicBool {
+        &self.interrupted
+    }
+
+    fn policy(&self) -> tools::Policy {
+        self.policy.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn set_policy(&self, policy: tools::Policy) {
+        *self.policy.lock().unwrap_or_else(PoisonError::into_inner) = policy;
+    }
+
+    /// The next instruction to run, or `None` once the worker is stopped.
+    ///
+    /// Urgent messages come first, then the inbox. A pause holds the inbox but never an urgent
+    /// message: an order that interrupts a turn also outranks the pause.
+    fn next(&self, inbox: &Receiver<String>) -> Option<String> {
+        // Read from an inbox that was not paused yet: hold it rather than run it behind the pause.
+        let mut held: Option<String> = None;
+        loop {
+            {
+                let mut gate = self.lock();
+                if gate.stopped {
+                    return None;
+                }
+                if let Some(text) = gate.urgent.pop_front() {
+                    return Some(text);
+                }
+                if gate.paused {
+                    drop(self.wake.wait(gate).unwrap_or_else(PoisonError::into_inner));
+                    continue;
+                }
+                if let Some(text) = held.take() {
+                    return Some(text);
+                }
+            }
+            match inbox.recv_timeout(IDLE_POLL) {
+                Ok(text) => held = Some(text),
+                Err(RecvTimeoutError::Timeout) => {}
+                // A closed inbox means a stop, which also sets `stopped`; nothing more will come.
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
 /// One worker tool call, as the user sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Progress {
@@ -58,9 +226,12 @@ pub(crate) enum Progress {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WorkerEvent {
+    /// A progress note; it does not end the instruction it belongs to.
     Reply,
     Finished,
     Failed,
+    /// An Overseer order cut the instruction short: neither an answer nor a failure.
+    Interrupted,
 }
 
 impl WorkerEvent {
@@ -69,6 +240,7 @@ impl WorkerEvent {
             WorkerEvent::Reply => "says",
             WorkerEvent::Finished => "finished",
             WorkerEvent::Failed => "failed",
+            WorkerEvent::Interrupted => "interrupted",
         }
     }
 }
@@ -119,6 +291,7 @@ impl Event {
 }
 
 /// One worker as the panels show it.
+#[allow(clippy::struct_excessive_bools)] // four independent flags, each shown on its own.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WorkerView {
     pub(crate) id: usize,
@@ -129,6 +302,12 @@ pub(crate) struct WorkerView {
     pub(crate) pending: usize,
     pub(crate) failed: bool,
     pub(crate) finished: bool,
+    /// Overseer stopped it: its thread is ending and it takes no more work.
+    pub(crate) stopped: bool,
+    /// Overseer paused it: it holds every queued instruction.
+    pub(crate) paused: bool,
+    /// Its tools refuse every write.
+    pub(crate) read_only: bool,
     /// How long the current instruction has been running.
     pub(crate) busy_for: Option<Duration>,
 }
@@ -146,7 +325,10 @@ struct Described {
     task: Option<String>,
     text: Option<String>,
     command: Option<String>,
+    action: Option<String>,
     id: Option<u64>,
+    #[serde(default)]
+    urgent: bool,
 }
 
 /// A string field of the arguments, or `""` when absent.
@@ -171,7 +353,12 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
             let dir = if path.is_empty() { prompt::DEFAULT_WORKING_DIR } else { path };
             format!("{dir} · {}", field(args.task.as_ref()))
         }
-        prompt::MESSAGE_WORKER => format!("#{} · {}", args.id.unwrap_or_default(), field(args.text.as_ref())),
+        prompt::MESSAGE_WORKER => {
+            let urgent = if args.urgent { "urgent " } else { "" };
+            format!("#{urgent}{} · {}", args.id.unwrap_or_default(), field(args.text.as_ref()))
+        }
+        prompt::CONTROL_WORKER => format!("#{} · {}", args.id.unwrap_or_default(), field(args.action.as_ref())),
+        prompt::RESTRICT_WORKER => format!("#{}", args.id.unwrap_or_default()),
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => first_line(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
@@ -191,7 +378,10 @@ struct Worker {
     /// Instructions sent but not yet finished. A `Reply` does not count.
     pending: usize,
     failed: bool,
-    inbox: Sender<String>,
+    /// Overseer stopped it; the entry stays as a record and the inbox is gone.
+    stopped: bool,
+    control: Arc<Control>,
+    inbox: Option<Sender<String>>,
     /// When the current instruction started; `None` once the worker is idle.
     busy_since: Option<Instant>,
     /// The worker thread. Its exit is the authoritative liveness signal.
@@ -235,13 +425,18 @@ impl Fleet {
                 pending: w.pending,
                 failed: w.failed,
                 finished: w.finished(),
+                stopped: w.stopped,
+                paused: w.control.paused(),
+                read_only: w.control.policy().read_only,
                 busy_for: w.busy_since.map(|since| since.elapsed()),
             })
             .collect()
     }
 
+    /// Whether any worker is doing work: a paused one holds its instruction by order, so it does not
+    /// keep the drain alive.
     pub(crate) fn busy(&self) -> bool {
-        self.workers.iter().any(|w| w.pending > 0 && !w.finished())
+        self.workers.iter().any(|w| w.pending > 0 && !w.finished() && !w.control.paused())
     }
 
     /// Updates worker status from one of its events. Call before handing the event to the overseer.
@@ -258,7 +453,7 @@ impl Fleet {
 
     /// Re-tasks a worker with a continue message, clearing a previous failure. Returns the line to print.
     pub(crate) fn resume(&mut self, arg: &str) -> String {
-        let result = resume_id(arg).and_then(|id| self.message_worker(id, CONTINUE, true).map(|_| id));
+        let result = resume_id(arg).and_then(|id| self.message_worker(id, CONTINUE, true, false).map(|_| id));
         match result {
             Ok(id) => format!("worker {id} resumed"),
             Err(e) => format!("error: {e}; worker ids: {}", self.ids()),
@@ -281,10 +476,15 @@ impl Fleet {
         let result = match call.function.name.as_str() {
             prompt::SPAWN_WORKER => tools::parse_args::<SpawnArgs>(arguments).and_then(|args| {
                 let path = args.path.as_deref().unwrap_or(prompt::DEFAULT_WORKING_DIR);
-                self.start_worker(path, &args.task).map(|id| format!("worker {id} started"))
+                self.start_worker(path, &args.task, args.policy()).map(|id| format!("worker {id} started"))
             }),
             prompt::MESSAGE_WORKER => tools::parse_args::<MessageArgs>(arguments)
-                .and_then(|args| self.message_worker(args.id, &args.text, false)),
+                .and_then(|args| self.message_worker(args.id, &args.text, false, args.urgent)),
+            prompt::CONTROL_WORKER => tools::parse_args::<ControlArgs>(arguments)
+                .and_then(|args| self.control_worker(args.id, args.action, args.task.as_deref())),
+            prompt::RESTRICT_WORKER => {
+                tools::parse_args::<RestrictArgs>(arguments).and_then(|args| self.restrict_worker(&args))
+            }
             prompt::LIST_WORKERS => tools::parse_args::<NoArgs>(arguments).map(|_| self.list_workers()),
             prompt::LIST_REPOS => tools::parse_args::<NoArgs>(arguments).map(|_| self.list_repos()),
             other => Err(format!("unknown tool {other}")),
@@ -297,11 +497,42 @@ impl Fleet {
         id.checked_sub(1).and_then(|i| self.workers.get_mut(i))
     }
 
-    fn start_worker(&mut self, path: &str, task: &str) -> Result<usize, String> {
+    fn start_worker(&mut self, path: &str, task: &str, policy: tools::Policy) -> Result<usize, String> {
         let working_dir = config::resolve_dir(path, &self.home)?;
         let id = self.workers.len() + 1;
         let log_path = self.log_dir.join(format!("worker-{id}.log"));
-        let log = File::create(&log_path).map_err(|e| config::io_error(log_path.display(), &e))?;
+        let control = Arc::new(Control::default());
+        control.set_policy(policy);
+        let (inbox, handle) = self.spawn_thread(id, &working_dir, Arc::clone(&control), task.to_string(), &log_path)?;
+        self.workers.push(Worker {
+            id,
+            working_dir,
+            initial_task: task.to_string(),
+            pending: 1,
+            failed: false,
+            stopped: false,
+            control,
+            inbox: Some(inbox),
+            busy_since: Some(Instant::now()),
+            handle,
+        });
+        Ok(id)
+    }
+
+    /// Starts one worker thread over an existing log file: its inbox, and the handle proving it lives.
+    fn spawn_thread(
+        &self,
+        id: usize,
+        working_dir: &Path,
+        control: Arc<Control>,
+        task: String,
+        log_path: &Path,
+    ) -> Result<(Sender<String>, JoinHandle<()>), String> {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| config::io_error(log_path.display(), &e))?;
         let (inbox, instructions) = mpsc::channel();
         let (llm, sender) = (Arc::clone(&self.llm), self.sender.clone());
         let stream_sender = sender.clone();
@@ -313,42 +544,132 @@ impl Fleet {
                 }
             }),
         ));
-        let worker_dir = working_dir.clone();
+        let worker_dir = working_dir.to_path_buf();
         let handle = thread::spawn(move || {
             let mut log = log;
-            let mut run = WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log, calls: 0 };
-            run.run(streamed.as_ref(), instructions);
+            let mut run =
+                WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log, calls: 0, control: &control };
+            run.run(streamed.as_ref(), &instructions);
         });
         // The thread is already waiting on the channel, so a closed receiver here means it died on
         // startup: report that rather than leaving a worker in the roster that will never answer.
-        inbox.send(task.to_string()).map_err(|_| format!("worker {id} could not be started"))?;
-        self.workers.push(Worker {
-            id,
-            working_dir,
-            initial_task: task.to_string(),
-            pending: 1,
-            failed: false,
-            busy_since: Some(Instant::now()),
-            inbox,
-            handle,
-        });
-        Ok(id)
+        inbox.send(task).map_err(|_| format!("worker {id} could not be started"))?;
+        Ok((inbox, handle))
     }
 
-    fn message_worker(&mut self, id: usize, text: &str, clear_failure: bool) -> Result<String, String> {
+    fn control_worker(&mut self, id: usize, action: Action, task: Option<&str>) -> Result<String, String> {
+        match action {
+            Action::Stop => self.stop_worker(id),
+            Action::Restart => self.restart_worker(id, task),
+            Action::Pause => {
+                let worker = self.worker_mut(id).ok_or_else(|| format!("no worker {id}"))?;
+                if worker.finished() {
+                    return Err(format!("worker {id} is gone"));
+                }
+                worker.control.pause();
+                Ok(format!("worker {id} paused; it finishes the current instruction, then holds every queued one"))
+            }
+            Action::Resume => {
+                let worker = self.worker_mut(id).ok_or_else(|| format!("no worker {id}"))?;
+                if worker.finished() {
+                    return Err(format!("worker {id} is gone"));
+                }
+                if worker.stopped {
+                    return Err(format!("worker {id} is stopped; restart it"));
+                }
+                worker.control.unpause();
+                Ok(format!("worker {id} resumed"))
+            }
+        }
+    }
+
+    fn stop_worker(&mut self, id: usize) -> Result<String, String> {
+        let worker = self.worker_mut(id).ok_or_else(|| format!("no worker {id}"))?;
+        worker.control.stop();
+        worker.inbox = None;
+        worker.stopped = true;
+        Ok(format!("worker {id} stopped"))
+    }
+
+    /// Cuts the running turn, drops the history, and starts `task` from scratch.
+    ///
+    /// A live thread is reused, so nothing races on the worker id; a dead one is replaced.
+    fn restart_worker(&mut self, id: usize, task: Option<&str>) -> Result<String, String> {
+        let Some(index) = id.checked_sub(1).filter(|index| *index < self.workers.len()) else {
+            return Err(format!("no worker {id}"));
+        };
+        let Some(worker) = self.workers.get(index) else { return Err(format!("no worker {id}")) };
+        let task = task.map_or_else(|| worker.initial_task.clone(), str::to_string);
+        if !worker.finished() {
+            let worker = self.workers.get_mut(index).ok_or_else(|| format!("no worker {id}"))?;
+            worker.control.restart(task.clone());
+            if worker.pending == 0 {
+                worker.busy_since = Some(Instant::now());
+            }
+            worker.pending += 1;
+            worker.failed = false;
+            worker.initial_task = task;
+            return Ok(format!("worker {id} restarting: its turn is cut and its history dropped"));
+        }
+        // Its thread is gone: a fresh one takes over the id, the directory, the log and the policy.
+        let dir = worker.working_dir.clone();
+        let policy = worker.control.policy();
+        let log_path = self.log_dir.join(format!("worker-{id}.log"));
+        let control = Arc::new(Control::default());
+        control.set_policy(policy);
+        let (inbox, handle) = self.spawn_thread(id, &dir, Arc::clone(&control), task.clone(), &log_path)?;
+        let worker = self.workers.get_mut(index).ok_or_else(|| format!("no worker {id}"))?;
+        worker.control = control;
+        worker.inbox = Some(inbox);
+        worker.handle = handle;
+        worker.initial_task = task;
+        worker.pending = 1;
+        worker.failed = false;
+        worker.stopped = false;
+        worker.busy_since = Some(Instant::now());
+        Ok(format!("worker {id} restarted from a clean history"))
+    }
+
+    fn restrict_worker(&mut self, args: &RestrictArgs) -> Result<String, String> {
+        let worker = self.worker_mut(args.id).ok_or_else(|| format!("no worker {}", args.id))?;
+        let policy = worker.control.policy().set(
+            args.read_only,
+            args.deny_tools.clone(),
+            args.allow_commands.clone(),
+            args.deny_commands.clone(),
+        );
+        worker.control.set_policy(policy.clone());
+        let described = policy.describe();
+        let restrictions =
+            if described.is_empty() { "no restriction".to_string() } else { described.trim_end().to_string() };
+        Ok(format!("worker {} restricted to: {restrictions}", args.id))
+    }
+
+    fn message_worker(&mut self, id: usize, text: &str, clear_failure: bool, urgent: bool) -> Result<String, String> {
         let worker = self.worker_mut(id).ok_or_else(|| format!("no worker {id}"))?;
         if worker.finished() {
             return Err(format!("worker {id} is gone"));
         }
-        worker.inbox.send(text.to_string()).map_err(|_| format!("worker {id} is gone"))?;
-        if worker.pending == 0 {
+        if worker.stopped {
+            return Err(format!("worker {id} is stopped; restart it"));
+        }
+        if urgent {
+            worker.control.urgent(text.to_string());
+        } else {
+            let inbox = worker.inbox.as_ref().ok_or_else(|| format!("worker {id} is stopped"))?;
+            inbox.send(text.to_string()).map_err(|_| format!("worker {id} is gone"))?;
+        }
+        let busy = worker.pending > 0;
+        if !busy {
             worker.busy_since = Some(Instant::now());
         }
         worker.pending += 1;
         if clear_failure {
             worker.failed = false;
         }
-        Ok(if worker.pending > 1 {
+        Ok(if urgent && busy {
+            format!("interrupted worker {id}; it reads your message now")
+        } else if worker.pending > 1 {
             format!("queued for worker {id}; it will read it after its current instruction")
         } else {
             format!("sent to worker {id}")
@@ -363,16 +684,23 @@ impl Fleet {
             .workers
             .iter()
             .map(|w| {
-                let state = if w.pending > 0 {
-                    if w.finished() { "failed" } else { "working" }
+                let state = if w.stopped {
+                    "stopped"
+                } else if w.finished() {
+                    "failed"
+                } else if w.control.paused() {
+                    "paused"
+                } else if w.pending > 0 {
+                    "working"
                 } else if w.failed {
                     "failed"
                 } else {
                     "idle"
                 };
+                let read_only = if w.control.policy().read_only { " · read-only" } else { "" };
                 let task: String =
                     w.initial_task.lines().next().unwrap_or("").chars().take(TASK_PREVIEW_WIDTH).collect();
-                format!("worker {} [{state}] {} | {task}", w.id, w.working_dir.display())
+                format!("worker {} [{state}{read_only}] {} | {task}", w.id, w.working_dir.display())
             })
             .collect();
         lines.join("\n")
@@ -404,30 +732,51 @@ fn resume_id(arg: &str) -> Result<usize, String> {
     }
 }
 
-/// One worker thread: its identity, its working directory, where progress goes, and its log.
+/// One worker thread: its identity, its working directory, where progress goes, its log and its orders.
 struct WorkerRun<'a> {
     id: usize,
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
     log: &'a mut File,
+    control: &'a Control,
     /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
     calls: usize,
 }
 
 impl WorkerRun<'_> {
-    /// Runs every instruction the worker receives until its inbox closes.
-    fn run(&mut self, llm: &dyn Llm, instructions: Receiver<String>) {
-        let mut history = vec![Message::system(prompt::worker_prompt(self.working_dir))];
+    /// Runs every instruction the worker receives until Overseer stops it or the inbox closes.
+    fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
+        let control = self.control;
         let tool_defs = prompt::worker_tool_definitions();
+        let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the worker.
-        for input in instructions {
+        while let Some(input) = control.next(instructions) {
+            control.clear_interrupt();
+            if control.take_reset() {
+                history.clear();
+            }
+            // The prompt carries the restrictions, so a policy changed between turns reaches the model.
+            let prompt = prompt::worker_prompt(self.working_dir, &control.policy());
+            if let Some(first) = history.first_mut() {
+                first.content = Some(prompt);
+            } else {
+                history.push(Message::system(prompt));
+            }
             let _ = writeln!(self.log, "> {input}");
             let result = {
-                let mut turn = Turn { llm, tool_defs: &tool_defs, execute: &mut |call: &ToolCall| self.execute(call) };
+                let mut turn = Turn {
+                    llm,
+                    tool_defs: &tool_defs,
+                    execute: &mut |call: &ToolCall| self.execute(call, control),
+                    cancel: Some(control.flag()),
+                };
                 turn.run(&mut history, &input)
             };
             let (kind, text) = match result {
                 Ok(answer) => (WorkerEvent::Finished, answer),
+                Err(e) if e.to_string() == "interrupted" => {
+                    (WorkerEvent::Interrupted, "Overseer cut its turn short".to_string())
+                }
                 Err(e) => (WorkerEvent::Failed, format!("{e:#}")),
             };
             let _ = writeln!(self.log, "= {kind:?}: {text}");
@@ -435,8 +784,8 @@ impl WorkerRun<'_> {
         }
     }
 
-    /// Runs one tool call, logging it and reporting its progress to the user.
-    fn execute(&mut self, call: &ToolCall) -> String {
+    /// Runs one tool call under the worker's policy, logging it and reporting its progress to the user.
+    fn execute(&mut self, call: &ToolCall, control: &Control) -> String {
         let _ = writeln!(self.log, "· {} {}", call.function.name, call.function.arguments);
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
@@ -448,16 +797,27 @@ impl WorkerRun<'_> {
             let summary = describe(&call.function.name, &call.function.arguments);
             progress(self.sender, self.id, Progress::Started { call: seq, tool: call.function.name.clone(), summary });
         }
+        let policy = control.policy();
         let output = if call.function.name == prompt::REPLY {
-            match tools::parse_args::<ReplyArgs>(&call.function.arguments).map(|args| args.text) {
-                Ok(text) => {
-                    let _ = self.sender.send(Event::Worker { id: self.id, kind: WorkerEvent::Reply, text });
-                    "sent to overseer".to_string()
-                }
-                Err(e) => format!("error: {e}"),
+            match policy.refuse(&call.function.name, &call.function.arguments) {
+                Some(refusal) => format!("error: {refusal}"),
+                None => match tools::parse_args::<ReplyArgs>(&call.function.arguments) {
+                    Ok(args) => {
+                        let _ =
+                            self.sender.send(Event::Worker { id: self.id, kind: WorkerEvent::Reply, text: args.text });
+                        "sent to overseer".to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                },
             }
         } else {
-            tools::execute(self.working_dir, &call.function.name, &call.function.arguments)
+            tools::execute_guarded(
+                self.working_dir,
+                &call.function.name,
+                &call.function.arguments,
+                &policy,
+                Some(control.flag()),
+            )
         };
         let _ = writeln!(self.log, "{output}");
         if let Some(seq) = seq {
@@ -491,6 +851,16 @@ mod tests {
         loop {
             match queue.recv_timeout(WAIT).unwrap() {
                 Event::Delta { .. } => {}
+                event => return event,
+            }
+        }
+    }
+
+    /// The next worker lifecycle event, skipping streamed output and tool progress.
+    fn next_worker_event(queue: &Receiver<Event>) -> Event {
+        loop {
+            match next_event(queue) {
+                Event::Progress { .. } => {}
                 event => return event,
             }
         }
@@ -616,7 +986,7 @@ mod tests {
             let name = tool.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             assert!(rendered.contains(name), "{name} missing from the overseer prompt");
         }
-        let rendered = prompt::worker_prompt(Path::new("/tmp"));
+        let rendered = prompt::worker_prompt(Path::new("/tmp"), &tools::Policy::default());
         for tool in prompt::worker_tool_definitions().as_array().unwrap() {
             let name = tool.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             assert!(rendered.contains(name), "{name} missing from the worker prompt");
@@ -697,7 +1067,7 @@ mod tests {
         assert!(
             h.fleet
                 .execute(&tool_call("r", prompt::SPAWN_WORKER, &json!({"repo": "/tmp", "task": "x"})))
-                .starts_with("error: invalid arguments: unknown field `repo`, expected `path` or `task`")
+                .starts_with("error: invalid arguments: unknown field `repo`, expected one of `path`, `task`, `read_only`, `deny_tools`, `allow_commands`, `deny_commands`")
         );
         assert_eq!(
             h.fleet.execute(&tool_call("s", prompt::SPAWN_WORKER, &json!({"path": "/nonexistent/x", "task": "x"}))),
@@ -755,5 +1125,131 @@ mod tests {
         h.fleet.record(1, WorkerEvent::Finished);
         assert_eq!(h.fleet.resume(" 1 "), "worker 1 resumed");
         assert_eq!(resume_id("\t1\n"), Ok(1));
+    }
+
+    /// A tool call's outcome, waiting for its own result whatever interleaves.
+    fn next_finished(queue: &Receiver<Event>) -> tools::Preview {
+        loop {
+            if let Progress::Finished { preview, .. } = next_progress(queue) {
+                return preview;
+            }
+        }
+    }
+
+    #[test]
+    fn an_urgent_message_cuts_a_running_command_short() {
+        let mut h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"})), text("urgent done")]);
+        assert_eq!(spawn(&mut h.fleet, &h.repo), "worker 1 started");
+        let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
+        let sent =
+            h.fleet.execute(&tool_call("m", prompt::MESSAGE_WORKER, &json!({"id": 1, "text": "now", "urgent": true})));
+        assert_eq!(sent, "interrupted worker 1; it reads your message now");
+        let interrupted =
+            Event::Worker { id: 1, kind: WorkerEvent::Interrupted, text: "Overseer cut its turn short".into() };
+        assert_eq!(next_worker_event(&h.queue), interrupted);
+        h.fleet.record(1, WorkerEvent::Interrupted);
+        let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "urgent done".into() };
+        assert_eq!(next_event(&h.queue), finished);
+        h.fleet.record(1, WorkerEvent::Finished);
+        let log = fs::read_to_string(h.logs.path().join("worker-1.log")).unwrap();
+        assert!(log.contains("interrupted by overseer"), "{log}");
+        assert!(log.contains("> now"), "{log}");
+    }
+
+    #[test]
+    fn pause_holds_the_next_instruction_until_resumed() {
+        let mut h = harness(vec![text("first"), text("second")]);
+        spawn(&mut h.fleet, &h.repo);
+        next_event(&h.queue);
+        h.fleet.record(1, WorkerEvent::Finished);
+        let paused = h.fleet.execute(&tool_call("p", prompt::CONTROL_WORKER, &json!({"id": 1, "action": "pause"})));
+        assert!(paused.contains("paused"), "{paused}");
+        assert!(list(&mut h.fleet).starts_with("worker 1 [paused]"));
+        h.fleet.execute(&tool_call("m", prompt::MESSAGE_WORKER, &json!({"id": 1, "text": "later"})));
+        assert!(
+            h.queue.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a paused worker ran the instruction it was sent"
+        );
+        let resumed = h.fleet.execute(&tool_call("p", prompt::CONTROL_WORKER, &json!({"id": 1, "action": "resume"})));
+        assert!(resumed.contains("resumed"), "{resumed}");
+        let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "second".into() };
+        assert_eq!(next_event(&h.queue), finished);
+    }
+
+    #[test]
+    fn a_stopped_worker_takes_no_more_work() {
+        let mut h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"}))]);
+        spawn(&mut h.fleet, &h.repo);
+        let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
+        let stopped = h.fleet.execute(&tool_call("s", prompt::CONTROL_WORKER, &json!({"id": 1, "action": "stop"})));
+        assert_eq!(stopped, "worker 1 stopped");
+        assert!(list(&mut h.fleet).starts_with("worker 1 [stopped]"));
+        assert_eq!(
+            h.fleet.execute(&tool_call("m", prompt::MESSAGE_WORKER, &json!({"id": 1, "text": "x"}))),
+            "error: worker 1 is stopped; restart it"
+        );
+        assert_eq!(
+            h.fleet.execute(&tool_call("p", prompt::CONTROL_WORKER, &json!({"id": 1, "action": "resume"}))),
+            "error: worker 1 is stopped; restart it"
+        );
+        let interrupted =
+            Event::Worker { id: 1, kind: WorkerEvent::Interrupted, text: "Overseer cut its turn short".into() };
+        assert_eq!(next_worker_event(&h.queue), interrupted);
+        let deadline = Instant::now() + WAIT;
+        while h.fleet.busy() {
+            assert!(Instant::now() < deadline, "a stopped worker kept the fleet busy");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn restart_drops_the_history_and_runs_the_new_task() {
+        /// Records how many messages each model call carried.
+        struct Counting(Arc<Mutex<Vec<usize>>>);
+        impl Llm for Counting {
+            fn chat(&self, messages: &[Message], _: &Value) -> anyhow::Result<Message> {
+                self.0.lock().unwrap().push(messages.len());
+                Ok(text("ok"))
+            }
+        }
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let mut h = harness_with(Arc::new(Counting(Arc::clone(&sizes))));
+        spawn(&mut h.fleet, &h.repo);
+        next_event(&h.queue);
+        h.fleet.record(1, WorkerEvent::Finished);
+        h.fleet.execute(&tool_call("m", prompt::MESSAGE_WORKER, &json!({"id": 1, "text": "more"})));
+        next_event(&h.queue);
+        h.fleet.record(1, WorkerEvent::Finished);
+        let restarted = h.fleet.execute(&tool_call(
+            "r",
+            prompt::CONTROL_WORKER,
+            &json!({"id": 1, "action": "restart", "task": "fresh"}),
+        ));
+        assert!(restarted.contains("restarting"), "{restarted}");
+        let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "ok".into() };
+        assert_eq!(next_event(&h.queue), finished);
+        assert_eq!(*sizes.lock().unwrap(), [2, 4, 2], "the restart kept the old history");
+        let log = fs::read_to_string(h.logs.path().join("worker-1.log")).unwrap();
+        assert!(log.contains("> fresh"), "{log}");
+    }
+
+    #[test]
+    fn a_spawned_policy_is_enforced_and_listed() {
+        let mut h = harness(vec![call("w", tools::WRITE_FILE, &json!({"path": "x", "content": "y"})), text("done")]);
+        let started = h.fleet.execute(&tool_call(
+            "s",
+            prompt::SPAWN_WORKER,
+            &json!({"path": h.repo, "task": "write", "read_only": true, "deny_tools": ["bash"]}),
+        ));
+        assert_eq!(started, "worker 1 started");
+        let preview = next_finished(&h.queue);
+        assert!(preview.failed, "a read-only worker's write_file went through");
+        assert!(preview.head.contains("read-only"), "{preview:?}");
+        next_event(&h.queue);
+        h.fleet.record(1, WorkerEvent::Finished);
+        assert!(list(&mut h.fleet).contains("[idle · read-only]"), "{}", list(&mut h.fleet));
+        let cleared = h.fleet.execute(&tool_call("r", prompt::RESTRICT_WORKER, &json!({"id": 1, "read_only": false})));
+        assert!(!list(&mut h.fleet).contains("read-only"), "{}", list(&mut h.fleet));
+        assert!(cleared.contains("restricted"), "{cleared}");
     }
 }
