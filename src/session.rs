@@ -38,10 +38,13 @@ pub(crate) fn run(
         return;
     }
     let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
+    // Set when stdin closes: the run ends at the first moment no agent is busy.
+    let mut draining = false;
     while let Ok(event) = events.recv() {
         match event {
             Event::Exit => break,
             Event::Eof => {
+                draining = true;
                 if lock(&swarm).busy() {
                     let _ = ui.send(UiEvent::Notice("draining: quits when no agent is busy".into()));
                     continue;
@@ -100,8 +103,12 @@ pub(crate) fn run(
                 let _ = ui.send(shown);
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
+                if draining && !busy {
+                    break;
+                }
             }
             Event::User(text) => {
+                draining = false;
                 // The guard must not outlive `tell_root`: a `match` scrutinee's temporary lives for
                 // the whole match, and the snapshot below takes the same lock again.
                 let told = lock(&swarm).tell_root(&text);
@@ -164,7 +171,17 @@ mod tests {
         frontend.send(Event::User("hello".into())).unwrap();
         let answer = next_answer(&ui_rx);
         assert_eq!(answer, "hello back");
-        frontend.send(Event::Exit).unwrap();
+        // End of input: the run must end by itself once no agent is busy, never hang on a closed stdin.
+        frontend.send(Event::Eof).unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        let done = loop {
+            match ui_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::Done) => break UiEvent::Done,
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("the run never ended on end of input ({e}); it saw {seen:?}"),
+            }
+        };
+        assert_eq!(done, UiEvent::Done);
         handle.join().unwrap();
     }
 
