@@ -137,6 +137,8 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         }
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
         KeyCode::F(5) => mouse(app)?,
+        // The verbosity flag is global, like the mouse: ctrl+0 works from a worker's view too.
+        KeyCode::Char('0') if ctrl => app.toggle_tool_output(),
         // A menu in front of the caret takes esc first; a worker's view takes it next, stopping a
         // working agent and leaving when there is nothing to stop. The root is never a target: it
         // is the user's only voice.
@@ -177,9 +179,6 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::Home => app.scroll_top(),
         KeyCode::End => app.scroll_bottom(),
         KeyCode::F(2) => app.toggle_workers(),
-        KeyCode::F(3) => app.toggle_tool_output(),
-        // The same verbosity flag, for a keyboard without function keys: F3 expanded everything.
-        KeyCode::Char('o') if ctrl => app.toggle_tool_output(),
         KeyCode::F(4) => app.toggle_worker_view(),
         _ => app.input(key),
     }
@@ -245,18 +244,18 @@ mod tests {
         assert!(queue.try_recv().is_err(), "a key pressed in an agent view wakes the core");
     }
 
-    /// Ctrl+O is F3's toggle without the function keys; a bare o is still a letter.
+    /// Ctrl+0 opens every tool card; a bare 0 is still a digit.
     #[test]
-    fn ctrl_o_flips_the_tool_output_flag_and_a_bare_o_does_not() {
+    fn ctrl_0_flips_the_tool_output_flag_and_a_bare_0_does_not() {
         let mut app = App::new("m");
         let before = app.tool_output;
-        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert_ne!(app.tool_output, before, "ctrl+o expands or collapses every tool card");
-        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
+        assert_ne!(app.tool_output, before, "ctrl+0 expands or collapses every tool card");
+        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
         assert_eq!(app.tool_output, before, "the same key toggles it back");
-        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
-        assert_eq!(app.tool_output, before, "a bare o never flips the flag");
-        assert_eq!(app.take_prompt(), "o", "a bare o types an o into the composer");
+        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
+        assert_eq!(app.tool_output, before, "a bare 0 never flips the flag");
+        assert_eq!(app.take_prompt(), "0", "a bare 0 types a digit into the composer");
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -365,9 +364,9 @@ mod tests {
         out
     }
 
-    /// The user's request end to end: a fresh app shows a long spawn card collapsed, and ctrl+o opens it.
+    /// The user's request end to end: a fresh app shows a long spawn card on one row, and ctrl+0 opens it.
     #[test]
-    fn a_spawn_card_starts_collapsed_and_ctrl_o_opens_it() {
+    fn a_spawn_card_starts_on_one_row_and_ctrl_0_opens_it() {
         let mut app = App::new("m");
         let task = format!("first line\n{}tail", "word ".repeat(40));
         let summary = format!("/tmp · {task}");
@@ -375,12 +374,11 @@ mod tests {
         app.apply(UiEvent::Progress { id: crate::swarm::Swarm::ROOT, progress: started });
         let launched = screen(&mut app, 100, 24);
         assert!(launched.contains("spawn_agent /tmp · first line"), "{launched}");
-        assert!(launched.contains("more lines"), "the card counts what it hides at launch: {launched}");
         assert!(!launched.contains("tail"), "the whole task waits for the key: {launched}");
-        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!launched.contains("more lines"), "a compact card counts nothing: {launched}");
+        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
         let opened = screen(&mut app, 100, 24);
-        assert!(opened.contains("tail"), "ctrl+o shows the whole task: {opened}");
-        assert!(!opened.contains("more lines"), "nothing is hidden once expanded: {opened}");
+        assert!(opened.contains("tail"), "ctrl+0 shows the whole task: {opened}");
     }
 
     /// Enter with the popup open takes the highlighted row: it never submits what is in the prompt.
@@ -404,30 +402,26 @@ mod tests {
         assert_eq!(app.take_prompt(), "/schemes", "down picked the second row and tab took it");
     }
 
-    /// The popup only takes the keys it lists: ctrl+o, the tool-card toggle, keeps working while the
-    /// menu is open, and its `o` never reaches the composer.
+    /// The popup only takes the keys it lists: ctrl+0, the tool-card toggle, keeps working while the
+    /// menu is open, and its `0` never reaches the composer.
     #[test]
-    fn ctrl_o_still_toggles_expansion_while_the_popup_is_open() {
+    fn ctrl_0_still_toggles_expansion_while_the_popup_is_open() {
         let mut app = App::new("m");
         let before = app.tool_output;
         press(&mut app, KeyCode::Char('/'));
-        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert_ne!(app.tool_output, before, "ctrl+o is not the popup's key");
+        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
+        assert_ne!(app.tool_output, before, "ctrl+0 is not the popup's key");
         assert!(app.completing(), "and it leaves the menu open");
-        assert_eq!(app.take_prompt(), "/", "the o never reached the composer");
+        assert_eq!(app.take_prompt(), "/", "the 0 never reached the composer");
     }
 
-    /// F3 is the other half of the verbosity flag, and the popup's arms match neither it nor ctrl+o:
-    /// with the popup closed, both still flip expansion.
+    /// F3 and ctrl+o no longer expand: ctrl+0 is the one key that does.
     #[test]
-    fn f3_still_toggles_expansion_with_the_popup_closed() {
+    fn f3_no_longer_toggles_expansion() {
         let mut app = App::new("m");
         let before = app.tool_output;
-        assert!(!app.completing(), "nothing is being completed in an empty composer");
         press(&mut app, KeyCode::F(3));
-        assert_ne!(app.tool_output, before, "F3 expands or collapses every tool card");
-        press(&mut app, KeyCode::F(3));
-        assert_eq!(app.tool_output, before, "and the same key toggles it back");
+        assert_eq!(app.tool_output, before, "F3 leaves the cards as they are");
     }
 
     /// Esc closes the popup and leaves the typed keys in the composer; it never quits the app.
