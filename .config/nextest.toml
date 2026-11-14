@@ -1,0 +1,7 @@
+[profile.default]
+# A test that hangs (a stray network call) fails instead of blocking the run.
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false
+retries = 0
