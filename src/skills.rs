@@ -95,7 +95,7 @@ impl Catalogue {
     pub(crate) fn read(&self, target: &str) -> Result<String, String> {
         let (name, rest) = target.split_once('/').unwrap_or((target, ""));
         let Some(index) = self.by_name.get(name) else {
-            return Err(format!("unknown skill {name}; skills are discovered when the worker starts"));
+            return Err(format!("unknown skill {name}; skills are discovered when the agent starts"));
         };
         let Some(skill) = self.skills.get(*index) else {
             return Err(format!("unknown skill {name}"));

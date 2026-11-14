@@ -34,6 +34,7 @@
 | `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
+| `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |

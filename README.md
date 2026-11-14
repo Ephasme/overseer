@@ -1,8 +1,8 @@
 # overseer
 
-A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it spawns, messages, lists and administers workers, and reads the list of git repositories already sitting under the directories you configure, which starts it with its fleet inventory and refills it through `list_repos`. Each worker starts in an existing directory you name — the overseer picks one of the repositories listed under those roots — with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
+A coding-agent harness written in Rust. One overseer agent coordinates a fleet of agents and never does the work itself. It has no file or shell tools: it spawns, messages, lists and administers agents, and reads the list of git repositories already sitting under the directories you configure, which starts it with its fleet inventory and refills it through `list_repos`. Each agent starts in an existing directory you name — the overseer picks one of the repositories listed under those roots — with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Agents are not sandboxed: their commands run without confirmation and can reach any path your user can.
 
-The overseer administers its workers at any moment. An urgent message cuts the running turn short, a `bash` command included, and runs ahead of anything queued. `pause` lets the current instruction finish, then holds the queue; `resume` releases it; `stop` kills the turn and ends the worker; `restart` kills the turn, drops the history and starts the given task. It also sets what each worker may do — at spawn or later, without a restart: `read_only` refuses `write_file` and every `bash` command that is not on a fixed read-only list (`ls cat head tail wc stat file tree pwd rg grep diff jq`, with `git` limited to `status log diff show blame branch remote ls-files rev-parse cat-file grep describe shortlog tag`), `deny_tools` bans a tool by name, and `allow_commands`/`deny_commands` match command prefixes, deny first. That is a guard, not a sandbox: commands are matched as text, so keep the lists tight.
+The overseer administers its agents at any moment. An urgent message cuts the running turn short, a `bash` command included, and runs ahead of anything queued. `pause` lets the current instruction finish, then holds the queue; `resume` releases it; `stop` kills the turn and ends the agent; `restart` kills the turn, drops the history and starts the given task. It also sets what each agent may do — at spawn or later, without a restart: `read_only` refuses `write_file` and every `bash` command that is not on a fixed read-only list (`ls cat head tail wc stat file tree pwd rg grep diff jq`, with `git` limited to `status log diff show blame branch remote ls-files rev-parse cat-file grep describe shortlog tag`), `deny_tools` bans a tool by name, and `allow_commands`/`deny_commands` match command prefixes, deny first. That is a guard, not a sandbox: commands are matched as text, so keep the lists tight.
 
 ## Install
 
@@ -35,7 +35,7 @@ OVERSEER_API_KEY=...
 overseer
 ```
 
-On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Every model call reaches its view one way: entries appended in the order the call produced them, so a thought, the answer and the tool call it asks for read top to bottom, and a worker's stream opens with the instruction that started it. The transcript is the lead's own stream: a worker's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`, `interrupted`). Every worker has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the worker panel counts the lines a closed view missed and shows each worker as working, paused, stopped, idle or failed, with `read-only` when restricted. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
+On a terminal it opens a full-screen UI: the transcript, an agent panel on the right, and the prompt at the bottom. Every model call reaches its view one way: entries appended in the order the call produced them, so a thought, the answer and the tool call it asks for read top to bottom, and an agent's stream opens with the instruction that started it. The transcript is the lead's own stream: an agent's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`, `interrupted`). Every agent has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the agent panel counts the lines a closed view missed and shows each agent as working, paused, stopped, idle or failed, with `read-only` when restricted. Each agent is labelled with a codename drawn from its id: the panel shows `brave-heron (2)`, and the lines that already carry the id show the name alone, `brave-heron`. The id stays what `/resume` and `message_agent` take. `ctrl+r` renames the agent picked in the panel, else the newest one, and the name you type replaces the codename for the rest of the run, everywhere that agent is named. Names live in memory only: a fresh run starts from the codenames again. `/resume <id>` re-tasks an agent without spending a model call; `exit` quits at once.
 Typing `/` at the start of the prompt opens a completion popup of the commands overseer knows, narrowed by what you type; `/resume ` follows with the agent ids that exist right now, each with its state and its directory, so an id that is gone is never offered.
 
 |Key|Effect|
@@ -48,20 +48,21 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+v|attach the image on the clipboard to the prompt; the message carries its path|
 |ctrl+x|drop the attached image|
 |PageUp / PageDown|scroll the view you are in; End follows new output again|
-|F2|hide or show the worker panel|
+|F2|hide or show the agent panel|
 |F3|expand every tool card, or collapse it back: what the call returned, and the whole body of a long call, which starts at two rows plus a `… N more lines` row|
 |ctrl+o|the same toggle as F3, for a keyboard without function keys: press it to open a card|
-|F4|open the picked worker's view, or close it|
+|F4|open the picked agent's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
-|click a worker row|open that worker's view; click its `esc back to fleet` line to come back|
-|↑ / ↓|inside a worker view: the previous or next worker|
-|PageUp / Home|inside a worker view: scroll its own stream|
-|esc|in a worker's view: stop that worker and everything below it now; with nothing running, back to the lead's stream. It never stops the overseer and never quits the app|
+|click an agent row|open that agent's view; click its `esc back to fleet` line to come back|
+|↑ / ↓|inside an agent view: the previous or next agent|
+|PageUp / Home|inside an agent view: scroll its own stream|
+|esc|in an agent's view: stop that agent and everything below it now; with nothing running, back to the lead's stream. It never stops the overseer and never quits the app|
 |ctrl+p / ctrl+n|recall the previous or next prompt|
-|ctrl+d|quit once no worker is busy|
+|ctrl+r|rename the agent picked in the panel, else the newest one; enter accepts, esc cancels|
+|ctrl+d|quit once no agent is busy|
 |ctrl+c|quit now|
 
-With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, worker activity and tool calls on stderr. Either way, worker reports wake the overseer on their own. A worker's `bash` command is killed after 300 seconds. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it.
+With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/agent-<id>.log`; `tail -f` one to watch it.
 
 ## Release
 

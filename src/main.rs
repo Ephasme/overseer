@@ -5,6 +5,7 @@ mod conflict;
 mod event;
 mod llm;
 mod mcp;
+mod names;
 mod plain;
 mod prompt;
 mod repos;

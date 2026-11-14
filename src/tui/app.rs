@@ -1,12 +1,13 @@
 use super::theme;
 use crate::clipboard;
 use crate::event::UiEvent;
+use crate::names;
 use crate::slash::{self, RESUME};
-use crate::swarm::{AgentEvent, AgentView, Progress, Swarm};
+use crate::swarm::{AgentEvent, AgentView, Event, Progress, Swarm};
 use crate::tools;
 use crate::version;
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
@@ -54,10 +55,22 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
 /// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
-const HINTS: [&str; 8] =
-    ["enter send", "ctrl+j newline", "F2 workers", "F3 expand", "ctrl+o expand", "F4 view", "F5 mouse", "ctrl+d quit"];
+const HINTS: [&str; 9] = [
+    "enter send",
+    "ctrl+j newline",
+    "F2 agents",
+    "F3 expand",
+    "ctrl+o expand",
+    "F4 view",
+    "ctrl+r rename",
+    "F5 mouse",
+    "ctrl+d quit",
+];
 
-/// Key hints while a worker's view is open: the way out is on its own header line.
+/// The same line while the rename prompt is open: nothing else takes a key then.
+const RENAME_HINTS: [&str; 2] = ["enter accept", "esc cancel"];
+
+/// Key hints while an agent's view is open: the way out is on its own header line.
 const WORKER_HINTS: [&str; 3] = ["F4 toggle", "F5 mouse", "ctrl+d quit"];
 
 /// The composer's frame: one bar down the left, closed by a half block.
@@ -101,6 +114,16 @@ enum Role {
     Debug,
 }
 
+/// The inline prompt that gives an agent another name.
+struct Rename {
+    /// The agent being renamed, by the id that never changes.
+    id: usize,
+    /// How it reads now, so the user sees whose name they replace.
+    label: String,
+    /// What the user has typed so far.
+    text: String,
+}
+
 struct Entry {
     role: Role,
     /// Tool name, or the worker label.
@@ -137,7 +160,7 @@ impl Entry {
 
     /// Closes a call whose owner stopped before it could report.
     fn abandon(&mut self) {
-        self.output = Some("(no result: its worker stopped)".into());
+        self.output = Some("(no result: its agent stopped)".into());
         self.failed = true;
     }
 
@@ -747,6 +770,8 @@ pub(super) struct App {
     open: bool,
     /// The view's back line, so a click on it returns to the fleet.
     back_area: Rect,
+    /// The rename prompt, while it is open.
+    rename: Option<Rename>,
     busy: bool,
     busy_since: Instant,
     last_tick: Instant,
@@ -780,6 +805,7 @@ impl App {
             selected: None,
             open: false,
             back_area: Rect::ZERO,
+            rename: None,
             busy: false,
             busy_since: Instant::now(),
             last_tick: Instant::now(),
@@ -800,7 +826,8 @@ impl App {
             UiEvent::Debug(text) => self.push(Role::Debug, String::new(), text),
             UiEvent::Boundary { id } => self.boundary(id),
             UiEvent::Agent { id, kind, text } => {
-                let name = format!("agent {id}");
+                // The id comes first and never changes; the name follows it because the user reads this too.
+                let name = format!("agent {id} · {}", self.name(id));
                 // The agent's own stream keeps the whole message; the lead gets one lifecycle line.
                 let answered = self.close_live(id);
                 let first = text.lines().next().unwrap_or_default().trim().to_string();
@@ -836,7 +863,7 @@ impl App {
                 self.workers = agents;
                 for (id, dir) in joined {
                     self.worker_stream_mut(id);
-                    let line = format!("agent {id} started · {dir}");
+                    let line = format!("agent {id} · {} started · {dir}", self.name(id));
                     self.push(Role::Notice, String::new(), line);
                 }
                 self.close_dead_calls();
@@ -993,6 +1020,90 @@ impl App {
         Some((entry.role, entry.body.as_str()))
     }
 
+    /// An agent's name alone, for a line that already carries its id.
+    fn name(&self, id: usize) -> String {
+        self.workers
+            .iter()
+            .find(|agent| agent.id == id)
+            .map_or_else(|| names::name(id, None), |agent| agent.name.clone())
+    }
+
+    /// How an agent reads here: the label the core sent, or its codename before the roster arrives.
+    fn label(&self, id: usize) -> String {
+        self.workers
+            .iter()
+            .find(|agent| agent.id == id)
+            .map_or_else(|| names::label(id, None), |agent| agent.label.clone())
+    }
+
+    /// The rename prompt, drawn where the composer sits with its frame, so the eye stays put.
+    fn rename_widget(&self) -> Paragraph<'static> {
+        let Some(rename) = &self.rename else { return Paragraph::default() };
+        // The composer's frame has no top border to hang a title on: the prompt names its agent in
+        // the line itself.
+        let block = Block::new()
+            .borders(Borders::LEFT | Borders::BOTTOM)
+            .border_set(PROMPT_FRAME)
+            .border_style(Style::new().fg(theme::warning()))
+            .padding(Padding::new(1, 1, 1, 0));
+        let line = Line::from(vec![
+            Span::styled(format!("rename {} ", rename.label), Style::new().fg(theme::warning())),
+            Span::styled("› ", Style::new().fg(theme::warning())),
+            Span::raw(rename.text.clone()),
+            Span::styled("▏", Style::new().fg(theme::warning())),
+        ]);
+        Paragraph::new(line).block(block)
+    }
+
+    /// Whether the rename prompt is open: every key belongs to it until it closes.
+    pub(super) fn renaming(&self) -> bool {
+        self.rename.is_some()
+    }
+
+    /// Opens the rename prompt on the agent picked in the panel, else on the newest one.
+    ///
+    /// An open view returns to the fleet first: the prompt sits where the composer does, and the
+    /// picked agent stays the one it renames.
+    pub(super) fn start_rename(&mut self) {
+        self.dirty = true;
+        self.open = false;
+        let picked = self.selected.filter(|id| self.workers.iter().any(|agent| agent.id == *id));
+        let Some(id) = picked.or_else(|| self.workers.last().map(|agent| agent.id)) else {
+            self.push(Role::Notice, String::new(), "no agent to rename yet".into());
+            return;
+        };
+        let label = self.label(id);
+        self.rename = Some(Rename { id, label, text: String::new() });
+    }
+
+    /// One key while the rename prompt is open. The event it returns is the one the frontend sends.
+    pub(super) fn rename_key(&mut self, key: KeyEvent) -> Option<Event> {
+        self.dirty = true;
+        match key.code {
+            KeyCode::Esc => {
+                self.rename = None;
+                None
+            }
+            KeyCode::Enter => {
+                let rename = self.rename.take()?;
+                Some(Event::Rename { id: rename.id, name: rename.text.trim().to_string() })
+            }
+            KeyCode::Backspace => {
+                if let Some(rename) = self.rename.as_mut() {
+                    rename.text.pop();
+                }
+                None
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(rename) = self.rename.as_mut() {
+                    rename.text.push(character);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// A line in the lead's stream: the only stream the overseer's own events reach.
     fn push(&mut self, role: Role, title: String, body: String) {
         // Anything landing in the transcript closes the streamed paragraph, so no later delta is
@@ -1139,9 +1250,14 @@ impl App {
             };
             self.render_transcript(frame, transcript);
             self.render_attachment(frame, chip);
-            frame.render_widget(&self.composer, input);
-            self.render_composer_meta(frame, input);
-            self.render_completion(frame, input);
+            if self.rename.is_some() {
+                let prompt = self.rename_widget();
+                frame.render_widget(prompt, input);
+            } else {
+                frame.render_widget(&self.composer, input);
+                self.render_composer_meta(frame, input);
+                self.render_completion(frame, input);
+            }
         }
         self.render_status(frame, status);
     }
@@ -1184,20 +1300,24 @@ impl App {
             }
             let unread = self.unread_of(worker.id);
             let indent = "  ".repeat(worker.depth);
+            // The name gives way to the state: a row that loses the state says less. The counter sits
+            // on the directory line, where the short label leaves room for it.
+            let reserved = text_width(&indent) + text_width(glyph) + 1 + text_width(&state);
+            let label = truncate(&worker.label, usize::from(inner.width).saturating_sub(reserved));
+            let marker = if unread == 0 { String::new() } else { format!(" · {unread} new") };
             let lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{indent}{glyph} "), Style::new().fg(colour)),
                     Span::styled(
-                        format!("a{}", worker.id),
+                        label,
                         Style::new().fg(if self.selected == Some(worker.id) { theme::text() } else { theme::info() }),
                     ),
                     Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
-                    Span::styled(
-                        if unread == 0 { String::new() } else { format!(" · {unread} new") },
-                        Style::new().fg(theme::warning()),
-                    ),
                 ]),
-                Line::from(Span::styled(short_dir(&worker.dir), Style::new().fg(theme::faint()))),
+                Line::from(vec![
+                    Span::styled(short_dir(&worker.dir), Style::new().fg(theme::faint())),
+                    Span::styled(marker, Style::new().fg(theme::warning())),
+                ]),
                 Line::default(),
             ];
             let band = if self.selected == Some(worker.id) { theme::band() } else { Style::new() };
@@ -1258,7 +1378,7 @@ impl App {
             let secs = self.busy_since.elapsed().as_secs_f32();
             spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::muted())));
         } else if self.draining {
-            spans.push(Span::styled("draining, quits when workers idle", Style::new().fg(theme::warning())));
+            spans.push(Span::styled("draining, quits when agents idle", Style::new().fg(theme::warning())));
         } else {
             spans.push(Span::styled("● idle", Style::new().fg(theme::muted())));
         }
@@ -1272,7 +1392,13 @@ impl App {
             spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::warning())));
         }
         let used = Line::from(spans.clone()).width();
-        let hints = if self.in_worker_view() { WORKER_HINTS.as_slice() } else { HINTS.as_slice() };
+        let hints = if self.renaming() {
+            RENAME_HINTS.as_slice()
+        } else if self.in_worker_view() {
+            WORKER_HINTS.as_slice()
+        } else {
+            HINTS.as_slice()
+        };
         // Two columns of inset on each side, the same as everything else on screen.
         let room = usize::from(area.width).saturating_sub(used + 2);
         let hint = fit_hints(hints, room);
@@ -1465,7 +1591,7 @@ impl App {
         let crumb = Line::from(vec![
             Span::styled("agents ", Style::new().fg(theme::muted())),
             Span::styled("› ", Style::new().fg(theme::faint())),
-            Span::styled(format!("agent {}", worker.id), Style::new().fg(theme::info())),
+            Span::styled(worker.label.clone(), Style::new().fg(theme::info())),
         ]);
         let mut line = vec![
             Span::styled(format!("{glyph} "), Style::new().fg(colour)),
@@ -2273,13 +2399,75 @@ mod tests {
         app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "tests pass".into() });
         let screen = screen(&mut app, 100, 24);
         assert!(screen.contains("spawned two agents"), "{screen}");
-        assert!(screen.contains("agent 2 finished: tests pass"), "{screen}");
+        assert!(screen.contains(&format!("agent 2 · {} finished: tests pass", names::name(2, None))), "{screen}");
         assert!(screen.contains("overseer"), "{screen}");
         assert!(screen.contains("idle"), "{screen}");
         assert!(screen.contains("┃"), "the composer keeps its bar: {screen}");
         assert!(screen.contains("Ask agent 1"), "{screen}");
         assert!(screen.contains("test-model"), "the status line names the model: {screen}");
         assert!(screen.contains(version::VERSION), "{screen}");
+    }
+
+    #[test]
+    fn an_agent_line_carries_its_codename_beside_the_id() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "done".into() });
+        let name = names::name(3, None);
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains(&format!("agent 3 · {name} finished")), "{rendered}");
+        assert_eq!(worker_entries(&app, 3)[0].title, format!("agent 3 · {name}"), "the id stays first");
+    }
+
+    #[test]
+    fn the_panel_and_a_view_name_an_agent_by_its_label() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "run the tests")]));
+        let fleet = screen(&mut app, 100, 24);
+        assert!(fleet.contains(&names::label(2, None)), "{fleet}");
+        click_first_agent(&mut app);
+        let view = screen(&mut app, 100, 24);
+        assert!(view.contains(&format!("agents › {}", names::label(2, None))), "{view}");
+    }
+
+    #[test]
+    fn the_rename_prompt_takes_a_name_and_escape_cancels_on_the_picked_agent() {
+        let mut app = App::new("m");
+        assert!(!app.renaming());
+        app.start_rename();
+        assert!(app.rename.is_none(), "nothing to rename before an agent exists");
+        assert!(app.lead.entries.last().is_some_and(|entry| entry.body.contains("no agent to rename")));
+
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "first job"), agent_view(3, "second job")]));
+        // A click picks an agent; the prompt renames that one, not the newest.
+        click_first_agent(&mut app);
+        app.leave_worker();
+        app.start_rename();
+        assert_eq!(app.rename.as_ref().map(|rename| rename.id), Some(2));
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains(&format!("rename {}", names::label(2, None))), "{rendered}");
+        assert!(rendered.contains("enter accept") && rendered.contains("esc cancel"), "{rendered}");
+        for character in "fix-nav".chars() {
+            app.rename_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.rename_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Event::Rename { id: 2, name: "fix-nav".into() })
+        );
+        assert!(!app.renaming());
+
+        // ctrl+r inside a view renames the agent it shows, and the fleet comes back so the prompt is visible.
+        click_first_agent(&mut app);
+        assert!(app.in_worker_view());
+        app.start_rename();
+        assert!(!app.in_worker_view(), "the prompt needs the fleet's composer line");
+        assert_eq!(app.rename.as_ref().map(|rename| rename.id), Some(2));
+
+        // Esc drops what was typed and leaves the name alone.
+        app.start_rename();
+        app.rename_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.rename_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert!(!app.renaming());
+        assert_eq!(app.label(2), names::label(2, None), "no event was sent, so no name changed");
     }
 
     #[test]
@@ -2437,6 +2625,8 @@ mod tests {
     fn agent_view(id: usize, task: &str) -> AgentView {
         AgentView {
             id,
+            name: names::name(id, None),
+            label: names::label(id, None),
             parent: Some(Swarm::ROOT),
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
@@ -2493,10 +2683,13 @@ mod tests {
         click_first_agent(&mut app);
         assert!(app.in_worker_view());
         let view = screen(&mut app, 100, 24);
-        assert!(view.contains("agents › agent 3"), "{view}");
+        assert!(view.contains(&format!("agents › {}", names::label(3, None))), "{view}");
         assert!(view.contains("fix the nav"), "the stream opens with the instruction: {view}");
         assert!(view.contains("esc back to agents"), "the way out is on the header: {view}");
-        assert!(view.contains("[agent 3] done done"), "the view shows the agent's own lines: {view}");
+        assert!(
+            view.contains(&format!("[agent 3 · {}] done done", names::name(3, None))),
+            "the view shows the agent's own lines: {view}"
+        );
         assert!(!view.contains("Ask agent 1"), "the composer is out of the way: {view}");
         app.worker_key(KeyEvent::from(KeyCode::Esc));
         assert!(!app.in_worker_view(), "esc returns to the tree");

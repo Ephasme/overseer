@@ -1056,7 +1056,7 @@ mod tests {
         assert!(
             guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
                 .starts_with("error: this agent is read-only"),
-            "write_file ran in a read-only worker"
+            "write_file ran in a read-only agent"
         );
         for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
             let args = json!({"command": command}).to_string();
