@@ -2,8 +2,8 @@ use crate::config;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Subdirectory of the system temp dir that holds pasted images.
 const DIR: &str = "overseer-attachments";
@@ -61,10 +61,19 @@ fn text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+/// How long `osascript` gets to answer before the read is called off.
+///
+/// One attempt, no retry: a script held up behind a permission prompt must not keep the chip
+/// spinning, and ctrl+v dead, for the rest of the session.
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a read that is waiting looks at the script it spawned.
+const WAIT: Duration = Duration::from_millis(20);
+
 /// Reads the clipboard's image into a fresh file in the temp dir.
 ///
-/// Only the paste key calls this: it spawns `osascript` and copies every byte of the image, far too
-/// slow for a keystroke.
+/// Only the paste key calls this, on a thread of its own: it spawns `osascript` and copies every
+/// byte of the image, far too slow for a keystroke.
 pub(crate) fn image() -> Paste {
     let dir = std::env::temp_dir().join(DIR);
     if let Err(e) = fs::create_dir_all(&dir) {
@@ -73,7 +82,33 @@ pub(crate) fn image() -> Paste {
     let path = dir.join(format!("paste-{}-{}.png", std::process::id(), stamp()));
     // A file an earlier run left here must not pass for this paste.
     let _ = fs::remove_file(&path);
-    let output = match Command::new("osascript").args(["-e", SCRIPT]).arg(&path).output() {
+    let mut child = match Command::new("osascript")
+        .args(["-e", SCRIPT])
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return Paste::Failed(format!("osascript: {e}")),
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let answered = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(WAIT),
+            Ok(None) => break false,
+            Err(e) => return Paste::Failed(format!("osascript: {e}")),
+        }
+    };
+    if !answered {
+        let _ = child.kill();
+        let _ = child.wait();
+        // A half-written file is not the image the user asked for.
+        let _ = fs::remove_file(&path);
+        return Paste::Failed(format!("osascript gave no answer within {}s", TIMEOUT.as_secs()));
+    }
+    let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(e) => return Paste::Failed(format!("osascript: {e}")),
     };
