@@ -2,6 +2,7 @@ use super::theme;
 use crate::clipboard;
 use crate::event::UiEvent;
 use crate::names;
+use crate::prompt;
 use crate::slash::{self, RESUME};
 use crate::swarm::{AgentEvent, AgentView, Event, Progress, Swarm};
 use crate::tools;
@@ -15,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tui_markdown::{AlertKind, Options, StyleSheet, from_str_with_options};
 use tui_textarea::{TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
 
@@ -36,8 +38,17 @@ const WHEEL_LINES: u16 = 3;
 /// Redraw interval of the spinner.
 const TICK: Duration = Duration::from_millis(120);
 
-/// Body rows a collapsed tool card keeps, before the row that counts what it hid.
-const BODY_ROWS: usize = 2;
+/// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
+const HINTS: [&str; 8] = [
+    "enter send",
+    "ctrl+j newline",
+    "F2 agents",
+    "ctrl+0 expand",
+    "F4 view",
+    "ctrl+r rename",
+    "F5 mouse",
+    "ctrl+d quit",
+];
 
 /// Said instead of attaching, when the clipboard has neither an image nor text.
 const NO_CLIPBOARD: &str = "the clipboard holds no image or text";
@@ -54,24 +65,11 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 /// What the chip says while the clipboard is being read.
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
-/// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
-const HINTS: [&str; 9] = [
-    "enter send",
-    "ctrl+j newline",
-    "F2 agents",
-    "F3 expand",
-    "ctrl+o expand",
-    "F4 view",
-    "ctrl+r rename",
-    "F5 mouse",
-    "ctrl+d quit",
-];
+/// Key hints while an agent's view is open: the way out is on its own header line.
+const WORKER_HINTS: [&str; 4] = ["F4 toggle", "ctrl+0 expand", "F5 mouse", "ctrl+d quit"];
 
 /// The same line while the rename prompt is open: nothing else takes a key then.
 const RENAME_HINTS: [&str; 2] = ["enter accept", "esc cancel"];
-
-/// Key hints while an agent's view is open: the way out is on its own header line.
-const WORKER_HINTS: [&str; 3] = ["F4 toggle", "F5 mouse", "ctrl+d quit"];
 
 /// The composer's frame: one bar down the left, closed by a half block.
 const PROMPT_FRAME: border::Set = border::Set {
@@ -109,6 +107,8 @@ enum Role {
     /// A tool call, by the overseer or by one of its workers.
     Tool,
     Worker(AgentEvent),
+    /// One agent speaking to another, as it lands in its owner's stream.
+    Message,
     Notice,
     Error,
     Debug,
@@ -170,26 +170,33 @@ impl Entry {
             Role::You => {
                 bar("▌ ", Style::new().fg(theme::primary()), &self.body, Style::new().fg(theme::text()), width)
             }
-            // A model reads as plain prose: the user's bar above it is the only mark the answer needs.
-            Role::Model => block("  ", Style::new(), &self.body, Style::new().fg(theme::text()), width),
-            // The reasoning is the same model's, one shade quieter and marked as not the answer.
+            // Prose is Markdown: headings, lists, emphasis and fences render; the gutter stays plain.
+            Role::Model => markdown(&self.body, "  ", Style::new(), width),
+            // The reasoning is the same model's: marked as not the answer, and cooler than one.
             Role::Thinking => block(
                 "✻ ",
-                Style::new().fg(theme::faint()),
+                Style::new().fg(theme::thought()),
                 &self.body,
-                Style::new().fg(theme::muted()).add_modifier(Modifier::ITALIC),
+                Style::new().fg(theme::thought()).add_modifier(Modifier::ITALIC),
                 width,
             ),
             Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
-                    AgentEvent::Reply => ("says", theme::info()),
+                    AgentEvent::Reply => ("says", theme::reply()),
                     AgentEvent::Finished => ("done", theme::success()),
                     AgentEvent::Failed => ("failed", theme::error()),
                     AgentEvent::Interrupted => ("interrupted", theme::warning()),
                 };
                 let prefix = format!("[{}] {label} ", self.title);
-                block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::muted()), width)
+                if matches!(kind, AgentEvent::Reply | AgentEvent::Finished) {
+                    markdown(&self.body, &prefix, Style::new().fg(colour), width)
+                } else {
+                    block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::text()), width)
+                }
+            }
+            Role::Message => {
+                block("→ ", Style::new().fg(theme::message()), &self.body, Style::new().fg(theme::text()), width)
             }
             Role::Notice => {
                 block("· ", Style::new().fg(theme::faint()), &self.body, Style::new().fg(theme::muted()), width)
@@ -203,7 +210,7 @@ impl Entry {
         }
     }
 
-    /// A tool call: a header naming what it acts on, then the head of what it returned.
+    /// A tool call: one header row, then its whole body and what it returned once expanded.
     fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let (glyph, colour) = if self.output.is_none() {
             (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::warning())
@@ -223,40 +230,33 @@ impl Entry {
         let verb = verb(&self.title);
         let lead = 1 + text_width(glyph);
         let room = width.saturating_sub(lead + text_width(verb) + 1 + text_width(&chips)).max(12);
-        // The body, wrapped: a collapsed card keeps its first rows, an expanded one shows it whole.
+        // One row at rest; the whole body once the reader asks for it.
         let mut rows: Vec<String> = Vec::new();
         for source in self.body.split('\n') {
             rows.extend(wrap(source, room));
         }
-        let hidden = if expand { 0 } else { rows.len().saturating_sub(BODY_ROWS) };
-        rows.truncate(rows.len() - hidden);
+        if !expand {
+            rows.truncate(1);
+        }
         let pad = " ".repeat(lead + text_width(verb) + 1);
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (index, row) in rows.into_iter().enumerate() {
             if index > 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(pad.clone(), Style::new()),
-                    Span::styled(row, Style::new().fg(theme::text())),
-                ]));
+                let mut spans = vec![Span::styled(pad.clone(), Style::new())];
+                spans.extend(highlight(&row, Style::new().fg(theme::text())));
+                lines.push(Line::from(spans));
                 continue;
             }
             let mut spans = vec![
                 Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-                Span::styled(verb.to_string(), Style::new().fg(theme::muted())),
+                Span::styled(verb.to_string(), verb_style(&self.title)),
             ];
             if !row.is_empty() {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(row, Style::new().fg(theme::text())));
+                spans.extend(highlight(&row, Style::new().fg(theme::text())));
             }
             spans.push(Span::styled(chips.clone(), Style::new().fg(theme::faint())));
             lines.push(Line::from(spans));
-        }
-        if hidden > 0 {
-            let plural = if hidden == 1 { "line" } else { "lines" };
-            lines.push(Line::from(Span::styled(
-                format!("{pad}… {hidden} more {plural}"),
-                Style::new().fg(theme::faint()),
-            )));
         }
         let Some(output) = &self.output else { return lines };
         if !expand {
@@ -272,10 +272,9 @@ impl Entry {
             rows.push("(no output)".into());
         }
         for row in rows.iter().take(tools::PREVIEW_LINES) {
-            lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::new().fg(theme::rule())),
-                Span::styled(row.clone(), style),
-            ]));
+            let mut spans = vec![Span::styled("  │ ", Style::new().fg(theme::rule()))];
+            spans.extend(highlight(row, style));
+            lines.push(Line::from(spans));
         }
         if hidden > 0 {
             let plural = if hidden == 1 { "line" } else { "lines" };
@@ -298,6 +297,18 @@ fn verb(tool: &str) -> &str {
     }
 }
 
+/// The verb's colour names the tool's family: a command, a file, an agent, an MCP tool.
+fn verb_style(tool: &str) -> Style {
+    let colour = match tool {
+        prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT | prompt::CONTROL_AGENT | prompt::LIST_AGENTS => theme::message(),
+        tools::BASH => theme::warning(),
+        tools::READ_FILE | tools::WRITE_FILE => theme::info(),
+        other if other.starts_with("mcp__") => theme::accent(),
+        _ => theme::muted(),
+    };
+    Style::new().fg(colour)
+}
+
 /// A prefix on the first row, spaces of the same width on the rest, then the wrapped body indented.
 fn block(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(text_width(prefix)).max(8);
@@ -306,8 +317,9 @@ fn block(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width
     for (line, source) in body.split('\n').enumerate() {
         for (row, text) in wrap(source, room).into_iter().enumerate() {
             let lead = if line == 0 && row == 0 { prefix } else { pad.as_str() };
-            let lead = Span::styled(lead.to_string(), prefix_style);
-            lines.push(Line::from(vec![lead, Span::styled(text, body_style)]));
+            let mut spans = vec![Span::styled(lead.to_string(), prefix_style)];
+            spans.extend(highlight(&text, body_style));
+            lines.push(Line::from(spans));
         }
     }
     lines
@@ -324,6 +336,327 @@ fn bar(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width: 
         }
     }
     lines
+}
+
+/// The Markdown renderer's palette: the same slots the transcript already uses.
+#[derive(Clone)]
+struct MarkdownStyle;
+
+impl StyleSheet for MarkdownStyle {
+    fn heading(&self, _level: u8) -> Style {
+        Style::new().fg(theme::accent()).add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::new().fg(theme::info())
+    }
+
+    fn link(&self) -> Style {
+        Style::new().fg(theme::reply()).add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::new().fg(theme::muted())
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    fn html(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    fn math_inline(&self) -> Style {
+        Style::new().fg(theme::warning())
+    }
+
+    fn math_display(&self) -> Style {
+        Style::new().fg(theme::warning())
+    }
+
+    fn footnote_ref(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    fn footnote_def(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    fn definition_term(&self) -> Style {
+        Style::new().fg(theme::text()).add_modifier(Modifier::BOLD)
+    }
+
+    fn definition_description(&self) -> Style {
+        Style::new().fg(theme::muted())
+    }
+
+    fn alert(&self, kind: AlertKind) -> Style {
+        let colour = match kind {
+            AlertKind::Note => theme::info(),
+            AlertKind::Tip => theme::success(),
+            AlertKind::Important => theme::accent(),
+            AlertKind::Warning => theme::warning(),
+            AlertKind::Caution => theme::error(),
+        };
+        Style::new().fg(colour)
+    }
+
+    fn table_header(&self) -> Style {
+        Style::new().fg(theme::accent()).add_modifier(Modifier::BOLD)
+    }
+
+    fn table_cell(&self) -> Style {
+        Style::new().fg(theme::text())
+    }
+
+    fn table_border(&self) -> Style {
+        Style::new().fg(theme::rule())
+    }
+
+    fn list_marker(&self) -> Style {
+        Style::new().fg(theme::primary())
+    }
+
+    fn image_alt(&self) -> Style {
+        Style::new().fg(theme::faint())
+    }
+
+    // Headings and fences read by colour and weight; their markers would be noise on a terminal.
+    fn heading_marker(&self, _level: u8) -> &'static str {
+        ""
+    }
+
+    fn code_block_fence(&self) -> &'static str {
+        ""
+    }
+}
+
+/// Gives every prose line an explicit Markdown hard break, leaving fences, indented code and tables
+/// untouched: a model's newline is a line break, not a space.
+fn hard_breaks(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 32);
+    let mut fenced = false;
+    for line in body.split('\n') {
+        let trimmed = line.trim_start();
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if fence {
+            fenced = !fenced;
+        }
+        let literal = fenced || line.starts_with("    ") || line.starts_with('\t');
+        if line.is_empty() || literal || trimmed.starts_with('|') {
+            out.push_str(line);
+        } else {
+            out.push_str(line.trim_end());
+            out.push_str("  ");
+        }
+        out.push('\n');
+    }
+    out.pop();
+    out
+}
+
+/// Prose as Markdown: rendered, then wrapped to `room`, with `prefix` on the first row only.
+///
+/// A model writes one newline where it means a line break; `CommonMark` would join the lines into one
+/// paragraph, so every prose line gets an explicit hard break before parsing.
+fn markdown(body: &str, prefix: &str, prefix_style: Style, width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(text_width(prefix)).max(8);
+    let options = Options::new(MarkdownStyle).table_width(u16::try_from(room).unwrap_or(u16::MAX));
+    let prepared = hard_breaks(body);
+    let text = from_str_with_options(&prepared, &options);
+    let pad = " ".repeat(text_width(prefix));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in text.lines {
+        for row in wrap_styled(&prose_line(line), room) {
+            let lead = if lines.is_empty() { prefix } else { pad.as_str() };
+            let mut spans = vec![Span::styled(lead.to_string(), prefix_style)];
+            spans.extend(row.spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    // An empty or still-empty streamed body keeps its gutter, so the transcript does not jump.
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(prefix.to_string(), prefix_style)));
+    }
+    lines
+}
+
+/// A rendered Markdown line as owned spans, in the transcript's text colour, schemes split out.
+fn prose_line(line: Line<'_>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let base = line.style;
+    for span in line.spans {
+        let style = base.patch(span.style);
+        let style = if style.fg.is_none() { style.fg(theme::text()) } else { style };
+        split_schemes(&mut spans, &span.content, style);
+    }
+    Line::from(spans)
+}
+
+/// One plain row, with every `scheme://…` token split out in the colour of what it reaches.
+fn highlight(row: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    split_schemes(&mut spans, row, style);
+    spans
+}
+
+/// Splits `text` into spans so an internal URI takes the colour of what it reaches.
+fn split_schemes(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    let mut rest = text;
+    let mut whole = true;
+    while let Some((start, end)) = uri(rest) {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), style));
+        }
+        let token = &rest[start..end];
+        let scheme = token.split("://").next().unwrap_or_default();
+        spans.push(Span::styled(token.to_string(), style.fg(scheme_colour(scheme))));
+        rest = &rest[end..];
+        whole = false;
+    }
+    if !rest.is_empty() || whole {
+        spans.push(Span::styled(rest.to_string(), style));
+    }
+}
+
+/// The span of the first internal URI in `row`: its scheme name and the token that follows it.
+fn uri(row: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(found) = row[from..].find("://") {
+        let separator = from + found;
+        let start = row[..separator]
+            .rfind(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')))
+            .map_or(0, |index| index + 1);
+        if row[start..separator].starts_with(|character: char| character.is_ascii_alphabetic()) {
+            let tail = separator + 3;
+            let end = row[tail..]
+                .char_indices()
+                .find(|(_, character)| {
+                    character.is_whitespace() || matches!(character, ')' | ']' | '}' | ',' | ';' | '`' | '"' | '\'')
+                })
+                .map_or(row.len(), |(index, _)| tail + index);
+            return Some((start, end));
+        }
+        from = separator + 3;
+    }
+    None
+}
+
+/// A scheme's hue: what the reader can tell apart at a glance without reading the token.
+fn scheme_colour(scheme: &str) -> Color {
+    match scheme {
+        "conflict" => theme::warning(),
+        "skill" => theme::accent(),
+        "agent" | "history" => theme::reply(),
+        "mcp" => theme::message(),
+        _ => theme::info(),
+    }
+}
+
+/// Word-wraps one styled line to `width`, keeping each character's style and the line's indentation.
+fn wrap_styled(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    let chars: Vec<(char, Style)> =
+        line.spans.iter().flat_map(|span| span.content.chars().map(move |character| (character, span.style))).collect();
+    let lead_len = chars.iter().take_while(|(character, _)| character.is_whitespace()).count();
+    let (lead, body) = chars.split_at(lead_len);
+    let lead = lead.to_vec();
+    let lead_width = columns(&lead);
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row = lead.clone();
+    let mut used = lead_width;
+    let mut index = 0;
+    while let Some((character, _)) = body.get(index) {
+        if character.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while body.get(index).is_some_and(|(character, _)| !character.is_whitespace()) {
+            index += 1;
+        }
+        let mut word = body.get(start..index).unwrap_or_default();
+        loop {
+            let spaced = used > lead_width;
+            let needed = columns(word);
+            if used + usize::from(spaced) + needed <= width {
+                if spaced {
+                    let style = row.last().map_or_else(Style::default, |(_, style)| *style);
+                    row.push((' ', style));
+                    used += 1;
+                }
+                row.extend_from_slice(word);
+                used += needed;
+                break;
+            }
+            if spaced {
+                rows.push(std::mem::take(&mut row));
+                row.clone_from(&lead);
+                used = lead_width;
+                continue;
+            }
+            let room = width.saturating_sub(lead_width).max(1);
+            let cut = cut_width(word, room);
+            let mut head = lead.clone();
+            head.extend_from_slice(word.get(..cut).unwrap_or_default());
+            rows.push(head);
+            word = word.get(cut..).unwrap_or_default();
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if used > lead_width || rows.is_empty() {
+        rows.push(row);
+    }
+    rows.into_iter().map(spans_of).collect()
+}
+
+/// Columns a styled run takes on screen.
+fn columns(chars: &[(char, Style)]) -> usize {
+    chars.iter().map(|(character, _)| char_width(*character)).sum()
+}
+
+/// How many characters of `word` fit in `width` columns, always taking at least one.
+fn cut_width(word: &[(char, Style)], width: usize) -> usize {
+    let mut used = 0;
+    let mut cut = 0;
+    for (index, (character, _)) in word.iter().enumerate() {
+        let next = used + char_width(*character);
+        if next > width && cut > 0 {
+            break;
+        }
+        used = next;
+        cut = index + 1;
+    }
+    cut
+}
+
+/// Coalesces styled characters into the fewest spans the styles allow.
+fn spans_of(chars: Vec<(char, Style)>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut current: Option<Style> = None;
+    for (character, style) in chars {
+        if current != Some(style) {
+            if let Some(previous) = current {
+                spans.push(Span::styled(std::mem::take(&mut text), previous));
+            }
+            current = Some(style);
+        }
+        text.push(character);
+    }
+    if let Some(previous) = current {
+        spans.push(Span::styled(text, previous));
+    }
+    Line::from(spans)
 }
 
 /// Word-wraps one line of text to `width` columns, cutting words wider than the line.
@@ -841,7 +1174,9 @@ impl App {
                     self.worker_stream_mut(id).push(Entry::new(Role::Worker(kind), name, text));
                     self.note_unread(id);
                 }
-                self.push(Role::Notice, String::new(), line);
+                // A reply is one agent addressing another; a lifecycle event stays a notice.
+                let role = if kind == AgentEvent::Reply { Role::Message } else { Role::Notice };
+                self.push(role, String::new(), line);
             }
             UiEvent::AgentDelta { id, text } => self.piece(id, Role::Model, &text),
             UiEvent::AgentThought { id, text } => self.piece(id, Role::Thinking, &text),
@@ -1374,7 +1709,7 @@ impl App {
         let mut spans = vec![Span::raw("  ")];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::accent())));
+            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::thought())));
             let secs = self.busy_since.elapsed().as_secs_f32();
             spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::muted())));
         } else if self.draining {
@@ -2203,42 +2538,83 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_tool_card_keeps_two_rows_and_counts_the_rest() {
+    fn a_tool_card_is_one_row_until_expanded() {
         let mut app = App::new("m");
         let text = format!("first line\n{}tail", "word ".repeat(40));
         tool_call(&mut app, 0, "spawn_agent", &format!("/tmp · {text}"));
-        let whole = app.lead.entries[0].lines(40, 0, true);
-        let hidden = whole.len() - 2;
         let collapsed = app.lead.entries[0].lines(40, 0, false);
-        assert_eq!(collapsed.len(), 3, "two body rows and the row that counts the rest: {collapsed:?}");
+        assert_eq!(collapsed.len(), 1, "a compact card is its header: {collapsed:?}");
         let joined = row_text(&collapsed);
         assert!(joined.contains("first line"), "{joined}");
-        assert!(!joined.contains("tail"), "the end of the task waits for ctrl+o: {joined}");
-        assert!(joined.contains(&format!("… {hidden} more lines")), "{joined}");
-        assert_eq!(collapsed[2].spans[0].style.fg, Some(theme::faint()), "the count is faint");
-        let rendered = screen(&mut app, 100, 24);
-        assert!(!rendered.contains("tail"), "the rendered card stops at its first rows: {rendered}");
-        assert!(rendered.contains("more lines"), "the launch render counts what it hides: {rendered}");
+        assert!(!joined.contains("tail"), "the end of the task waits for ctrl+0: {joined}");
+        let whole = app.lead.entries[0].lines(40, 0, true);
+        assert!(whole.len() > 1, "ctrl+0 shows the whole body: {whole:?}");
+        assert!(row_text(&whole).contains("tail"), "the expanded card reaches the end");
     }
 
     #[test]
-    fn a_card_body_that_fits_two_rows_gets_no_hint_row() {
+    fn prose_renders_markdown_and_drops_its_markers() {
+        let lines = markdown("# Title\n\n**bold** and `code`\n\n- one\n- two", "  ", Style::new(), 60);
+        let text = row_text(&lines);
+        assert!(text.contains("Title"), "{text}");
+        assert!(!text.contains('#'), "the heading marker is gone: {text}");
+        assert!(text.contains("bold"), "{text}");
+        assert!(!text.contains("**"), "the emphasis marker is gone: {text}");
+        assert!(text.contains("code"), "{text}");
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        let heading = lines.iter().flat_map(|line| &line.spans).find(|span| span.content == "Title");
+        let heading = heading.expect("the heading survives");
+        assert_eq!(heading.style.fg, Some(theme::accent()), "headings take the accent");
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD), "headings are bold");
+
         let mut app = App::new("m");
-        tool_call(&mut app, 0, "spawn_agent", "/tmp · one\ntwo");
-        let lines = app.lead.entries[0].lines(80, 0, false);
-        assert_eq!(lines.len(), 2, "both rows fit, so nothing is hidden: {lines:?}");
-        assert!(!row_text(&lines).contains("more"), "no count without something hidden");
+        app.apply(UiEvent::Answer("# Title\n\n**bold** and `code`".into()));
+        let rendered = screen(&mut app, 80, 20);
+        assert!(rendered.contains("Title") && rendered.contains("bold"), "{rendered}");
+        assert!(!rendered.contains('#') && !rendered.contains("**"), "the screen shows prose: {rendered}");
     }
 
     #[test]
-    fn a_card_that_hides_one_row_says_line_and_not_lines() {
+    fn tables_and_fences_render_without_the_source_syntax() {
+        let table = markdown("| a | b |\n|---|---|\n| 1 | 2 |", "  ", Style::new(), 40);
+        let table = row_text(&table);
+        for cell in ["a", "b", "1", "2", "│"] {
+            assert!(table.contains(cell), "the table keeps {cell}: {table}");
+        }
+        assert!(!table.contains("|---"), "the delimiter row is syntax, not output: {table}");
+        let code = markdown("```rust\nfn main() {}\n```", "  ", Style::new(), 40);
+        let code = row_text(&code);
+        assert!(code.contains("fn main() {}"), "{code}");
+        assert!(!code.contains("```") && !code.contains("rust"), "the fence and its language stay hidden: {code}");
+    }
+
+    #[test]
+    fn markdown_wrapping_keeps_each_run_style() {
+        let style = Style::new().fg(theme::warning()).add_modifier(Modifier::BOLD);
+        let line = Line::from(Span::styled("alpha beta gamma delta".to_string(), style));
+        let rows = wrap_styled(&line, 10);
+        assert!(rows.len() > 1, "the line wraps: {rows:?}");
+        for span in rows.iter().flat_map(|row| &row.spans) {
+            assert_eq!(span.style, style, "no row loses the run's colour or weight");
+        }
+    }
+
+    #[test]
+    fn tool_output_is_never_parsed_as_markdown() {
         let mut app = App::new("m");
-        tool_call(&mut app, 0, "spawn_agent", "/tmp · one\ntwo\nthree");
-        let lines = app.lead.entries[0].lines(80, 0, false);
-        let joined = row_text(&lines);
-        assert_eq!(lines.len(), 3, "two rows and the count: {lines:?}");
-        assert!(joined.contains("… 1 more line"), "{joined}");
-        assert!(!joined.contains("more lines"), "one hidden row is a line: {joined}");
+        tool_call(&mut app, 0, "read_file", "**literal**");
+        let text = row_text(&app.lead.entries[0].lines(80, 0, true));
+        assert!(text.contains("**literal**"), "a file's characters reach the screen as written: {text}");
+    }
+
+    #[test]
+    fn an_internal_uri_is_drawn_in_the_colour_of_its_scheme() {
+        let spans = highlight("read `conflict://1` then skill://x", Style::new().fg(theme::text()));
+        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(joined, "read `conflict://1` then skill://x", "splitting changes no character");
+        let colour = |token: &str| spans.iter().find(|span| span.content == token).and_then(|span| span.style.fg);
+        assert_eq!(colour("conflict://1"), Some(theme::warning()), "a conflict is a warning");
+        assert_eq!(colour("skill://x"), Some(theme::accent()), "a skill is the overseer's accent");
     }
 
     #[test]
@@ -2273,7 +2649,7 @@ mod tests {
         assert!(!text.contains("five"), "only the head is shown: {text}");
         assert!(text.contains("… 2 more lines"), "{text}");
         assert!(!text.contains("stdout:"), "the result's scaffolding is not output: {text}");
-        assert_eq!(worker_entries(&app, 2)[0].lines(80, 0, false).len(), 1, "F3 leaves one row per call");
+        assert_eq!(worker_entries(&app, 2)[0].lines(80, 0, false).len(), 1, "a compact card is one row per call");
     }
 
     #[test]
