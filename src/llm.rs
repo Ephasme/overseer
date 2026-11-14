@@ -3,6 +3,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// Longest response body echoed into an error: a proxy's error page must not land in the transcript.
+const MAX_ERROR_BODY: usize = 2_000;
+
+fn excerpt(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", body.get(..end).unwrap_or_default())
+}
+
 /// One chat message in the chat-completions wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Message {
@@ -113,7 +127,7 @@ impl OpenAiClient {
         let status = response.status();
         let body = response.text().context("reading model response failed")?;
         if !status.is_success() {
-            bail!("model returned HTTP {status}: {body}");
+            bail!("model returned HTTP {status}: {}", excerpt(&body));
         }
         Ok(body)
     }
@@ -133,7 +147,7 @@ impl OpenAiClient {
         let status = response.status();
         if stream && !status.is_success() {
             let body = response.text().context("reading model response failed")?;
-            bail!("model returned HTTP {status}: {body}");
+            bail!("model returned HTTP {status}: {}", excerpt(&body));
         }
         Ok(response)
     }
@@ -151,7 +165,7 @@ struct Choice {
 
 fn parse_response(body: &str) -> Result<Message> {
     let response: ChatResponse =
-        serde_json::from_str(body).with_context(|| format!("unexpected model response: {body}"))?;
+        serde_json::from_str(body).with_context(|| format!("unexpected model response: {}", excerpt(body)))?;
     response.choices.into_iter().next().map(|c| c.message).context("model response has no choices")
 }
 
@@ -210,7 +224,7 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
             break;
         }
         let chunk: StreamChunk =
-            serde_json::from_str(data).with_context(|| format!("unexpected stream chunk: {data}"))?;
+            serde_json::from_str(data).with_context(|| format!("unexpected stream chunk: {}", excerpt(data)))?;
         if let Some(error) = chunk.error {
             bail!("model stream failed: {error}");
         }

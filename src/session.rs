@@ -4,6 +4,7 @@ use crate::event::UiEvent;
 use crate::fleet::{self, Event, Fleet};
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
+use crate::tools;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -73,7 +74,11 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Worker { id, kind, text: text.clone() });
                 format!("[worker {id} {}] {text}", kind.verb())
             }
-            Event::User(text) => text,
+            // A prompt typed after ctrl+D cancels the drain: the user changed their mind.
+            Event::User(text) => {
+                draining = false;
+                text
+            }
         };
         let _ = ui.send(UiEvent::Busy(true));
         {
@@ -109,5 +114,7 @@ pub(crate) fn run(
             break;
         }
     }
+    // Quitting must not leave a worker's `cargo build` running without its owner.
+    tools::kill_running();
     let _ = ui.send(UiEvent::Done);
 }

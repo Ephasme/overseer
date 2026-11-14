@@ -52,11 +52,13 @@ pub(crate) fn overseer_tool_definitions() -> Value {
 
 pub(crate) fn worker_tool_definitions() -> Value {
     let mut defs = tools::definitions();
-    defs.as_array_mut().expect("tools::definitions returns an array").push(json!({"type": "function", "function": {
-        "name": REPLY,
-        "description": "Send a short progress note to Overseer without ending your turn.",
-        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
-    }}));
+    if let Some(functions) = defs.as_array_mut() {
+        functions.push(json!({"type": "function", "function": {
+            "name": REPLY,
+            "description": "Send a short progress note to Overseer without ending your turn.",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+        }}));
+    }
     defs
 }
 

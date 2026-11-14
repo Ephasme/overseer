@@ -248,10 +248,13 @@ fn composer(model: &str) -> TextArea<'static> {
 #[allow(clippy::struct_excessive_bools)]
 pub(super) struct App {
     entries: Vec<Entry>,
-    /// The transcript flattened at `transcript_width`; `transcript_dirty` asks for a rebuild.
+    /// Entries flattened at `transcript_width`: those before `flattened` are already in `transcript`.
     transcript: Vec<Line<'static>>,
     transcript_width: u16,
-    transcript_dirty: bool,
+    /// Rows each entry took, so a rebuild can keep everything before the first dirty entry.
+    entry_rows: Vec<usize>,
+    flattened: usize,
+    dirty_from: usize,
     composer: TextArea<'static>,
     model: String,
     history: Vec<String>,
@@ -286,7 +289,9 @@ impl App {
             entries: Vec::new(),
             transcript: Vec::new(),
             transcript_width: 0,
-            transcript_dirty: true,
+            entry_rows: Vec::new(),
+            flattened: 0,
+            dirty_from: 0,
             composer: composer(model),
             model: model.to_string(),
             history: Vec::new(),
@@ -311,10 +316,6 @@ impl App {
 
     pub(super) fn apply(&mut self, event: UiEvent) {
         self.dirty = true;
-        // The transcript is only rebuilt when entries change; worker deltas touch the panel alone.
-        if !matches!(event, UiEvent::WorkerDelta { .. } | UiEvent::Workers(_) | UiEvent::Busy(_)) {
-            self.transcript_dirty = true;
-        }
         match event {
             UiEvent::Notice(text) => self.push(Role::Notice, String::new(), text),
             UiEvent::Answer(text) => self.answer(text),
@@ -325,6 +326,8 @@ impl App {
             UiEvent::ToolStarted { id, tool, summary } => {
                 let index = self.entries.len();
                 self.entries.push(Entry::new(Role::Tool, tool, summary));
+                self.entry_rows.push(0);
+                self.invalidate(index);
                 if self.tools.len() <= id {
                     self.tools.resize(id + 1, None);
                 }
@@ -336,6 +339,9 @@ impl App {
                 let index = self.tools.get(id).copied().flatten();
                 if let Some(entry) = index.and_then(|i| self.entries.get_mut(i)) {
                     entry.finish(output, secs);
+                }
+                if let Some(index) = index {
+                    self.invalidate(index);
                 }
             }
             UiEvent::Worker { id, kind, text } => {
@@ -353,6 +359,8 @@ impl App {
                 self.busy = moving;
                 if moving {
                     self.busy_since = Instant::now();
+                    // A turn started after ctrl+D: the drain is cancelled.
+                    self.draining = false;
                 } else {
                     // A failed turn never sends an answer: its streamed text stays as the record.
                     self.live = None;
@@ -364,28 +372,38 @@ impl App {
 
     /// Separates the model calls of one turn with a blank line.
     fn boundary(&mut self) {
-        if let Some(entry) = self.live.and_then(|index| self.entries.get_mut(index))
+        let Some(index) = self.live else { return };
+        let changed = if let Some(entry) = self.entries.get_mut(index)
             && !entry.body.is_empty()
             && !entry.body.ends_with("\n\n")
         {
             entry.body.push_str("\n\n");
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.invalidate(index);
         }
     }
 
     fn stream(&mut self, text: &str) {
         if self.live.is_none() {
-            let index = self.entries.len();
             self.push(Role::Overseer, String::new(), String::new());
-            self.live = Some(index);
+            self.live = Some(self.entries.len().saturating_sub(1));
         }
-        if let Some(entry) = self.live.and_then(|index| self.entries.get_mut(index)) {
+        if let Some(index) = self.live
+            && let Some(entry) = self.entries.get_mut(index)
+        {
             entry.body.push_str(text);
+            self.invalidate(index);
         }
     }
 
     /// The turn's final text: it replaces what streamed when a backend sends nothing.
     fn answer(&mut self, text: String) {
-        match self.live.take().and_then(|index| self.entries.get_mut(index)) {
+        let live = self.live.take();
+        match live.and_then(|index| self.entries.get_mut(index)) {
             Some(entry) if entry.body.trim().is_empty() => entry.body = text,
             Some(entry) if !entry.body.trim_end().ends_with(text.trim()) && !text.trim().is_empty() => {
                 entry.body.push_str("\n\n");
@@ -394,6 +412,9 @@ impl App {
 
             Some(_) => {}
             None => self.push(Role::Overseer, String::new(), text),
+        }
+        if let Some(index) = live {
+            self.invalidate(index);
         }
     }
 
@@ -422,6 +443,33 @@ impl App {
 
     fn push(&mut self, role: Role, title: String, body: String) {
         self.entries.push(Entry::new(role, title, body));
+        self.entry_rows.push(0);
+        self.invalidate(self.entries.len().saturating_sub(1));
+    }
+
+    /// Marks `index` and everything after it as needing a new flatten.
+    fn invalidate(&mut self, index: usize) {
+        self.dirty_from = self.dirty_from.min(index);
+    }
+
+    /// Rebuilds the flattened transcript from the first dirty entry on, keeping what precedes it.
+    fn reflatten(&mut self) {
+        let from = self.dirty_from.min(self.entries.len());
+        let keep = from.min(self.flattened);
+        let rows = self.entry_rows.iter().take(keep).sum::<usize>() + keep.saturating_sub(1);
+        self.transcript.truncate(rows);
+        for index in keep..self.entries.len() {
+            if !self.transcript.is_empty() {
+                self.transcript.push(Line::default());
+            }
+            let lines = self.entries.get(index).map_or_else(Vec::new, |entry| entry.lines(self.transcript_width));
+            if let Some(slot) = self.entry_rows.get_mut(index) {
+                *slot = lines.len();
+            }
+            self.transcript.extend(lines);
+        }
+        self.flattened = self.entries.len();
+        self.dirty_from = self.entries.len();
     }
 
     /// Whether a frame is due; clears the flag.
@@ -429,21 +477,19 @@ impl App {
         std::mem::take(&mut self.dirty)
     }
 
-    /// A resize changes the transcript width, so its cache is rebuilt on the next draw.
+    /// A resize changes the transcript width, so the whole cache is rebuilt on the next draw.
     pub(super) fn resize(&mut self) {
-        self.transcript_dirty = true;
+        self.dirty_from = 0;
         self.dirty = true;
     }
 
-    /// Advances the spinner; says whether a redraw is needed.
-    pub(super) fn tick(&mut self) -> bool {
-        if !self.busy || self.last_tick.elapsed() < TICK {
-            return false;
+    /// Advances the spinner.
+    pub(super) fn tick(&mut self) {
+        if self.busy && self.last_tick.elapsed() >= TICK {
+            self.last_tick = Instant::now();
+            self.spinning = self.spinning.wrapping_add(1);
+            self.dirty = true;
         }
-        self.last_tick = Instant::now();
-        self.spinning = self.spinning.wrapping_add(1);
-        self.dirty = true;
-        true
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame) {
@@ -470,10 +516,12 @@ impl App {
         let inner = frame_block.inner(area);
         frame.render_widget(frame_block, area);
         let width = inner.width.max(1);
-        if self.transcript_dirty || self.transcript_width != width {
-            self.transcript = flatten(&self.entries, width);
+        if self.transcript_width != width {
             self.transcript_width = width;
-            self.transcript_dirty = false;
+            self.dirty_from = 0;
+        }
+        if self.dirty_from < self.entries.len() {
+            self.reflatten();
         }
         let total = u16::try_from(self.transcript.len()).unwrap_or(u16::MAX);
         // Reading older lines while new ones arrive: keep the same rows under the cursor.
@@ -567,7 +615,6 @@ impl App {
 
     pub(super) fn echo(&mut self, prompt: &str) {
         self.push(Role::You, String::new(), prompt.to_string());
-        self.transcript_dirty = true;
         self.dirty = true;
     }
 
@@ -594,7 +641,6 @@ impl App {
     /// The core thread vanished without saying `Done`: show it and quit rather than wait forever.
     pub(super) fn lost_core(&mut self) {
         self.push(Role::Error, String::new(), "overseer stopped unexpectedly".into());
-        self.transcript_dirty = true;
         self.dirty = true;
         self.quit = true;
     }
@@ -679,18 +725,6 @@ impl App {
         self.composer.set_lines(lines, cursor);
         self.dirty = true;
     }
-}
-
-/// Every entry's rows, separated by a blank line.
-fn flatten(entries: &[Entry], width: u16) -> Vec<Line<'static>> {
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    for entry in entries {
-        if !rows.is_empty() {
-            rows.push(Line::default());
-        }
-        rows.extend(entry.lines(width));
-    }
-    rows
 }
 
 fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
@@ -896,5 +930,40 @@ mod tests {
         assert!(app.composer.lines().iter().all(String::is_empty));
         app.recall_previous();
         assert_eq!(app.composer.lines(), ["hello"]);
+    }
+
+    #[test]
+    fn a_new_entry_keeps_the_flattened_prefix() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Answer("first".into()));
+        screen(&mut app, 60, 16);
+        let prefix = app.transcript.clone();
+        assert_eq!(app.dirty_from, app.entries.len(), "a drawn transcript has nothing left to flatten");
+        app.apply(UiEvent::Answer("second".into()));
+        assert_eq!(app.dirty_from, 1, "only the new entry needs flattening");
+        screen(&mut app, 60, 16);
+        assert_eq!(app.transcript.get(..prefix.len()), Some(prefix.as_slice()));
+        assert!(row_text(&app.transcript).contains("second"));
+    }
+
+    #[test]
+    fn finishing_an_early_tool_call_reflattens_from_its_entry() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::ToolStarted { id: 0, tool: "bash".into(), summary: "ls".into() });
+        app.apply(UiEvent::Answer("after".into()));
+        screen(&mut app, 60, 16);
+        app.apply(UiEvent::ToolFinished { id: 0, output: "done".into(), secs: 1.0 });
+        assert_eq!(app.dirty_from, 0);
+        let rendered = screen(&mut app, 60, 16);
+        assert!(rendered.contains("done"), "{rendered}");
+    }
+
+    #[test]
+    fn a_turn_after_ctrl_d_cancels_the_drain() {
+        let mut app = App::new("m");
+        app.drain();
+        assert!(app.draining);
+        app.apply(UiEvent::Busy(true));
+        assert!(!app.draining);
     }
 }
