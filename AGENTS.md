@@ -40,6 +40,7 @@
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |
 | `src/tools.rs` | the file tools `bash`, `read_file`, `write_file`, and the `Policy` that guards them |
 | `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
+| `src/slash.rs` | the slash-command table the composer's completion popup reads |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
@@ -60,6 +61,7 @@
 - `Control::set_policy` has exactly one caller, `Swarm::spawn`, before the thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
+- `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
 - Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build` or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
