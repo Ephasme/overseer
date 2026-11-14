@@ -1,3 +1,4 @@
+use crate::clipboard;
 use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
@@ -34,11 +35,17 @@ const TICK: Duration = Duration::from_millis(120);
 /// Longest worker preview kept, in characters.
 const PREVIEW_CHARS: usize = 400;
 
+/// Said instead of attaching, when the clipboard has neither an image nor text.
+const NO_CLIPBOARD: &str = "the clipboard holds no image or text";
+
+/// The head of the attachment chip above the composer.
+const ATTACHMENT_LEAD: &str = " ▸ image ";
+
+/// Its remove affordance, kept visible whatever the path's length.
+const ATTACHMENT_HINT: &str = " · ctrl+x removes";
+
 /// Key hints on the right of the status line.
 const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+x drop image · ctrl+d quit";
-
-/// Said out loud, because a paste that does nothing looks like a broken key.
-const EMPTY_CLIPBOARD: &str = "clipboard has no image or text";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -728,10 +735,13 @@ impl App {
     /// The pending image, one compact chip above the composer.
     fn render_attachment(&self, frame: &mut Frame, area: Rect) {
         let Some(path) = &self.attachment else { return };
+        // The hint is the point of the chip, so a long path is cut instead of pushing it off the line.
+        let fixed = ATTACHMENT_LEAD.len() + ATTACHMENT_HINT.len() + 2;
+        let room = usize::from(area.width).saturating_sub(fixed).max(8);
         let line = Line::from(vec![
-            Span::styled(" image ", Style::new().fg(Color::Black).bg(YELLOW)),
-            Span::styled(format!(" {}", path.display()), DIM),
-            Span::styled(" · ctrl+x removes", DIM),
+            Span::styled(ATTACHMENT_LEAD, Style::new().fg(MAGENTA)),
+            Span::styled(truncate(&path.display().to_string(), room), Style::new()),
+            Span::styled(ATTACHMENT_HINT, DIM),
         ]);
         frame.render_widget(Paragraph::new(line).block(Block::new().padding(Padding::horizontal(1))), area);
     }
@@ -760,7 +770,7 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// The prompt as submitted, trimmed; the composer keeps its settings but starts empty.
+    /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
         let mut text = self.composer.lines().join("\n").trim().to_string();
         if let Some(path) = self.attachment.take() {
@@ -769,10 +779,12 @@ impl App {
             let note = format!("[attached image: {}]", path.display());
             text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
         }
+        let typed = self.composer.lines().join("\n");
         self.composer = composer(&self.model);
         self.recall = None;
-        if !text.is_empty() {
-            self.history.push(text.clone());
+        // History holds what was typed: a recalled temp path would point at a file since dropped.
+        if !typed.is_empty() {
+            self.history.push(typed);
         }
         self.dirty = true;
         text
@@ -788,33 +800,37 @@ impl App {
         self.dirty = true;
     }
 
-    /// Ctrl+V: the system clipboard, which a terminal withholds from a TUI outside bracketed paste.
+    /// Ctrl+V: the system clipboard, which a terminal hands a TUI only as text, in bracketed paste.
+    ///
+    /// Text goes in first, the common case and the fast one; an image becomes an attachment, since a
+    /// PNG cannot be typed into a composer and the model only reads text.
     pub(super) fn paste(&mut self) {
-        let dir = crate::config::home().map_or_else(
-            |_| std::env::temp_dir().join("overseer/pastes"),
-            |home| crate::config::state_dir(&home).join("pastes"),
-        );
-        self.dirty = true;
-        self.apply_paste(crate::clipboard::read(&dir));
+        if let Some(text) = clipboard::text() {
+            self.insert(&text);
+            return;
+        }
+        self.attach(clipboard::image());
     }
 
-    /// Applies one paste: an image becomes a pending attachment, text goes in the composer, and a
-    /// clipboard holding neither says so instead of doing nothing.
-    fn apply_paste(&mut self, content: crate::clipboard::Content) {
-        match content {
-            crate::clipboard::Content::Text(text) => self.insert(&text),
-            crate::clipboard::Content::Empty => self.notice(EMPTY_CLIPBOARD),
-            crate::clipboard::Content::Failed(why) => self.notice(&format!("cannot read the clipboard: {why}")),
-            crate::clipboard::Content::Image(path) => {
+    /// Takes what a paste found: an image to attach, or a notice saying why there is none.
+    pub(super) fn attach(&mut self, paste: clipboard::Paste) {
+        match paste {
+            clipboard::Paste::Image(path) => {
+                self.detach();
                 self.attachment = Some(path);
-                self.dirty = true;
+            }
+            clipboard::Paste::Empty => self.notice(NO_CLIPBOARD),
+            clipboard::Paste::Failed(why) => {
+                self.push(Role::Error, String::new(), format!("cannot read the clipboard: {why}"));
             }
         }
+        self.dirty = true;
     }
 
-    /// Drops the pending attachment: ctrl+x, or backspace on an empty composer.
+    /// Drops the attachment and its temp file.
     pub(super) fn detach(&mut self) {
-        if self.attachment.take().is_some() {
+        if let Some(path) = self.attachment.take() {
+            clipboard::discard(&path);
             self.dirty = true;
         }
     }
@@ -993,7 +1009,7 @@ fn short_dir(dir: &Path) -> String {
 #[cfg(test)]
 mod paste_tests {
     use super::*;
-    use crate::clipboard::Content;
+    use clipboard::Paste;
     use std::fs;
 
     fn saved(dir: &Path) -> PathBuf {
@@ -1007,24 +1023,24 @@ mod paste_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
         let path = saved(dir.path());
-        app.apply_paste(Content::Image(path.clone()));
+        app.attach(Paste::Image(path.clone()));
         assert_eq!(app.attachment.as_deref(), Some(path.as_path()));
     }
 
     #[test]
     fn an_empty_clipboard_says_so_instead_of_doing_nothing() {
         let mut app = App::new("m");
-        app.apply_paste(Content::Empty);
+        app.attach(Paste::Empty);
         assert!(app.attachment.is_none());
         let last = app.entries.last().expect("a notice");
         assert_eq!(last.role, Role::Notice);
-        assert_eq!(last.body, EMPTY_CLIPBOARD);
+        assert_eq!(last.body, NO_CLIPBOARD);
     }
 
     #[test]
     fn a_clipboard_that_cannot_be_read_says_why() {
         let mut app = App::new("m");
-        app.apply_paste(Content::Failed("osascript: not found".into()));
+        app.attach(Paste::Failed("osascript: not found".into()));
         let last = app.entries.last().expect("a notice");
         assert_eq!(last.body, "cannot read the clipboard: osascript: not found");
     }
@@ -1033,21 +1049,13 @@ mod paste_tests {
     fn an_attachment_rides_one_message_as_its_absolute_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Content::Image(saved(dir.path())));
+        app.attach(Paste::Image(saved(dir.path())));
         app.insert("what is this?");
         let prompt = app.take_prompt();
         assert!(prompt.starts_with("what is this?"), "{prompt}");
         assert!(prompt.contains("[attached image: "), "{prompt}");
         assert!(prompt.contains(".png]"), "{prompt}");
         assert!(app.attachment.is_none(), "the attachment belongs to one message");
-    }
-
-    #[test]
-    fn pasted_text_still_lands_in_the_composer() {
-        let mut app = App::new("m");
-        app.apply_paste(Content::Text("hello".into()));
-        assert_eq!(app.composer.lines(), ["hello"]);
-        assert!(app.attachment.is_none());
     }
 }
 #[cfg(test)]
@@ -1371,5 +1379,91 @@ mod tests {
         app.click(1, top);
         assert_eq!(app.selected, None);
         assert!(app.entries.is_empty());
+    }
+
+    fn pasted(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"\x89PNG\r\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_pasted_image_rides_along_with_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path.clone()));
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("paste.png"), "the chip shows the path: {drawn}");
+        assert!(drawn.contains("ctrl+x removes"), "{drawn}");
+        app.insert("look at this");
+        let prompt = app.take_prompt();
+        assert_eq!(prompt, format!("look at this\n\n[attached image: {}]", path.display()));
+        assert!(app.attachment.is_none(), "the attachment belongs to the prompt it left with");
+        let after = screen(&mut app, 100, 24);
+        assert!(!after.contains("ctrl+x removes"), "the chip goes with the prompt: {after}");
+        app.recall_previous();
+        assert_eq!(app.composer.lines(), ["look at this"], "history keeps what was typed, not a temp path");
+    }
+
+    #[test]
+    fn an_image_alone_is_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path.clone()));
+        assert_eq!(app.take_prompt(), format!("[attached image: {}]", path.display()));
+    }
+
+    #[test]
+    fn a_second_paste_replaces_the_first_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (pasted(dir.path(), "one.png"), pasted(dir.path(), "two.png"));
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(first));
+        app.attach(clipboard::Paste::Image(second.clone()));
+        assert_eq!(app.attachment, Some(second));
+    }
+
+    #[test]
+    fn a_long_path_leaves_the_remove_hint_visible() {
+        let mut app = App::new("m");
+        let path = PathBuf::from(format!("/tmp/{}/paste.png", "d".repeat(120)));
+        app.attach(clipboard::Paste::Image(path));
+        let drawn = screen(&mut app, 40, 24);
+        assert!(drawn.contains("ctrl+x removes"), "the hint survives a cut path: {drawn}");
+        assert!(drawn.contains('…'), "a cut path is marked: {drawn}");
+    }
+
+    #[test]
+    fn a_clipboard_without_an_image_says_so_and_attaches_nothing() {
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Empty);
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains(NO_CLIPBOARD), "{drawn}");
+        assert!(app.attachment.is_none());
+        app.insert("hello");
+        assert_eq!(app.take_prompt(), "hello");
+    }
+
+    #[test]
+    fn an_unreadable_clipboard_reports_why_rather_than_doing_nothing() {
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Failed("osascript: no such file".into()));
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("cannot read the clipboard: osascript: no such file"), "{drawn}");
+        assert!(app.attachment.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_drops_the_attachment_and_the_chip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path));
+        app.detach();
+        assert!(app.attachment.is_none());
+        app.insert("no image now");
+        assert_eq!(app.take_prompt(), "no image now");
     }
 }

@@ -38,6 +38,8 @@ On a terminal it opens a full-screen UI: the transcript, a worker panel on the r
 |---|---|
 |enter|send the prompt|
 |ctrl+j|new line in the prompt|
+|ctrl+v|attach the image on the clipboard to the prompt; the message carries its path|
+|ctrl+x|drop the attached image|
 |PageUp / PageDown|scroll the transcript; End follows new output again|
 |F2|hide or show the worker panel|
 |F3|hide or show what tool calls returned, leaving one row per call|
