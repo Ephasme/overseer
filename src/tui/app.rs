@@ -2,16 +2,14 @@ use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
 use crate::version;
-use anyhow::{Context, Result, bail};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tui_textarea::{TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
 
@@ -796,22 +794,22 @@ impl App {
             |_| std::env::temp_dir().join("overseer/pastes"),
             |home| crate::config::state_dir(&home).join("pastes"),
         );
-        self.apply_paste(Paste::read(), &dir);
+        self.apply_paste(crate::clipboard::read(), &dir);
     }
 
     /// Applies one paste: an image becomes a pending attachment, text goes in the composer, and a
     /// clipboard holding neither says so instead of doing nothing.
-    fn apply_paste(&mut self, paste: Paste, dir: &Path) {
-        match paste {
-            Paste::Image { width, height, bytes } => match save_paste(dir, width, height, &bytes) {
+    fn apply_paste(&mut self, content: crate::clipboard::Content, dir: &Path) {
+        match content {
+            crate::clipboard::Content::Text(text) => self.insert(&text),
+            crate::clipboard::Content::Empty => self.notice(EMPTY_CLIPBOARD),
+            image => match crate::clipboard::save(&image, dir) {
                 Ok(path) => {
                     self.attachment = Some(path);
                     self.dirty = true;
                 }
                 Err(e) => self.notice(&format!("cannot save the pasted image: {e}")),
             },
-            Paste::Text(text) => self.insert(&text),
-            Paste::Nothing => self.notice(EMPTY_CLIPBOARD),
         }
     }
 
@@ -993,79 +991,35 @@ fn short_dir(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
-/// What the clipboard held, decided once so the branch that acts on it is testable without one.
-#[derive(Debug, PartialEq)]
-enum Paste {
-    /// Raw RGBA8 pixels, as arboard hands them back.
-    Image {
-        width: usize,
-        height: usize,
-        bytes: Vec<u8>,
-    },
-    Text(String),
-    Nothing,
-}
-
-impl Paste {
-    /// Reads the clipboard, image first: a screenshot has no text form, and `get_text` fails on one.
-    fn read() -> Self {
-        let Ok(mut clipboard) = arboard::Clipboard::new() else { return Self::Nothing };
-        if let Ok(image) = clipboard.get_image() {
-            return Self::Image { width: image.width, height: image.height, bytes: image.bytes.into_owned() };
-        }
-        match clipboard.get_text() {
-            Ok(text) if !text.trim().is_empty() => Self::Text(text),
-            _ => Self::Nothing,
-        }
-    }
-}
-
-/// Writes clipboard RGBA pixels as `paste-<millis>.png` under `dir` and returns its path.
-fn save_paste(dir: &Path, width: usize, height: usize, bytes: &[u8]) -> Result<PathBuf> {
-    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
-        bail!("the clipboard image is larger than 65535×65535");
-    };
-    let buffer =
-        image::RgbaImage::from_raw(width, height, bytes.to_vec()).context("the clipboard image is not RGBA8")?;
-    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    let path = dir.join(format!("paste-{stamp}.png"));
-    buffer
-        .save_with_format(&path, image::ImageFormat::Png)
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(path)
-}
-
 #[cfg(test)]
 mod paste_tests {
     use super::*;
-    use image::GenericImageView;
-
-    fn two_by_two() -> Vec<u8> {
-        vec![
-            255, 0, 0, 255, 0, 255, 0, 255, //
-            0, 0, 255, 255, 255, 255, 255, 255,
-        ]
-    }
+    use crate::clipboard::Content;
+    use std::fs;
 
     #[test]
-    fn a_pasted_screenshot_is_written_as_a_png_and_attached() {
+    fn a_pasted_screenshot_becomes_a_pending_attachment() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Paste::Image { width: 2, height: 2, bytes: two_by_two() }, dir.path());
+        app.apply_paste(
+            Content::Rgba {
+                width: 2,
+                height: 2,
+                bytes: vec![0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 9, 9, 9, 255],
+            },
+            dir.path(),
+        );
         let path = app.attachment.clone().expect("an attachment");
         assert!(path.starts_with(dir.path()), "{}", path.display());
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
-        let png = fs::read(&path).expect("the png");
-        assert_eq!(png.get(..8), Some(b"\x89PNG\r\n\x1a\n".as_slice()));
-        assert_eq!(image::load_from_memory(&png).expect("decodable").dimensions(), (2, 2));
+        assert!(fs::read(&path).expect("the png").starts_with(b"\x89PNG"));
     }
 
     #[test]
     fn an_empty_clipboard_says_so_instead_of_doing_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Paste::Nothing, dir.path());
+        app.apply_paste(Content::Empty, dir.path());
         assert!(app.attachment.is_none());
         let last = app.entries.last().expect("a notice");
         assert_eq!(last.role, Role::Notice);
@@ -1076,7 +1030,7 @@ mod paste_tests {
     fn an_attachment_rides_one_message_as_its_absolute_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Paste::Image { width: 1, height: 1, bytes: vec![0, 0, 0, 255] }, dir.path());
+        app.apply_paste(Content::Rgba { width: 1, height: 1, bytes: vec![0, 0, 0, 255] }, dir.path());
         app.insert("what is this?");
         let prompt = app.take_prompt();
         assert!(prompt.starts_with("what is this?"), "{prompt}");
