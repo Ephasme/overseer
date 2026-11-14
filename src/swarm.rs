@@ -3,6 +3,7 @@ use crate::config;
 use crate::conflict;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::mcp;
+use crate::names;
 use crate::prompt;
 use crate::repos;
 use crate::skills;
@@ -250,6 +251,11 @@ pub(crate) enum Event {
     Stop {
         id: usize,
     },
+    /// User typed a new name for an agent in its rename prompt.
+    Rename {
+        id: usize,
+        name: String,
+    },
     /// User typed `/schemes`: which internal URIs resolve, without a model call.
     Schemes,
     /// User typed `/mcp`: the server list, handled without a model call.
@@ -319,6 +325,10 @@ impl Event {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AgentView {
     pub(crate) id: usize,
+    /// The name on its own, for lines that already carry the id: `brave-otter`.
+    pub(crate) name: String,
+    /// `brave-otter (3)`: the codename, or the name the user chose, then the id it answers to.
+    pub(crate) label: String,
     /// The agent that owns this one; `None` for the root.
     pub(crate) parent: Option<usize>,
     /// Delegations below the root: the root is 0.
@@ -400,6 +410,8 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
 /// One agent in the tree. Ids are never reused, so a stale order can never reach a new agent.
 struct Agent {
     id: usize,
+    /// The name the user typed for this agent; `None` shows the codename.
+    name: Option<String>,
     parent: Option<usize>,
     /// Delegations below the root: the root is 0.
     depth: usize,
@@ -422,6 +434,14 @@ struct Agent {
 impl Agent {
     fn finished(&self) -> bool {
         self.handle.is_finished()
+    }
+
+    fn label(&self) -> String {
+        names::label(self.id, self.name.as_deref())
+    }
+
+    fn name(&self) -> String {
+        names::name(self.id, self.name.as_deref())
     }
 }
 
@@ -465,6 +485,8 @@ impl Swarm {
             .iter()
             .map(|agent| AgentView {
                 id: agent.id,
+                name: agent.name(),
+                label: agent.label(),
                 parent: agent.parent,
                 depth: agent.depth,
                 dir: agent.working_dir.clone(),
@@ -478,6 +500,36 @@ impl Swarm {
                 busy_for: agent.busy_since.map(|since| since.elapsed()),
             })
             .collect()
+    }
+
+    /// How an agent reads in the UI and in what its owner reads. An id that has no agent yet, or no
+    /// longer, still gets its codename: the label never has to be looked up to be printed.
+    pub(crate) fn label(&self, id: usize) -> String {
+        id.checked_sub(1).and_then(|index| self.agents.get(index)).map_or_else(|| names::label(id, None), Agent::label)
+    }
+
+    /// The agent's name alone, for a line that already carries its id.
+    pub(crate) fn name(&self, id: usize) -> String {
+        id.checked_sub(1).and_then(|index| self.agents.get(index)).map_or_else(|| names::name(id, None), Agent::name)
+    }
+
+    /// The line an owner reads for one agent event: `[agent 3 · rapid-beacon says] ...`.
+    ///
+    /// The id comes first and unchanged, so anything that parses `[agent <n>` still works; the name
+    /// follows it because the user reads this stream too.
+    pub(crate) fn event_line(&self, id: usize, kind: AgentEvent, text: &str) -> String {
+        format!("[agent {id} · {} {}] {text}", self.name(id), kind.verb())
+    }
+
+    /// Gives an agent the name the user typed. A blank name drops it back to the codename.
+    pub(crate) fn rename(&mut self, id: usize, name: &str) -> String {
+        let Some(agent) = self.agent_mut(id) else {
+            return format!("error: no agent {}", names::label(id, None));
+        };
+        let before = agent.label();
+        let name = name.trim();
+        agent.name = (!name.is_empty()).then(|| name.to_string());
+        format!("{before} is now {}", agent.label())
     }
 
     /// Whether any agent is doing work: a paused one holds its instruction by order, so it does not
@@ -533,22 +585,32 @@ impl Swarm {
     /// Why `caller` may not address `target`, or `None` when it may.
     fn may_address(&self, caller: usize, target: usize) -> Option<String> {
         if self.agent(target).is_none() {
-            return Some(format!("no agent {target}"));
+            return Some(format!("no agent {}", self.label(target)));
         }
+        let label = self.label(target);
         if target == caller {
-            return Some(format!("agent {target} is you: an agent commands its own children, not itself"));
+            return Some(format!("{label} is you: an agent commands its own children, not itself"));
         }
         if !self.owns(caller, target) {
-            return Some(format!("agent {target} is not under your command"));
+            return Some(format!("{label} is not under your command"));
         }
         None
     }
 
     /// `/resume <id>`: the user owns every agent, so any id works.
     pub(crate) fn resume(&mut self, arg: &str) -> String {
-        let result = resume_id(arg).and_then(|id| self.deliver_to(id, CONTINUE, true, false).map(|_| id));
-        match result {
-            Ok(id) => format!("agent {id} resumed"),
+        let id = match resume_id(arg) {
+            Ok(id) => id,
+            Err(e) => return format!("error: {e}; agent ids: {}", self.ids()),
+        };
+        // Its own check, not `deliver_to`'s: that one words its error for the model, and this line is
+        // what the user reads.
+        if self.agent(id).is_none() {
+            return format!("error: no agent {}; agent ids: {}", names::label(id, None), self.ids());
+        }
+        let label = self.label(id);
+        match self.deliver_to(id, CONTINUE, true, false) {
+            Ok(_) => format!("{label} resumed"),
             Err(e) => format!("error: {e}; agent ids: {}", self.ids()),
         }
     }
@@ -594,6 +656,7 @@ impl Swarm {
             spawn_thread(llm, sender, id, 0, None, &dir, Arc::clone(&control), None, &log_path, swarm)?;
         lock(swarm).agents.push(Agent {
             id,
+            name: None,
             parent: None,
             depth: 0,
             working_dir: dir,
@@ -615,7 +678,7 @@ impl Swarm {
             return Err("the root is not running".to_string());
         }
         self.deliver_to(Swarm::ROOT, text, true, false)?;
-        Ok("sent to agent 1".to_string())
+        Ok(format!("sent to {}", self.label(Swarm::ROOT)))
     }
 
     /// Where a report goes: its owner, or `None` for the root, whose reader is the user.
@@ -626,7 +689,8 @@ impl Swarm {
     /// Hands a child's report to its owner, as a new instruction.
     pub(crate) fn deliver(&mut self, child: usize, kind: AgentEvent, text: &str) {
         let Some(parent) = self.deliver_target(child) else { return };
-        let _ = self.deliver_to(parent, &format!("[agent {child} {}] {text}", kind.verb()), false, false);
+        let line = self.event_line(child, kind, text);
+        let _ = self.deliver_to(parent, &line, false, false);
     }
 
     /// Runs one tree tool for `caller`; `None` when `name` is not one, so the caller falls through
@@ -657,10 +721,10 @@ impl Swarm {
             }
         }
         match name {
-            prompt::SPAWN_AGENT => Some(
-                tools::parse_args::<SpawnArgs>(arguments)
-                    .and_then(|args| Swarm::spawn(swarm, caller, args).map(|id| format!("agent {id} started"))),
-            ),
+            prompt::SPAWN_AGENT => Some(tools::parse_args::<SpawnArgs>(arguments).and_then(|args| {
+                let id = Swarm::spawn(swarm, caller, args)?;
+                Ok(format!("{} started", lock(swarm).label(id)))
+            })),
             prompt::MESSAGE_AGENT => {
                 Some(tools::parse_args::<MessageArgs>(arguments).and_then(|args| lock(swarm).message(caller, &args)))
             }
@@ -686,7 +750,8 @@ impl Swarm {
             let depth = parent.depth.saturating_add(1);
             if depth > tree.max_depth {
                 return Err(format!(
-                    "depth limit: an agent below {caller} would be at depth {depth}, past max_depth {}",
+                    "depth limit: an agent below {} would be at depth {depth}, past max_depth {}",
+                    tree.label(caller),
                     tree.max_depth
                 ));
             }
@@ -720,6 +785,7 @@ impl Swarm {
         )?;
         lock(swarm).agents.push(Agent {
             id,
+            name: None,
             parent: Some(caller),
             depth,
             working_dir,
@@ -747,26 +813,27 @@ impl Swarm {
             return Err(refusal);
         }
         let id = args.id;
+        let label = self.label(id);
         match args.action {
             Action::Stop => self.stop(id),
             Action::Pause => {
-                let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {id}"))?;
+                let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {label}"))?;
                 if agent.finished() {
-                    return Err(format!("agent {id} is gone"));
+                    return Err(format!("{label} is gone"));
                 }
                 agent.control.pause();
-                Ok(format!("agent {id} paused; it finishes the current instruction, then holds every queued one"))
+                Ok(format!("{label} paused; it finishes the current instruction, then holds every queued one"))
             }
             Action::Resume => {
-                let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {id}"))?;
+                let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {label}"))?;
                 if agent.finished() {
-                    return Err(format!("agent {id} is gone"));
+                    return Err(format!("{label} is gone"));
                 }
                 if agent.stopped {
-                    return Err(format!("agent {id} is stopped; spawn a new one with the rights you want"));
+                    return Err(format!("{label} is stopped; spawn a new one with the rights you want"));
                 }
                 agent.control.unpause();
-                Ok(format!("agent {id} resumed"))
+                Ok(format!("{label} resumed"))
             }
         }
     }
@@ -778,11 +845,12 @@ impl Swarm {
     /// voice the user talks to, since nothing in the program can restart it.
     pub(crate) fn stop(&mut self, id: usize) -> Result<String, String> {
         if id == Swarm::ROOT {
-            return Err("agent 1 is the overseer: it has no owner and cannot be stopped".into());
+            return Err(format!("{} is the overseer: it has no owner and cannot be stopped", self.label(id)));
         }
         if self.agent(id).is_none() {
-            return Err(format!("no agent {id}"));
+            return Err(format!("no agent {}", self.label(id)));
         }
+        let label = self.label(id);
         let mut stopped = self.descendants(id);
         stopped.push(id);
         for target in &stopped {
@@ -798,26 +866,27 @@ impl Swarm {
         }
         let below = stopped.len().saturating_sub(1);
         Ok(if below == 0 {
-            format!("agent {id} stopped")
+            format!("{label} stopped")
         } else {
-            format!("agent {id} stopped, with {below} agent(s) below it")
+            format!("{label} stopped, with {below} agent(s) below it")
         })
     }
 
     /// Queues `text` for one agent, counting it as pending work.
     fn deliver_to(&mut self, id: usize, text: &str, clear_failure: bool, urgent: bool) -> Result<String, String> {
-        let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {id}"))?;
+        let label = self.label(id);
+        let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {label}"))?;
         if agent.finished() {
-            return Err(format!("agent {id} is gone"));
+            return Err(format!("{label} is gone"));
         }
         if agent.stopped {
-            return Err(format!("agent {id} is stopped"));
+            return Err(format!("{label} is stopped"));
         }
         if urgent {
             agent.control.urgent(text.to_string());
         } else {
-            let inbox = agent.inbox.as_ref().ok_or_else(|| format!("agent {id} is stopped"))?;
-            inbox.send(text.to_string()).map_err(|_| format!("agent {id} is gone"))?;
+            let inbox = agent.inbox.as_ref().ok_or_else(|| format!("{label} is stopped"))?;
+            inbox.send(text.to_string()).map_err(|_| format!("{label} is gone"))?;
         }
         let busy = agent.pending > 0;
         if !busy {
@@ -828,11 +897,11 @@ impl Swarm {
             agent.failed = false;
         }
         Ok(if urgent && busy {
-            format!("interrupted agent {id}; it reads your message now")
+            format!("interrupted {label}; it reads your message now")
         } else if agent.pending > 1 {
-            format!("queued for agent {id}; it will read it after its current instruction")
+            format!("queued for {label}; it will read it after its current instruction")
         } else {
-            format!("sent to agent {id}")
+            format!("sent to {label}")
         })
     }
 
@@ -841,13 +910,13 @@ impl Swarm {
         let mut mine: Vec<&Agent> =
             self.agents.iter().filter(|agent| agent.id == caller || self.owns(caller, agent.id)).collect();
         if mine.is_empty() {
-            return format!("no agent {caller}");
+            return format!("no agent {}", self.label(caller));
         }
         mine.sort_by_key(|agent| (agent.depth, agent.id));
         mine.iter().map(|agent| self.line(agent, caller)).collect::<Vec<String>>().join("\n")
     }
 
-    /// One roster line: `agent 3 [depth 1 · working] /dir | task`, the caller and its rights marked.
+    /// One roster line: `brave-otter (3) [depth 1 · working] /dir | task`, the caller and its rights marked.
     #[allow(clippy::unused_self)] // the roster reads as one block; the line reads no field of the tree.
     fn line(&self, agent: &Agent, caller: usize) -> String {
         let state = if agent.stopped {
@@ -869,8 +938,8 @@ impl Swarm {
         let you = if agent.id == caller { " · you" } else { "" };
         let task: String = agent.initial_task.lines().next().unwrap_or("").chars().take(TASK_PREVIEW_WIDTH).collect();
         format!(
-            "agent {} [depth {} · {state}{read_only}{you}] {} | {task}",
-            agent.id,
+            "{} [depth {} · {state}{read_only}{you}] {} | {task}",
+            agent.label(),
             agent.depth,
             agent.working_dir.display()
         )
@@ -953,7 +1022,7 @@ fn spawn_thread(
         run.run(streamed.as_ref(), &instructions);
     });
     if let Some(task) = task {
-        inbox.send(task).map_err(|_| format!("agent {id} could not be started"))?;
+        inbox.send(task).map_err(|_| format!("{} could not be started", names::label(id, None)))?;
     }
     Ok((inbox, handle))
 }
@@ -963,8 +1032,8 @@ fn resume_id(arg: &str) -> Result<usize, String> {
     let mut parts = arg.split_whitespace();
     match (parts.next(), parts.next()) {
         (None, _) => Err("usage: /resume <id>".into()),
-        (Some(id), None) => id.parse::<usize>().map_err(|_| format!("not a worker id: {id}")),
-        (Some(_), Some(_)) => Err(format!("expected one worker id, got: {}", arg.trim())),
+        (Some(id), None) => id.parse::<usize>().map_err(|_| format!("not an agent id: {id}")),
+        (Some(_), Some(_)) => Err(format!("expected one agent id, got: {}", arg.trim())),
     }
 }
 
@@ -1218,6 +1287,12 @@ mod tests {
         tool(swarm, caller, prompt::SPAWN_AGENT, &json!({"path": dir, "task": task}))
     }
 
+    /// The label an agent id always gets: every expectation below is built from it, so no test
+    /// hard-codes a codename.
+    fn codename(id: usize) -> String {
+        names::label(id, None)
+    }
+
     fn list(swarm: &Arc<Mutex<Swarm>>, caller: usize) -> String {
         tool(swarm, caller, prompt::LIST_AGENTS, &json!({}))
     }
@@ -1373,7 +1448,7 @@ mod tests {
     #[test]
     fn the_roots_answer_is_the_users() {
         let h = harness(vec![text("hello")]);
-        assert_eq!(h.swarm.lock().unwrap().tell_root("hi").unwrap(), "sent to agent 1");
+        assert_eq!(h.swarm.lock().unwrap().tell_root("hi").unwrap(), format!("sent to {}", codename(1)));
         let answer = Event::Agent { id: 1, kind: AgentEvent::Finished, text: "hello".into() };
         assert_eq!(next_event(&h.queue), answer);
     }
@@ -1381,7 +1456,7 @@ mod tests {
     #[test]
     fn a_reports_reach_its_owner_and_the_roots_are_the_users() {
         let h = harness(vec![text("child says done"), text("root says acknowledged")]);
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "do it"), "agent 2 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "do it"), format!("{} started", codename(2)));
         let child = next_event(&h.queue);
         assert!(matches!(child, Event::Agent { id: 2, kind: AgentEvent::Finished, .. }), "{child:?}");
         h.swarm.lock().unwrap().deliver(2, AgentEvent::Finished, "child says done");
@@ -1394,40 +1469,40 @@ mod tests {
     #[test]
     fn an_agent_commands_only_its_descendants() {
         let h = harness(vec![text("a"), text("b")]);
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), "agent 2 started");
-        assert_eq!(spawn(&h.swarm, 2, &h.repo, "two"), "agent 3 started");
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "sibling"), "agent 4 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
+        assert_eq!(spawn(&h.swarm, 2, &h.repo, "two"), format!("{} started", codename(3)));
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "sibling"), format!("{} started", codename(4)));
         assert_eq!(
             tool(&h.swarm, 2, prompt::MESSAGE_AGENT, &json!({"id": 1, "text": "x"})),
-            "error: agent 1 is not under your command"
+            format!("error: {} is not under your command", codename(1))
         );
         assert_eq!(
             tool(&h.swarm, 2, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "x"})),
-            "error: agent 2 is you: an agent commands its own children, not itself"
+            format!("error: {} is you: an agent commands its own children, not itself", codename(2))
         );
         assert_eq!(
             tool(&h.swarm, 3, prompt::MESSAGE_AGENT, &json!({"id": 4, "text": "x"})),
-            "error: agent 4 is not under your command"
+            format!("error: {} is not under your command", codename(4))
         );
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 3, "action": "pause"})),
-            "agent 3 paused; it finishes the current instruction, then holds every queued one"
+            format!("{} paused; it finishes the current instruction, then holds every queued one", codename(3))
         );
     }
 
     #[test]
     fn the_depth_limit_counts_delegations_below_the_root() {
         let h = harness(vec![text("a"), text("b"), text("c"), text("d")]);
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "l1"), "agent 2 started");
-        assert_eq!(spawn(&h.swarm, 2, &h.repo, "l2"), "agent 3 started");
-        assert_eq!(spawn(&h.swarm, 3, &h.repo, "l3"), "agent 4 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "l1"), format!("{} started", codename(2)));
+        assert_eq!(spawn(&h.swarm, 2, &h.repo, "l2"), format!("{} started", codename(3)));
+        assert_eq!(spawn(&h.swarm, 3, &h.repo, "l3"), format!("{} started", codename(4)));
         assert_eq!(
             spawn(&h.swarm, 4, &h.repo, "l4"),
-            "error: depth limit: an agent below 4 would be at depth 4, past max_depth 3"
+            format!("error: depth limit: an agent below {} would be at depth 4, past max_depth 3", codename(4))
         );
         let listed = list(&h.swarm, Swarm::ROOT);
-        assert!(listed.contains("agent 4 [depth 3 · "), "{listed}");
-        assert!(listed.contains("agent 1 [depth 0 · "), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 3 · ", codename(4))), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 0 · ", codename(1))), "{listed}");
     }
 
     #[test]
@@ -1439,10 +1514,10 @@ mod tests {
             prompt::SPAWN_AGENT,
             &json!({"path": h.repo, "task": "leaf", "deny_tools": ["spawn_agent"]}),
         );
-        assert_eq!(started, "agent 2 started");
+        assert_eq!(started, format!("{} started", codename(2)));
         assert_eq!(spawn(&h.swarm, 2, &h.repo, "nope"), "error: tool spawn_agent is banned for this agent");
         let listed = list(&h.swarm, Swarm::ROOT);
-        assert!(listed.contains("agent 2 [depth 1 · "), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 1 · ", codename(2))), "{listed}");
     }
 
     #[test]
@@ -1457,7 +1532,7 @@ mod tests {
         // The only way to change rights: stop it, which stops everything below, and spawn a new one.
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"})),
-            "agent 2 stopped"
+            format!("{} stopped", codename(2))
         );
         assert_eq!(
             tool(
@@ -1466,10 +1541,10 @@ mod tests {
                 prompt::SPAWN_AGENT,
                 &json!({"path": h.repo, "task": "two", "read_only": true})
             ),
-            "agent 3 started"
+            format!("{} started", codename(3))
         );
         assert!(
-            list(&h.swarm, Swarm::ROOT).contains("agent 3 [depth 1 · working · read-only"),
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · working · read-only", codename(3))),
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
@@ -1482,11 +1557,11 @@ mod tests {
         spawn(&h.swarm, 2, &h.repo, "two");
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"})),
-            "agent 2 stopped, with 1 agent(s) below it"
+            format!("{} stopped, with 1 agent(s) below it", codename(2))
         );
         let listed = list(&h.swarm, Swarm::ROOT);
-        assert!(listed.contains("agent 2 [depth 1 · stopped"), "{listed}");
-        assert!(listed.contains("agent 3 [depth 2 · stopped"), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 1 · stopped", codename(2))), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 2 · stopped", codename(3))), "{listed}");
     }
 
     /// Every instruction runs `sleep 30`, so whichever agent the scheduler starts first keeps its
@@ -1502,15 +1577,15 @@ mod tests {
     #[test]
     fn the_stop_key_ends_a_running_turn_and_everything_below_it() {
         let h = harness_with(Arc::new(Sleepy));
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), "agent 2 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
         spawn(&h.swarm, 2, &h.repo, "two");
         for _ in 0..2 {
             let Progress::Started { .. } = next_progress(&h.queue) else { panic!("a command never started") };
         }
-        assert_eq!(h.swarm.lock().unwrap().stop(2), Ok("agent 2 stopped, with 1 agent(s) below it".into()));
+        assert_eq!(h.swarm.lock().unwrap().stop(2), Ok(format!("{} stopped, with 1 agent(s) below it", codename(2))));
         let listed = list(&h.swarm, Swarm::ROOT);
-        assert!(listed.contains("agent 2 [depth 1 · stopped"), "{listed}");
-        assert!(listed.contains("agent 3 [depth 2 · stopped"), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 1 · stopped", codename(2))), "{listed}");
+        assert!(listed.contains(&format!("{} [depth 2 · stopped", codename(3))), "{listed}");
         // The turn is only cut once its command dies: the agent reports the interruption after.
         let deadline = Instant::now() + WAIT;
         let mut cut = false;
@@ -1530,15 +1605,15 @@ mod tests {
         let h = harness(vec![]);
         assert_eq!(
             h.swarm.lock().unwrap().stop(Swarm::ROOT),
-            Err("agent 1 is the overseer: it has no owner and cannot be stopped".into())
+            Err(format!("{} is the overseer: it has no owner and cannot be stopped", codename(1)))
         );
-        assert_eq!(h.swarm.lock().unwrap().stop(9), Err("no agent 9".into()));
+        assert_eq!(h.swarm.lock().unwrap().stop(9), Err(format!("no agent {}", codename(9))));
     }
 
     #[test]
     fn a_reply_and_a_final_answer_reach_the_owner() {
         let h = harness(vec![call("c1", prompt::REPLY, &json!({"text": "halfway"})), text("done")]);
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "do it"), "agent 2 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "do it"), format!("{} started", codename(2)));
         assert!(h.swarm.lock().unwrap().busy());
         let reply = Event::Agent { id: 2, kind: AgentEvent::Reply, text: "halfway".into() };
         assert_eq!(next_event(&h.queue), reply);
@@ -1546,7 +1621,11 @@ mod tests {
         assert_eq!(next_event(&h.queue), finished);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
         assert!(!h.swarm.lock().unwrap().busy());
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · idle]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · idle]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
         let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
         assert!(log.contains("> do it") && log.contains("· reply") && log.contains("= Finished: done"), "{log}");
     }
@@ -1558,7 +1637,7 @@ mod tests {
         next_event(&h.queue);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
         let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "more"}));
-        assert_eq!(sent, "sent to agent 2");
+        assert_eq!(sent, format!("sent to {}", codename(2)));
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "second".into() };
         assert_eq!(next_event(&h.queue), finished);
     }
@@ -1570,7 +1649,11 @@ mod tests {
         let failed = Event::Agent { id: 2, kind: AgentEvent::Failed, text: "script exhausted".into() };
         assert_eq!(next_event(&h.queue), failed);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Failed);
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · failed]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · failed]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
     }
 
     #[test]
@@ -1588,22 +1671,29 @@ mod tests {
             assert!(Instant::now() < deadline, "a dead agent kept the swarm busy");
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · failed]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · failed]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
     }
 
     #[test]
     fn spawn_takes_any_directory_and_defaults_to_its_owner() {
         let h = harness(vec![text("a"), text("b")]);
         let elsewhere = tempfile::tempdir().unwrap();
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, elsewhere.path(), "one"), "agent 2 started");
-        assert_eq!(tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"task": "do it"})), "agent 3 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, elsewhere.path(), "one"), format!("{} started", codename(2)));
+        assert_eq!(
+            tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"task": "do it"})),
+            format!("{} started", codename(3))
+        );
         // A spawn with no path lands in its owner's directory: the root's own temp dir, not `/tmp`.
         let owner = h.root.path().file_name().unwrap().to_string_lossy().into_owned();
         let listed = list(&h.swarm, Swarm::ROOT);
         assert!(listed.contains(&format!("{owner} | do it")), "{listed}");
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 7, "text": "x"})),
-            "error: no agent 7"
+            format!("error: no agent {}", codename(7))
         );
         assert!(
             tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"repo": "/tmp", "task": "x"})).starts_with(
@@ -1622,8 +1712,12 @@ mod tests {
         spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
         next_event(&h.queue);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
-        assert_eq!(h.swarm.lock().unwrap().resume("2"), "agent 2 resumed");
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · working]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert_eq!(h.swarm.lock().unwrap().resume("2"), format!("{} resumed", codename(2)));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · working]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "second".into() };
         assert_eq!(next_event(&h.queue), finished);
     }
@@ -1634,24 +1728,32 @@ mod tests {
         spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
         next_event(&h.queue);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Failed);
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · failed]"), "{}", list(&h.swarm, Swarm::ROOT));
-        assert_eq!(h.swarm.lock().unwrap().resume("2"), "agent 2 resumed");
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · failed]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
+        assert_eq!(h.swarm.lock().unwrap().resume("2"), format!("{} resumed", codename(2)));
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "second".into() };
         assert_eq!(next_event(&h.queue), finished);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · idle]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · idle]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
     }
 
     #[test]
     fn resume_rejects_bad_arguments_without_messaging() {
         let h = harness(vec![text("first")]);
-        assert_eq!(h.swarm.lock().unwrap().resume("9"), "error: no agent 9; agent ids: 1");
+        assert_eq!(h.swarm.lock().unwrap().resume("9"), format!("error: no agent {}; agent ids: 1", codename(9)));
         spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
         next_event(&h.queue);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
         assert_eq!(h.swarm.lock().unwrap().resume(""), "error: usage: /resume <id>; agent ids: 1, 2");
-        assert_eq!(h.swarm.lock().unwrap().resume("x"), "error: not a worker id: x; agent ids: 1, 2");
-        assert_eq!(h.swarm.lock().unwrap().resume("1 2"), "error: expected one worker id, got: 1 2; agent ids: 1, 2");
+        assert_eq!(h.swarm.lock().unwrap().resume("x"), "error: not an agent id: x; agent ids: 1, 2");
+        assert_eq!(h.swarm.lock().unwrap().resume("1 2"), "error: expected one agent id, got: 1 2; agent ids: 1, 2");
         assert!(!h.swarm.lock().unwrap().busy());
         while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
         assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err());
@@ -1663,17 +1765,17 @@ mod tests {
         spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
         next_event(&h.queue);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
-        assert_eq!(h.swarm.lock().unwrap().resume(" 2 "), "agent 2 resumed");
+        assert_eq!(h.swarm.lock().unwrap().resume(" 2 "), format!("{} resumed", codename(2)));
         assert_eq!(resume_id("\t1\n"), Ok(1));
     }
 
     #[test]
     fn an_urgent_message_cuts_a_running_command_short() {
         let h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"})), text("urgent done")]);
-        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), "agent 2 started");
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
         let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
         let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "now", "urgent": true}));
-        assert_eq!(sent, "interrupted agent 2; it reads your message now");
+        assert_eq!(sent, format!("interrupted {}; it reads your message now", codename(2)));
         let interrupted =
             Event::Agent { id: 2, kind: AgentEvent::Interrupted, text: "your owner cut this turn short".into() };
         assert_eq!(next_agent_event(&h.queue), interrupted);
@@ -1694,7 +1796,11 @@ mod tests {
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
         let paused = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "pause"}));
         assert!(paused.contains("paused"), "{paused}");
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · paused]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · paused]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
         tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "later"}));
         assert!(
             h.queue.recv_timeout(Duration::from_millis(300)).is_err(),
@@ -1712,15 +1818,19 @@ mod tests {
         spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
         let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
         let stopped = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"}));
-        assert_eq!(stopped, "agent 2 stopped");
-        assert!(list(&h.swarm, Swarm::ROOT).contains("agent 2 [depth 1 · stopped]"), "{}", list(&h.swarm, Swarm::ROOT));
+        assert_eq!(stopped, format!("{} stopped", codename(2)));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains(&format!("{} [depth 1 · stopped]", codename(2))),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "x"})),
-            "error: agent 2 is stopped"
+            format!("error: {} is stopped", codename(2))
         );
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "resume"})),
-            "error: agent 2 is stopped; spawn a new one with the rights you want"
+            format!("error: {} is stopped; spawn a new one with the rights you want", codename(2))
         );
         let interrupted =
             Event::Agent { id: 2, kind: AgentEvent::Interrupted, text: "your owner cut this turn short".into() };
@@ -1741,7 +1851,7 @@ mod tests {
             prompt::SPAWN_AGENT,
             &json!({"path": h.repo, "task": "write", "read_only": true, "deny_tools": ["bash"]}),
         );
-        assert_eq!(started, "agent 2 started");
+        assert_eq!(started, format!("{} started", codename(2)));
         let preview = next_finished(&h.queue);
         assert!(preview.failed, "a read-only agent's write_file went through");
         assert!(preview.head.contains("read-only"), "{preview:?}");
@@ -1752,5 +1862,44 @@ mod tests {
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
+    }
+
+    #[test]
+    fn an_agent_event_line_carries_the_name_after_the_id_and_follows_a_rename() {
+        let h = harness(vec![text("first")]);
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        assert_eq!(
+            h.swarm.lock().unwrap().event_line(2, AgentEvent::Finished, "done"),
+            format!("[agent 2 · {} finished] done", names::name(2, None))
+        );
+        for kind in [AgentEvent::Reply, AgentEvent::Finished, AgentEvent::Failed, AgentEvent::Interrupted] {
+            let line = h.swarm.lock().unwrap().event_line(2, kind, "x");
+            assert!(line.starts_with("[agent 2 · "), "the id stays the first token: {line}");
+        }
+        h.swarm.lock().unwrap().rename(2, "fix-nav");
+        assert_eq!(h.swarm.lock().unwrap().event_line(2, AgentEvent::Reply, "on it"), "[agent 2 · fix-nav says] on it");
+        // An id the swarm no longer has still gets its codename: the line never shows a bare id.
+        assert!(h.swarm.lock().unwrap().event_line(9, AgentEvent::Failed, "gone").contains(&names::name(9, None)));
+    }
+
+    #[test]
+    fn a_rename_replaces_the_label_and_a_blank_name_brings_the_codename_back() {
+        let h = harness(vec![text("first")]);
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        next_event(&h.queue);
+        h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished);
+        let before = codename(2);
+        assert_eq!(h.swarm.lock().unwrap().rename(2, " fix-nav "), format!("{before} is now fix-nav (2)"));
+        assert!(
+            list(&h.swarm, Swarm::ROOT).contains("fix-nav (2) [depth 1 · idle]"),
+            "{}",
+            list(&h.swarm, Swarm::ROOT)
+        );
+        assert_eq!(
+            h.swarm.lock().unwrap().snapshot().get(1).map(|view| view.label.clone()),
+            Some("fix-nav (2)".into())
+        );
+        assert_eq!(h.swarm.lock().unwrap().rename(2, "  "), format!("fix-nav (2) is now {before}"));
+        assert_eq!(h.swarm.lock().unwrap().rename(9, "x"), format!("error: no agent {}", codename(9)));
     }
 }

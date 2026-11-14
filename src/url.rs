@@ -170,14 +170,14 @@ fn unavailable(name: &str) -> String {
 
 fn conflict_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
     let Some(conflicts) = ctx.conflicts.as_mut() else {
-        return Err("conflict ids belong to the worker that read the file".to_string());
+        return Err("conflict ids belong to the agent that read the file".to_string());
     };
     conflicts.read(rest)
 }
 
 fn conflict_write(ctx: &mut Ctx, rest: &str, content: &str) -> Result<String, String> {
     let Some(conflicts) = ctx.conflicts.as_mut() else {
-        return Err("conflict ids belong to the worker that read the file".to_string());
+        return Err("conflict ids belong to the agent that read the file".to_string());
     };
     conflicts.write(rest, content)
 }
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn a_caller_without_a_registry_cannot_use_conflict_ids() {
         let mut ctx = Ctx { conflicts: None, skills: None };
-        assert_eq!(read(&mut ctx, "conflict://1").unwrap_err(), "conflict ids belong to the worker that read the file");
+        assert_eq!(read(&mut ctx, "conflict://1").unwrap_err(), "conflict ids belong to the agent that read the file");
         assert!(write(&mut ctx, "conflict://1", "@ours").is_err());
     }
 }

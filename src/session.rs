@@ -109,6 +109,15 @@ pub(crate) fn run(
                     break;
                 }
             }
+            Event::Rename { id, name } => {
+                let (line, agents) = {
+                    let mut tree = lock(&swarm);
+                    let line = tree.rename(id, &name);
+                    (line, tree.snapshot())
+                };
+                let _ = ui.send(UiEvent::Notice(line));
+                let _ = ui.send(UiEvent::Agents(agents));
+            }
             Event::Progress { id, progress } => {
                 let _ = ui.send(UiEvent::Progress { id, progress });
             }

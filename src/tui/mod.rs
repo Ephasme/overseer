@@ -119,6 +119,13 @@ fn event_loop(
 }
 
 fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key: KeyEvent) -> Result<()> {
+    // The rename prompt takes every key while it is open: no binding of the main screen applies.
+    if app.renaming() {
+        if let Some(event) = app.rename_key(key) {
+            let _ = input.send(event);
+        }
+        return Ok(());
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -156,6 +163,8 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::Char('x') if ctrl => app.detach(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
         KeyCode::Char('n') if ctrl => app.recall_next(),
+        // A bare `r` types a letter in the prompt, so renaming takes a modifier.
+        KeyCode::Char('r') if ctrl => app.start_rename(),
         // Enter accepts the highlighted row; with no popup open it submits, exactly as before.
         KeyCode::Enter if !alt && !shift => {
             if !app.accept_completion() {
@@ -260,6 +269,8 @@ mod tests {
         let mut app = App::new("m");
         let agent = AgentView {
             id: 2,
+            name: crate::names::name(2, None),
+            label: crate::names::label(2, None),
             parent: Some(crate::swarm::Swarm::ROOT),
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
@@ -288,6 +299,8 @@ mod tests {
     fn working(id: usize) -> AgentView {
         AgentView {
             id,
+            name: crate::names::name(id, None),
+            label: crate::names::label(id, None),
             parent: Some(crate::swarm::Swarm::ROOT),
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
