@@ -31,8 +31,12 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
 
 fn describe(progress: &Progress) -> String {
     match progress {
-        Progress::Started { tool, summary } => format!("{tool} {summary}"),
-        Progress::Finished { tool, secs } => format!("{tool} done in {secs:.1}s"),
+        Progress::Started { tool, summary, .. } => format!("{tool} {summary}"),
+        Progress::Finished { secs, preview, .. } => {
+            let status = if preview.status.is_empty() { String::new() } else { format!(" {}", preview.status) };
+            let head = preview.head.lines().next().unwrap_or_default();
+            if preview.failed { format!("failed{status}: {head}") } else { format!("ok{status} in {secs:.1}s") }
+        }
     }
 }
 

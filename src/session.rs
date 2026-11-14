@@ -90,7 +90,8 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::ToolStarted { id, tool: call.function.name.clone(), summary });
                 let output = fleet.execute(call);
                 let secs = started.elapsed().as_secs_f64();
-                let _ = ui.send(UiEvent::ToolFinished { id, output: output.clone(), secs });
+                let preview = tools::preview(&call.function.name, &output);
+                let _ = ui.send(UiEvent::ToolFinished { id, preview, secs });
                 if debug {
                     let _ = ui.send(UiEvent::Debug(output.clone()));
                 }

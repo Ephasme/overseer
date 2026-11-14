@@ -51,9 +51,9 @@ struct ReplyArgs {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Progress {
     /// A tool call started; `summary` is one line of its arguments.
-    Started { tool: String, summary: String },
-    /// The same call returned after `secs`.
-    Finished { tool: String, secs: f64 },
+    Started { call: usize, tool: String, summary: String },
+    /// The same call returned after `secs`, with what its result is worth showing.
+    Finished { call: usize, secs: f64, preview: tools::Preview },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,11 +174,7 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
         _ => String::new(),
     };
-    let mut short: String = line.chars().take(PROGRESS_WIDTH).collect();
-    if line.chars().count() > PROGRESS_WIDTH {
-        short.push('…');
-    }
-    short
+    tools::shorten(&line, PROGRESS_WIDTH)
 }
 
 struct Worker {
@@ -314,7 +310,7 @@ impl Fleet {
         let worker_dir = working_dir.clone();
         let handle = thread::spawn(move || {
             let mut log = log;
-            let mut run = WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log };
+            let mut run = WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log, calls: 0 };
             run.run(streamed.as_ref(), instructions);
         });
         // The thread is already waiting on the channel, so a closed receiver here means it died on
@@ -408,6 +404,8 @@ struct WorkerRun<'a> {
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
     log: &'a mut File,
+    /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
+    calls: usize,
 }
 
 impl WorkerRun<'_> {
@@ -435,10 +433,14 @@ impl WorkerRun<'_> {
     fn execute(&mut self, call: &ToolCall) -> String {
         let _ = writeln!(self.log, "· {} {}", call.function.name, call.function.arguments);
         let started = Instant::now();
-        let tracked = call.function.name != prompt::REPLY;
-        if tracked {
+        let seq = (call.function.name != prompt::REPLY).then(|| {
+            let seq = self.calls;
+            self.calls += 1;
+            seq
+        });
+        if let Some(seq) = seq {
             let summary = describe(&call.function.name, &call.function.arguments);
-            progress(self.sender, self.id, Progress::Started { tool: call.function.name.clone(), summary });
+            progress(self.sender, self.id, Progress::Started { call: seq, tool: call.function.name.clone(), summary });
         }
         let output = if call.function.name == prompt::REPLY {
             match tools::parse_args::<ReplyArgs>(&call.function.arguments).map(|args| args.text) {
@@ -452,9 +454,10 @@ impl WorkerRun<'_> {
             tools::execute(self.working_dir, &call.function.name, &call.function.arguments)
         };
         let _ = writeln!(self.log, "{output}");
-        if tracked {
+        if let Some(seq) = seq {
+            let preview = tools::preview(&call.function.name, &output);
             let secs = started.elapsed().as_secs_f64();
-            progress(self.sender, self.id, Progress::Finished { tool: call.function.name.clone(), secs });
+            progress(self.sender, self.id, Progress::Finished { call: seq, secs, preview });
         }
         output
     }
@@ -483,6 +486,15 @@ mod tests {
             match queue.recv_timeout(WAIT).unwrap() {
                 Event::Delta { .. } => {}
                 event => return event,
+            }
+        }
+    }
+
+    /// The next worker tool event, skipping everything else the worker sends.
+    fn next_progress(queue: &Receiver<Event>) -> Progress {
+        loop {
+            if let Event::Progress { progress, .. } = queue.recv_timeout(WAIT).unwrap() {
+                return progress;
             }
         }
     }
@@ -520,6 +532,24 @@ mod tests {
         assert_eq!(Event::from_line("exit"), Some(Event::Exit));
         assert_eq!(Event::from_line("/resume 3"), Some(Event::Resume(" 3".into())));
         assert_eq!(Event::from_line("hello"), Some(Event::User("hello".into())));
+    }
+
+    #[test]
+    fn a_worker_tool_call_reports_what_it_ran_and_what_it_returned() {
+        let mut h = harness(vec![call("t1", tools::BASH, &json!({"command": "printf 'a\\nb\\n'"})), text("done")]);
+        assert_eq!(spawn(&mut h.fleet, &h.repo), "worker 1 started");
+        assert_eq!(
+            next_progress(&h.queue),
+            Progress::Started { call: 0, tool: tools::BASH.into(), summary: "printf 'a\\nb\\n'".into() }
+        );
+        let Progress::Finished { call, secs, preview, .. } = next_progress(&h.queue) else {
+            panic!("the call never reported a result");
+        };
+        assert_eq!(call, 0, "the result belongs to the call that started");
+        assert!(secs >= 0.0);
+        assert!(!preview.failed);
+        assert_eq!(preview.head, "a\nb");
+        assert_eq!(preview.status, "");
     }
 
     #[test]
