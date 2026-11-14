@@ -1,5 +1,6 @@
 use crate::config;
 use crate::conflict;
+use crate::url;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -257,7 +258,12 @@ pub(crate) fn shorten(text: &str, width: usize) -> String {
 }
 
 /// Schemas of the file and shell tools every worker gets.
+///
+/// The URI paragraph comes from the scheme table, so a scheme that gains handlers appears here
+/// without a second edit, and a reserved name never reaches a model.
 pub(crate) fn definitions() -> Value {
+    let uris = url::summary()
+        .map_or_else(String::new, |summary| format!("\nInternal URIs are accepted as `path`:\n{summary}"));
     json!([
         {"type": "function", "function": {
             "name": BASH,
@@ -266,12 +272,12 @@ pub(crate) fn definitions() -> Value {
         }},
         {"type": "function", "function": {
             "name": READ_FILE,
-            "description": "Read a UTF-8 text file. Relative paths resolve against the working directory. A file holding merge-conflict markers gets every block an id, listed after the text: resolve one by writing to `conflict://<id>`, and read `conflict://<id>` (or `/ours`, `/theirs`, `/base`) to inspect it. `<path>:conflicts` registers and lists every block of a file.",
+            "description": format!("Read a UTF-8 text file. Relative paths resolve against the working directory. A file holding merge-conflict markers gets every block an id, listed after the text. `<path>:conflicts` registers and lists every block of a file.{uris}"),
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
         }},
         {"type": "function", "function": {
             "name": WRITE_FILE,
-            "description": "Create or overwrite a file with the given content. Creates missing parent directories. Relative paths resolve against the working directory. A path of `conflict://<id>` instead replaces only that conflict block's marker lines, keeping the code around it: `content` is the replacement, or `@ours` / `@theirs` / `@both`. `conflict://*` resolves many at once from `content` lines of `<id>: @ours`.",
+            "description": format!("Create or overwrite a file with the given content. Creates missing parent directories. Relative paths resolve against the working directory.{uris}"),
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
         }}
     ])
@@ -468,8 +474,8 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
 ///
 /// Every conflict block the read shows is registered, so a later write can address it by id.
 fn read_file(working_dir: &Path, args: &ReadArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
-    if let Some(rest) = args.path.strip_prefix(conflict::SCHEME) {
-        return conflicts.read(rest);
+    if url::is_url(&args.path) {
+        return url::read(&mut url::Ctx { conflicts: Some(conflicts) }, &args.path);
     }
     if let Some(display) = args.path.strip_suffix(conflict::LIST_SUFFIX) {
         return list_conflicts(working_dir, display, conflicts);
@@ -531,8 +537,8 @@ fn list_conflicts(working_dir: &Path, display: &str, conflicts: &mut conflict::R
 }
 
 fn write_file(working_dir: &Path, args: &WriteArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
-    if let Some(rest) = args.path.strip_prefix(conflict::SCHEME) {
-        return conflicts.write(rest, &args.content);
+    if url::is_url(&args.path) {
+        return url::write(&mut url::Ctx { conflicts: Some(conflicts) }, &args.path, &args.content);
     }
     let full = working_dir.join(&args.path);
     if let Some(parent) = full.parent() {
@@ -663,6 +669,25 @@ mod tests {
         assert!(out.starts_with("resolved conflict #1 at lines 1–5 in src.rs"), "{out}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "let x = 2;\n");
         assert!(!out.contains("error"), "{out}");
+    }
+
+    #[test]
+    fn tool_descriptions_advertise_only_the_uris_that_resolve() {
+        let described = |name: &str| -> String {
+            definitions().as_array().unwrap().iter().find(|tool| tool["function"]["name"] == name).unwrap()["function"]
+                ["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for name in [READ_FILE, WRITE_FILE] {
+            let text = described(name);
+            assert!(text.contains("Internal URIs are accepted as `path`"), "{text}");
+            assert!(text.contains("`conflict://`"), "{text}");
+            for reserved in ["mcp://", "ssh://", "pr://"] {
+                assert!(!text.contains(reserved), "{name} advertises {reserved}: {text}");
+            }
+        }
     }
 
     #[test]

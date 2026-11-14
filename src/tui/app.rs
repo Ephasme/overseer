@@ -561,7 +561,7 @@ fn composer() -> TextArea<'static> {
             .border_style(Style::new().fg(theme::EDGE))
             .padding(Padding::new(1, 1, 1, 0)),
     );
-    area.set_placeholder_text("Ask the overseer, /resume <id>, or exit");
+    area.set_placeholder_text("Ask the overseer, /resume <id>, /schemes, or exit");
     area.set_wrap_mode(WrapMode::WordOrGlyph);
     area.set_max_rows(COMPOSER_ROWS);
     area
