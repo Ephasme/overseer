@@ -1,6 +1,8 @@
+use crate::agent::{INTERRUPTED, cancelled};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// Longest response body echoed into an error: a proxy's error page must not land in the transcript.
@@ -77,11 +79,18 @@ pub(crate) enum Piece<'a> {
 
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message>;
+    /// `cancel` is the owner's interrupt flag, read between streamed lines.
+    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message>;
 
     /// The same call, reporting pieces as they arrive. A backend without streaming reports them once.
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
-        let message = self.chat(messages, tools)?;
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
+        let message = self.chat(messages, tools, cancel)?;
         report(&message, on_piece);
         Ok(message)
     }
@@ -114,12 +123,18 @@ impl OpenAiClient {
 }
 
 impl Llm for OpenAiClient {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
+    fn chat(&self, messages: &[Message], tools: &Value, _cancel: Option<&AtomicBool>) -> Result<Message> {
         let body = self.post(messages, tools, false)?;
         parse_response(&body)
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
         let response = self.send(messages, tools, true)?;
         let streamed = response
             .headers()
@@ -133,7 +148,7 @@ impl Llm for OpenAiClient {
             report(&message, on_piece);
             return Ok(message);
         }
-        read_stream(std::io::BufReader::new(response), on_piece)
+        read_stream(std::io::BufReader::new(response), cancel, on_piece)
     }
 }
 
@@ -231,11 +246,18 @@ struct FragmentFunction {
 }
 
 /// Rebuilds the assistant message from `data:` lines, reporting each piece as it arrives.
-fn read_stream(reader: impl std::io::BufRead, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
+fn read_stream(
+    reader: impl std::io::BufRead,
+    cancel: Option<&AtomicBool>,
+    on_piece: &mut dyn FnMut(Piece<'_>),
+) -> Result<Message> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut complete = false;
     for line in reader.lines() {
+        if cancelled(cancel) {
+            bail!(INTERRUPTED);
+        }
         let line = line.context("reading model stream failed")?;
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
@@ -345,14 +367,20 @@ impl StreamLlm {
 }
 
 impl Llm for StreamLlm {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
-        self.chat_stream(messages, tools, &mut |_| ())
+    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+        self.chat_stream(messages, tools, cancel, &mut |_| ())
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
-        self.inner.chat_stream(messages, tools, &mut |piece| {
+        self.inner.chat_stream(messages, tools, cancel, &mut |piece| {
             (self.sink)(match piece {
                 Piece::Text(text) => StreamStep::Text(text),
                 Piece::Reasoning(text) => StreamStep::Reasoning(text),
@@ -398,7 +426,7 @@ pub(crate) mod testing {
     }
 
     impl Llm for Scripted {
-        fn chat(&self, _: &[Message], _: &Value) -> Result<Message> {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
             let mut replies = self.0.lock().unwrap();
             if replies.is_empty() {
                 bail!("script exhausted");
@@ -424,7 +452,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = String::new();
-        let message = read_stream(std::io::Cursor::new(sse), &mut |piece| {
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             if let Piece::Text(text) = piece {
                 seen.push_str(text);
             }
@@ -447,7 +475,7 @@ mod tests {
             "\"function\":{\"name\":\"file\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let message = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap();
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
         assert_eq!(message.tool_calls.unwrap()[0].function.name, "read_file");
     }
 
@@ -458,7 +486,7 @@ mod tests {
             "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("no function name"), "{err}");
     }
 
@@ -479,7 +507,7 @@ mod tests {
             }),
         );
         let mut reported = String::new();
-        llm.chat_stream(&[], &json!([]), &mut |piece| {
+        llm.chat_stream(&[], &json!([]), None, &mut |piece| {
             if let Piece::Text(text) = piece {
                 reported.push_str(text);
             }
@@ -502,7 +530,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = Vec::new();
-        let message = read_stream(std::io::Cursor::new(sse), &mut |piece| {
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             seen.push(match piece {
                 Piece::Text(text) => format!("text {text}"),
                 Piece::Reasoning(text) => format!("think {text}"),
@@ -517,20 +545,40 @@ mod tests {
     #[test]
     fn stream_without_text_or_tools_is_an_error() {
         let sse = "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
-        assert!(read_stream(std::io::Cursor::new(sse), &mut |_| ()).is_err());
+        assert!(read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).is_err());
     }
     #[test]
     fn stream_reports_a_provider_error_chunk() {
         let sse = "data: {\"error\":{\"message\":\"overloaded\"}}\n\n";
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("overloaded"), "{err}");
     }
 
     #[test]
     fn stream_truncated_before_finish_is_an_error() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n";
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("before it finished"), "{err}");
+    }
+
+    #[test]
+    fn a_cancelled_stream_stops_at_the_next_line() {
+        let cancel = AtomicBool::new(false);
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut seen = String::new();
+        let err = read_stream(std::io::Cursor::new(sse), Some(&cancel), &mut |piece| {
+            if let Piece::Text(text) = piece {
+                seen.push_str(text);
+            }
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), INTERRUPTED);
+        assert_eq!(seen, "one", "the rest of the answer is never read");
     }
 
     #[test]
@@ -550,7 +598,7 @@ mod tests {
                 }
             }),
         );
-        llm.chat(&[], &json!([])).unwrap();
+        llm.chat(&[], &json!([]), None).unwrap();
         assert_eq!(*seen.lock().unwrap(), "|hi");
     }
 

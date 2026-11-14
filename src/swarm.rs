@@ -246,6 +246,10 @@ pub(crate) enum Event {
     Eof,
     /// User typed `/resume <id>`: the argument, handled without a model call.
     Resume(String),
+    /// The frontend's stop key: one agent and everything below it, without a model call.
+    Stop {
+        id: usize,
+    },
     /// User typed `/schemes`: which internal URIs resolve, without a model call.
     Schemes,
     /// User typed `/mcp`: the server list, handled without a model call.
@@ -744,27 +748,7 @@ impl Swarm {
         }
         let id = args.id;
         match args.action {
-            Action::Stop => {
-                let mut stopped = self.descendants(id);
-                stopped.push(id);
-                for target in &stopped {
-                    if let Some(agent) = self.agent_mut(*target) {
-                        agent.control.stop();
-                        agent.inbox = None;
-                        agent.stopped = true;
-                        // Nothing will run the instructions still queued, so nothing will ever
-                        // finish them: the counter and the busy mark would stay set for good.
-                        agent.pending = 0;
-                        agent.busy_since = None;
-                    }
-                }
-                let below = stopped.len().saturating_sub(1);
-                Ok(if below == 0 {
-                    format!("agent {id} stopped")
-                } else {
-                    format!("agent {id} stopped, with {below} agent(s) below it")
-                })
-            }
+            Action::Stop => self.stop(id),
             Action::Pause => {
                 let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {id}"))?;
                 if agent.finished() {
@@ -785,6 +769,39 @@ impl Swarm {
                 Ok(format!("agent {id} resumed"))
             }
         }
+    }
+
+    /// Stops one agent and everything below it: the running turn is cut short, the threads take no
+    /// more work, and every queued instruction is dropped.
+    ///
+    /// The root is refused whoever asks: no agent owns it, and the keyboard must not end the one
+    /// voice the user talks to, since nothing in the program can restart it.
+    pub(crate) fn stop(&mut self, id: usize) -> Result<String, String> {
+        if id == Swarm::ROOT {
+            return Err("agent 1 is the overseer: it has no owner and cannot be stopped".into());
+        }
+        if self.agent(id).is_none() {
+            return Err(format!("no agent {id}"));
+        }
+        let mut stopped = self.descendants(id);
+        stopped.push(id);
+        for target in &stopped {
+            if let Some(agent) = self.agent_mut(*target) {
+                agent.control.stop();
+                agent.inbox = None;
+                agent.stopped = true;
+                // Nothing will run the instructions still queued, so nothing will ever finish
+                // them: the counter and the busy mark would stay set for good.
+                agent.pending = 0;
+                agent.busy_since = None;
+            }
+        }
+        let below = stopped.len().saturating_sub(1);
+        Ok(if below == 0 {
+            format!("agent {id} stopped")
+        } else {
+            format!("agent {id} stopped, with {below} agent(s) below it")
+        })
     }
 
     /// Queues `text` for one agent, counting it as pending work.
@@ -1472,6 +1489,52 @@ mod tests {
         assert!(listed.contains("agent 3 [depth 2 · stopped"), "{listed}");
     }
 
+    /// Every instruction runs `sleep 30`, so whichever agent the scheduler starts first keeps its
+    /// command in flight and the stop has something real to cut.
+    struct Sleepy;
+
+    impl Llm for Sleepy {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+            Ok(call("c1", tools::BASH, &json!({"command": "sleep 30"})))
+        }
+    }
+
+    #[test]
+    fn the_stop_key_ends_a_running_turn_and_everything_below_it() {
+        let h = harness_with(Arc::new(Sleepy));
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), "agent 2 started");
+        spawn(&h.swarm, 2, &h.repo, "two");
+        for _ in 0..2 {
+            let Progress::Started { .. } = next_progress(&h.queue) else { panic!("a command never started") };
+        }
+        assert_eq!(h.swarm.lock().unwrap().stop(2), Ok("agent 2 stopped, with 1 agent(s) below it".into()));
+        let listed = list(&h.swarm, Swarm::ROOT);
+        assert!(listed.contains("agent 2 [depth 1 · stopped"), "{listed}");
+        assert!(listed.contains("agent 3 [depth 2 · stopped"), "{listed}");
+        // The turn is only cut once its command dies: the agent reports the interruption after.
+        let deadline = Instant::now() + WAIT;
+        let mut cut = false;
+        while !cut {
+            assert!(Instant::now() < deadline, "the stopped agent never reported its cut turn");
+            match h.queue.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Agent { id: 2, kind: AgentEvent::Interrupted, .. }) => cut = true,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(cut, "the stopped agent never reported its cut turn");
+    }
+
+    #[test]
+    fn the_root_and_an_unknown_id_cannot_be_stopped() {
+        let h = harness(vec![]);
+        assert_eq!(
+            h.swarm.lock().unwrap().stop(Swarm::ROOT),
+            Err("agent 1 is the overseer: it has no owner and cannot be stopped".into())
+        );
+        assert_eq!(h.swarm.lock().unwrap().stop(9), Err("no agent 9".into()));
+    }
+
     #[test]
     fn a_reply_and_a_final_answer_reach_the_owner() {
         let h = harness(vec![call("c1", prompt::REPLY, &json!({"text": "halfway"})), text("done")]);
@@ -1514,7 +1577,7 @@ mod tests {
     fn a_panicking_agent_does_not_keep_the_swarm_busy() {
         struct Panic;
         impl Llm for Panic {
-            fn chat(&self, _: &[Message], _: &Value) -> anyhow::Result<Message> {
+            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
                 panic!("boom")
             }
         }
