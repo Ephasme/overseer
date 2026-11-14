@@ -99,9 +99,17 @@ pub(crate) fn run(
             Event::Delta { id, text } => {
                 let _ = ui.send(UiEvent::AgentDelta { id, text });
             }
+            Event::Thought { id, text } => {
+                let _ = ui.send(UiEvent::AgentThought { id, text });
+            }
             Event::TurnStart { id } => {
-                if id == Swarm::ROOT {
-                    let _ = ui.send(UiEvent::TurnBoundary);
+                let _ = ui.send(UiEvent::Boundary { id });
+            }
+            Event::Instruction { id, text } => {
+                // The lead shows the user's own prompts as they are typed; a worker's instruction
+                // arrives here, from the thread that is about to work on it.
+                if id != Swarm::ROOT {
+                    let _ = ui.send(UiEvent::Instruction { id, text });
                 }
             }
             Event::Agent { id, kind, text } => {

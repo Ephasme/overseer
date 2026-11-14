@@ -24,7 +24,13 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
                 }
             }
             UiEvent::Progress { id, progress } => err(&format!("[agent {id}] {}", describe(&progress))),
-            UiEvent::AgentDelta { .. } | UiEvent::TurnBoundary | UiEvent::Agents(_) | UiEvent::Busy(_) => {}
+            // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
+            UiEvent::AgentDelta { .. }
+            | UiEvent::AgentThought { .. }
+            | UiEvent::Boundary { .. }
+            | UiEvent::Instruction { .. }
+            | UiEvent::Agents(_)
+            | UiEvent::Busy(_) => {}
             UiEvent::Done => break,
         }
     }
