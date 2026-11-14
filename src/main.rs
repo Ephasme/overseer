@@ -47,10 +47,12 @@ fn main() -> Result<()> {
     let session_input = input_tx.clone();
     let stop = input_tx.clone();
     let model = cfg.model.clone();
+    // Read before the core takes the config: the palette is fixed before the first frame.
+    let theme = cfg.theme;
     let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx));
 
     let frontend = if tui_available() {
-        tui::run(ui_rx, input_tx, &model)
+        tui::run(ui_rx, input_tx, &model, theme)
     } else {
         plain::run(ui_rx, input_tx);
         Ok(())

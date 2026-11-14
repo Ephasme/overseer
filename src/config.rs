@@ -13,6 +13,8 @@ struct RawConfig {
     roots: Vec<String>,
     base_url: String,
     model: String,
+    /// Omitted means `auto`.
+    theme: Option<String>,
 }
 
 #[derive(Debug)]
@@ -21,8 +23,32 @@ pub(crate) struct Config {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) base_url: String,
     pub(crate) model: String,
+    pub(crate) theme: Theme,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+}
+
+/// Which palette the TUI draws with; `auto` is the one that reads `NO_COLOR`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum Theme {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+    /// No colour at all: every slot is the terminal's default and selection is reverse video.
+    Mono,
+}
+
+impl Theme {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            "mono" => Ok(Self::Mono),
+            other => bail!("theme {other:?} is not auto, dark, light or mono"),
+        }
+    }
 }
 
 /// The user's home directory; an unset or empty `HOME` is an error, not a relative path.
@@ -74,7 +100,8 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         }
         roots.push(canonical);
     }
-    Ok(Config { roots, base_url: raw.base_url, model: raw.model, home: home.to_path_buf() })
+    let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
+    Ok(Config { roots, base_url: raw.base_url, model: raw.model, theme, home: home.to_path_buf() })
 }
 
 fn expand_home(path: &str, home: &Path) -> PathBuf {
@@ -147,5 +174,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir(home.path().join("code")).unwrap();
         assert_eq!(resolve_dir("~/code", home.path()).unwrap(), fs::canonicalize(home.path().join("code")).unwrap());
+    }
+
+    #[test]
+    fn theme_defaults_to_auto_and_rejects_what_it_does_not_know() {
+        let home = tempfile::tempdir().unwrap();
+        let rest = "roots = [\"/\"]\nbase_url = \"u\"\nmodel = \"m\"";
+        assert_eq!(parse(rest, home.path()).unwrap().theme, Theme::Auto);
+        assert_eq!(parse(&format!("{rest}\ntheme = \"light\""), home.path()).unwrap().theme, Theme::Light);
+        let wrong = parse(&format!("{rest}\ntheme = \"solarized\""), home.path()).unwrap_err().to_string();
+        assert!(wrong.contains("solarized"), "{wrong}");
     }
 }

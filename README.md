@@ -20,9 +20,10 @@ Prebuilt for macOS (Apple silicon and Intel) and Linux (x86_64). From source: `c
 roots = ["~/code"]                    # repositories under these are listed for the overseer; not a sandbox
 base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions endpoint
 model = "gpt-4.1"
+theme = "auto"                        # auto | dark | light | mono; omitted means auto
 ```
 
-All three keys are required. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
+The first three keys are required; `theme` is optional. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
 
 ```sh
 OVERSEER_API_KEY=...
@@ -46,6 +47,7 @@ On a terminal it opens a full-screen UI: the transcript, a worker panel on the r
 |F2|hide or show the worker panel|
 |F3|hide or show what tool calls returned, leaving one row per call|
 |F4|open the picked worker's view, or close it|
+|F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
 |click a worker row|open that worker's view; click its `esc back to fleet` line to come back|
 |↑ / ↓|inside a worker view: the previous or next worker|
 |PageUp / Home|inside a worker view: scroll its own stream|
