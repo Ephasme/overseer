@@ -1,4 +1,4 @@
-use crate::agent::Turn;
+use crate::agent::{INTERRUPTED, Turn};
 use crate::config;
 use crate::conflict;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, PoisonError,
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -23,6 +23,14 @@ use std::time::{Duration, Instant};
 /// Locks the tree, ignoring a poisoned lock: one panicked agent must not wedge the others.
 pub(crate) fn lock(swarm: &Arc<Mutex<Swarm>>) -> MutexGuard<'_, Swarm> {
     swarm.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Serialises agent spawns. A spawn starts its thread with the tree lock released, and this keeps
+/// the id it validated free until the agent is in the tree.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+fn spawning() -> MutexGuard<'static, ()> {
+    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Longest one-line summary of a tool call.
@@ -147,10 +155,6 @@ impl Control {
         self.wake.notify_all();
     }
 
-    fn clear_interrupt(&self) {
-        self.interrupted.store(false, Ordering::SeqCst);
-    }
-
     fn flag(&self) -> &AtomicBool {
         &self.interrupted
     }
@@ -167,6 +171,10 @@ impl Control {
     ///
     /// Urgent messages come first, then the inbox. A pause holds the inbox but never an urgent
     /// message: an order that interrupts a turn also outranks the pause.
+    ///
+    /// The interrupt flag is cleared here, under the gate that sets it, at the dequeue: the order it
+    /// announced is the one about to run. Clearing it a statement later would wipe an order that
+    /// arrived in between, and the turn would run on after the overseer was told it was cut short.
     fn next(&self, inbox: &Receiver<String>) -> Option<String> {
         // Read from an inbox that was not paused yet: hold it rather than run it behind the pause.
         let mut held: Option<String> = None;
@@ -177,6 +185,7 @@ impl Control {
                     return None;
                 }
                 if let Some(text) = gate.urgent.pop_front() {
+                    self.interrupted.store(false, Ordering::SeqCst);
                     return Some(text);
                 }
                 if gate.paused {
@@ -184,6 +193,7 @@ impl Control {
                     continue;
                 }
                 if let Some(text) = held.take() {
+                    self.interrupted.store(false, Ordering::SeqCst);
                     return Some(text);
                 }
             }
@@ -354,7 +364,7 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
     let line = match name {
         prompt::SPAWN_AGENT => {
             let path = field(args.path.as_ref());
-            let dir = if path.is_empty() { config::DEFAULT_WORKING_DIR } else { path };
+            let dir = if path.is_empty() { "owner's dir" } else { path };
             format!("{dir} · {}", field(args.task.as_ref()))
         }
         prompt::MESSAGE_AGENT => {
@@ -403,8 +413,8 @@ impl Agent {
 
 /// The whole tree, shared by every agent thread: whoever holds the lock may spawn, message or stop.
 ///
-/// It does not store its own `Arc`: a spawned thread needs one to reach the same tree, so callers
-/// pass it (`Swarm::tool`, `Swarm::start_root`) instead of the tree holding a cycle to itself.
+/// A worker thread reaches it through a `Weak` (`spawn_thread`): the tree owns every worker's inbox,
+/// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
     llm: Arc<dyn Llm>,
     roots: Vec<PathBuf>,
@@ -548,16 +558,27 @@ impl Swarm {
 
     /// Starts the agent the user talks to: id 1, depth 0, no parent and no first instruction. Its
     /// rights are empty: nobody owns it, so nothing could restrict it.
+    ///
+    /// The log and the thread start with the tree lock released, as in `spawn`.
     pub(crate) fn start_root(swarm: &Arc<Mutex<Swarm>>, dir: PathBuf) -> Result<usize, String> {
-        let mut tree = swarm.lock().unwrap_or_else(PoisonError::into_inner);
-        if !tree.agents.is_empty() {
-            return Err("the root is already running".to_string());
-        }
-        let id = Swarm::ROOT;
-        let log_path = tree.log_dir.join(format!("agent-{id}.log"));
-        let control = Arc::new(Control::default());
-        let (inbox, handle) = tree.spawn_thread(id, 0, None, &dir, Arc::clone(&control), None, &log_path, swarm)?;
-        tree.agents.push(Agent {
+        let _reserved = spawning();
+        let (id, log_path, control, llm, sender) = {
+            let tree = lock(swarm);
+            if !tree.agents.is_empty() {
+                return Err("the root is already running".to_string());
+            }
+            let id = Swarm::ROOT;
+            (
+                id,
+                tree.log_dir.join(format!("agent-{id}.log")),
+                Arc::new(Control::default()),
+                Arc::clone(&tree.llm),
+                tree.sender.clone(),
+            )
+        };
+        let (inbox, handle) =
+            spawn_thread(llm, sender, id, 0, None, &dir, Arc::clone(&control), None, &log_path, swarm)?;
+        lock(swarm).agents.push(Agent {
             id,
             parent: None,
             depth: 0,
@@ -622,10 +643,10 @@ impl Swarm {
             }
         }
         match name {
-            prompt::SPAWN_AGENT => Some(tools::parse_args::<SpawnArgs>(arguments).and_then(|args| {
-                let mut tree = lock(swarm);
-                tree.spawn(caller, args, swarm).map(|id| format!("agent {id} started"))
-            })),
+            prompt::SPAWN_AGENT => Some(
+                tools::parse_args::<SpawnArgs>(arguments)
+                    .and_then(|args| Swarm::spawn(swarm, caller, args).map(|id| format!("agent {id} started"))),
+            ),
             prompt::MESSAGE_AGENT => {
                 Some(tools::parse_args::<MessageArgs>(arguments).and_then(|args| lock(swarm).message(caller, &args)))
             }
@@ -633,33 +654,47 @@ impl Swarm {
                 Some(tools::parse_args::<ControlArgs>(arguments).and_then(|args| lock(swarm).control(caller, &args)))
             }
             prompt::LIST_AGENTS => Some(tools::parse_args::<NoArgs>(arguments).map(|_| lock(swarm).list(caller))),
-            prompt::LIST_REPOS => Some(tools::parse_args::<NoArgs>(arguments).map(|_| lock(swarm).list_repos())),
+            prompt::LIST_REPOS => Some(tools::parse_args::<NoArgs>(arguments).map(|_| Swarm::list_repos(swarm))),
             _ => None,
         }
     }
 
-    /// Starts one agent below `caller`. The new thread reaches the same tree through `me`.
+    /// Starts one agent below `caller`. The new thread reaches the same tree through `swarm`.
     ///
-    /// The policy is merged here, before the thread exists: nothing can change it afterwards.
-    fn spawn(&mut self, caller: usize, args: SpawnArgs, me: &Arc<Mutex<Swarm>>) -> Result<usize, String> {
-        let (depth, owner) = {
-            let parent = self.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
-            (parent.depth.saturating_add(1), parent.control.policy())
+    /// The policy is merged under the tree lock, before the thread exists: nothing can change it
+    /// afterwards. The log file is opened and the thread started with that lock released, because
+    /// both block and every other agent's dispatch, the session's events and `snapshot()` wait on it.
+    fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
+        let _reserved = spawning();
+        let (depth, dir, home, id, log_path, control, llm, sender) = {
+            let tree = lock(swarm);
+            let parent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
+            let depth = parent.depth.saturating_add(1);
+            if depth > tree.max_depth {
+                return Err(format!(
+                    "depth limit: an agent below {caller} would be at depth {depth}, past max_depth {}",
+                    tree.max_depth
+                ));
+            }
+            let control = Arc::new(Control::default());
+            control.set_policy(parent.control.policy().inherit(&args.policy()));
+            let dir = args.path.clone().unwrap_or_else(|| parent.working_dir.display().to_string());
+            let id = tree.agents.len() + 1;
+            (
+                depth,
+                dir,
+                tree.home.clone(),
+                id,
+                tree.log_dir.join(format!("agent-{id}.log")),
+                control,
+                Arc::clone(&tree.llm),
+                tree.sender.clone(),
+            )
         };
-        if depth > self.max_depth {
-            return Err(format!(
-                "depth limit: an agent below {caller} would be at depth {depth}, past max_depth {}",
-                self.max_depth
-            ));
-        }
-        let policy = owner.inherit(&args.policy());
-        let dir = args.path.as_deref().unwrap_or(config::DEFAULT_WORKING_DIR);
-        let working_dir = config::resolve_dir(dir, &self.home)?;
-        let id = self.agents.len() + 1;
-        let log_path = self.log_dir.join(format!("agent-{id}.log"));
-        let control = Arc::new(Control::default());
-        control.set_policy(policy);
-        let (inbox, handle) = self.spawn_thread(
+        let working_dir = config::resolve_dir(&dir, &home)?;
+        let (inbox, handle) = spawn_thread(
+            llm,
+            sender,
             id,
             depth,
             Some(caller),
@@ -667,9 +702,9 @@ impl Swarm {
             Arc::clone(&control),
             Some(args.task.clone()),
             &log_path,
-            me,
+            swarm,
         )?;
-        self.agents.push(Agent {
+        lock(swarm).agents.push(Agent {
             id,
             parent: Some(caller),
             depth,
@@ -684,63 +719,6 @@ impl Swarm {
             handle,
         });
         Ok(id)
-    }
-
-    /// Starts one agent thread: its inbox, and the handle proving it lives. `task` is the first
-    /// instruction; the root starts with none and waits for the user.
-    #[allow(clippy::too_many_arguments)] // one call site each for the root and for a spawned agent.
-    fn spawn_thread(
-        &self,
-        id: usize,
-        depth: usize,
-        parent: Option<usize>,
-        working_dir: &Path,
-        control: Arc<Control>,
-        task: Option<String>,
-        log_path: &Path,
-        me: &Arc<Mutex<Swarm>>,
-    ) -> Result<(Sender<String>, JoinHandle<()>), String> {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| config::io_error(log_path.display(), &e))?;
-        let (inbox, instructions) = mpsc::channel();
-        let sender = self.sender.clone();
-        let tree = Arc::clone(me);
-        let stream_sender = sender.clone();
-        let streamed = Arc::new(StreamLlm::new(
-            Arc::clone(&self.llm),
-            Arc::new(move |step| match step {
-                StreamStep::Start => {
-                    let _ = stream_sender.send(Event::TurnStart { id });
-                }
-                StreamStep::Text(delta) => {
-                    let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
-                }
-            }),
-        ));
-        let agent_dir = working_dir.to_path_buf();
-        let handle = thread::spawn(move || {
-            let mut log = log;
-            let mut run = AgentRun {
-                swarm: &tree,
-                id,
-                depth,
-                parent,
-                working_dir: &agent_dir,
-                sender: &sender,
-                log: &mut log,
-                calls: 0,
-                control: &control,
-                conflicts: conflict::Registry::default(),
-            };
-            run.run(streamed.as_ref(), &instructions);
-        });
-        if let Some(task) = task {
-            inbox.send(task).map_err(|_| format!("agent {id} could not be started"))?;
-        }
-        Ok((inbox, handle))
     }
 
     fn message(&mut self, caller: usize, args: &MessageArgs) -> Result<String, String> {
@@ -764,6 +742,10 @@ impl Swarm {
                         agent.control.stop();
                         agent.inbox = None;
                         agent.stopped = true;
+                        // Nothing will run the instructions still queued, so nothing will ever
+                        // finish them: the counter and the busy mark would stay set for good.
+                        agent.pending = 0;
+                        agent.busy_since = None;
                     }
                 }
                 let below = stopped.len().saturating_sub(1);
@@ -844,7 +826,9 @@ impl Swarm {
         let state = if agent.stopped {
             "stopped"
         } else if agent.finished() {
-            "failed"
+            // The thread is gone: a recorded failure, or work it will never finish, is a failure; a
+            // worker with nothing outstanding ended cleanly.
+            if agent.failed || agent.pending > 0 { "failed" } else { "done" }
         } else if agent.control.paused() {
             "paused"
         } else if agent.pending > 0 {
@@ -865,10 +849,13 @@ impl Swarm {
         )
     }
 
-    fn list_repos(&self) -> String {
-        let found = repos::find(&self.roots);
+    /// The repositories under the configured roots. The walk runs with the tree lock released: it
+    /// recurses the whole filesystem, and every agent's dispatch waits on that lock.
+    fn list_repos(swarm: &Arc<Mutex<Swarm>>) -> String {
+        let configured = lock(swarm).roots.clone();
+        let found = repos::find(&configured);
         if found.is_empty() {
-            let roots: Vec<String> = self.roots.iter().map(|root| root.display().to_string()).collect();
+            let roots: Vec<String> = configured.iter().map(|root| root.display().to_string()).collect();
             return format!("no git repositories found under {}", roots.join(", "));
         }
         let total = found.len();
@@ -879,6 +866,66 @@ impl Swarm {
         }
         lines.join("\n")
     }
+}
+
+/// Starts one agent thread: its inbox, and the handle proving it lives. `task` is the first
+/// instruction; the root starts with none and waits for the user.
+///
+/// The tree is reached through a `Weak`: the tree holds this worker's inbox, so a strong handle back
+/// would keep the pair alive for the life of the process, once the session has let the tree go.
+#[allow(clippy::too_many_arguments)] // one call site each for the root and for a spawned agent.
+fn spawn_thread(
+    llm: Arc<dyn Llm>,
+    sender: Sender<Event>,
+    id: usize,
+    depth: usize,
+    parent: Option<usize>,
+    working_dir: &Path,
+    control: Arc<Control>,
+    task: Option<String>,
+    log_path: &Path,
+    me: &Arc<Mutex<Swarm>>,
+) -> Result<(Sender<String>, JoinHandle<()>), String> {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| config::io_error(log_path.display(), &e))?;
+    let (inbox, instructions) = mpsc::channel();
+    let tree = Arc::downgrade(me);
+    let stream_sender = sender.clone();
+    let streamed = Arc::new(StreamLlm::new(
+        llm,
+        Arc::new(move |step| match step {
+            StreamStep::Start => {
+                let _ = stream_sender.send(Event::TurnStart { id });
+            }
+            StreamStep::Text(delta) => {
+                let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
+            }
+        }),
+    ));
+    let agent_dir = working_dir.to_path_buf();
+    let handle = thread::spawn(move || {
+        let mut log = log;
+        let mut run = AgentRun {
+            swarm: &tree,
+            id,
+            depth,
+            parent,
+            working_dir: &agent_dir,
+            sender: &sender,
+            log: &mut log,
+            calls: 0,
+            control: &control,
+            conflicts: conflict::Registry::default(),
+        };
+        run.run(streamed.as_ref(), &instructions);
+    });
+    if let Some(task) = task {
+        inbox.send(task).map_err(|_| format!("agent {id} could not be started"))?;
+    }
+    Ok((inbox, handle))
 }
 
 /// Reads the one worker id `/resume` takes, or why the argument is unusable.
@@ -892,8 +939,11 @@ fn resume_id(arg: &str) -> Result<usize, String> {
 }
 
 /// One agent thread: its place in the tree, where progress goes, its log and its orders.
+///
+/// The tree is held weakly: it owns this worker's inbox, and this worker's turn needs it, so a
+/// strong handle here would keep both alive after the session let the tree go.
 struct AgentRun<'a> {
-    swarm: &'a Arc<Mutex<Swarm>>,
+    swarm: &'a Weak<Mutex<Swarm>>,
     id: usize,
     depth: usize,
     parent: Option<usize>,
@@ -912,30 +962,32 @@ impl AgentRun<'_> {
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
         let (home, mcp) = {
-            let swarm = self.swarm.lock().unwrap_or_else(PoisonError::into_inner);
-            (swarm.home.clone(), Arc::clone(&swarm.mcp))
+            let Some(swarm) = self.swarm.upgrade() else { return };
+            let tree = lock(&swarm);
+            (tree.home.clone(), Arc::clone(&tree.mcp))
         };
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&home, self.working_dir);
         let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
-            control.clear_interrupt();
             let policy = control.policy();
-            let facts = {
-                let swarm = self.swarm.lock().unwrap_or_else(PoisonError::into_inner);
-                prompt::AgentFacts {
+            let (facts, remaining) = {
+                let Some(swarm) = self.swarm.upgrade() else { return };
+                let tree = lock(&swarm);
+                let facts = prompt::AgentFacts {
                     id: self.id,
                     parent: self.parent,
                     depth: self.depth,
-                    max_depth: swarm.max_depth,
+                    max_depth: tree.max_depth,
                     dir: self.working_dir,
                     policy: &policy,
-                    children: swarm.children(self.id),
+                    children: tree.children(self.id),
                     skills: &skills,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
-                }
+                };
+                (facts, tree.max_depth.saturating_sub(self.depth))
             };
             let prompt = prompt::agent_prompt(&facts);
             if let Some(first) = history.first_mut() {
@@ -944,7 +996,7 @@ impl AgentRun<'_> {
                 history.push(Message::system(prompt));
             }
             // Rebuilt per instruction: a server that connected after this agent started must reach it.
-            let tool_defs = prompt::agent_tool_definitions(&mcp, &policy);
+            let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
             let _ = writeln!(self.log, "> {input}");
             let result = {
                 let context = tools::Context { skills: &skills, mcp: mcp.as_ref() };
@@ -958,7 +1010,7 @@ impl AgentRun<'_> {
             };
             let (kind, text) = match result {
                 Ok(answer) => (AgentEvent::Finished, answer),
-                Err(e) if e.to_string() == "interrupted" => {
+                Err(e) if e.to_string() == INTERRUPTED => {
                     (AgentEvent::Interrupted, "your owner cut this turn short".to_string())
                 }
                 Err(e) => (AgentEvent::Failed, format!("{e:#}")),
@@ -968,9 +1020,19 @@ impl AgentRun<'_> {
         }
     }
 
+    /// A tree tool's result, or `None` when `call` is not one. The tree is upgraded for the call
+    /// only, so a worker whose session is gone cannot reach it and cannot keep it alive.
+    fn tree_tool(&self, call: &ToolCall) -> Option<Result<String, String>> {
+        let swarm = self.swarm.upgrade()?;
+        Swarm::tool(&swarm, self.id, &call.function.name, &call.function.arguments)
+    }
+
     /// Runs one tool call under the agent's policy, logging it and reporting its progress to the user.
     fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
-        let _ = writeln!(self.log, "· {} {}", call.function.name, call.function.arguments);
+        // The log keeps the capped summary, never the raw arguments: a `write_file` carries a whole
+        // file, whose content would land on disk in plain text.
+        let summary = describe(&call.function.name, &call.function.arguments);
+        let _ = writeln!(self.log, "· {} ({} bytes) {summary}", call.function.name, call.function.arguments.len());
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
             let seq = self.calls;
@@ -978,7 +1040,6 @@ impl AgentRun<'_> {
             seq
         });
         if let Some(seq) = seq {
-            let summary = describe(&call.function.name, &call.function.arguments);
             progress(self.sender, self.id, Progress::Started { call: seq, tool: call.function.name.clone(), summary });
         }
         let policy = control.policy();
@@ -1010,7 +1071,7 @@ impl AgentRun<'_> {
                 }
                 Err(e) => format!("error: {e}"),
             }
-        } else if let Some(result) = Swarm::tool(self.swarm, self.id, &call.function.name, &call.function.arguments) {
+        } else if let Some(result) = self.tree_tool(call) {
             tools::outcome(result)
         } else {
             tools::execute_guarded(
@@ -1161,7 +1222,7 @@ mod tests {
     fn every_agent_tool_is_dispatched() {
         let h = harness(vec![]);
         let mcp = mcp::Registry::load(h.root.path());
-        for definition in prompt::agent_tool_definitions(&mcp, &tools::Policy::default()).as_array().unwrap() {
+        for definition in prompt::agent_tool_definitions(&mcp, &tools::Policy::default(), 3).as_array().unwrap() {
             let name = definition.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             // The built-ins and `reply` are not tree tools: they fall through to the turn loop.
             if let Some(result) = Swarm::tool(&h.swarm, Swarm::ROOT, name, &json!({}).to_string()) {
@@ -1191,7 +1252,7 @@ mod tests {
 
     #[test]
     fn describe_names_what_a_tool_call_acts_on() {
-        assert_eq!(describe(prompt::SPAWN_AGENT, &json!({"task": "x"}).to_string()), "/tmp · x");
+        assert_eq!(describe(prompt::SPAWN_AGENT, &json!({"task": "x"}).to_string()), "owner's dir · x");
         let nested = json!({"path": "/repo", "task": "a\nb"}).to_string();
         assert_eq!(describe(prompt::SPAWN_AGENT, &nested), "/repo · a\nb", "the whole task, newlines kept");
         let message = json!({"id": 4, "text": "one\ntwo"}).to_string();
@@ -1233,7 +1294,7 @@ mod tests {
         assert!(rendered.contains("Agents you own right now: agent 3"), "{rendered}");
         assert!(rendered.contains("Your rights are fixed"), "{rendered}");
         assert!(rendered.contains("Ownership is one way"), "{rendered}");
-        for definition in prompt::agent_tool_definitions(&mcp, &policy).as_array().unwrap() {
+        for definition in prompt::agent_tool_definitions(&mcp, &policy, 2).as_array().unwrap() {
             let name = definition.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap();
             assert!(rendered.contains(name), "{name} missing from the agent prompt");
         }
@@ -1242,6 +1303,38 @@ mod tests {
             prompt::agent_prompt(&root_facts).contains("The user talks to you directly"),
             "the root must know its answer is the user's"
         );
+        // Non-root with no parent is a contradiction: the prompt must say so, not invent an owner.
+        let orphan = prompt::AgentFacts { id: 5, root: false, ..root_facts };
+        let orphan_prompt = prompt::agent_prompt(&orphan);
+        assert!(!orphan_prompt.contains("Agent 0 started you"), "{orphan_prompt}");
+        assert!(orphan_prompt.contains("Your owner is not recorded"), "{orphan_prompt}");
+    }
+
+    /// The tools array must hold only what the policy and the depth allow: a call that can only be
+    /// refused teaches the model to waste turns.
+    #[test]
+    fn a_banned_or_impossible_tool_is_not_advertised() {
+        let home = tempfile::tempdir().unwrap();
+        let mcp = mcp::Registry::load(home.path());
+        let advertised = |policy: &tools::Policy, remaining: usize| -> Vec<String> {
+            prompt::agent_tool_definitions(&mcp, policy, remaining)
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| Some(tool.get("function")?.get("name")?.as_str()?.to_string()))
+                .collect()
+        };
+        let banned = tools::Policy {
+            deny_tools: vec![prompt::SPAWN_AGENT.into(), prompt::REPLY.into()],
+            ..tools::Policy::default()
+        };
+        let names = advertised(&banned, 2);
+        assert!(!names.contains(&prompt::SPAWN_AGENT.to_string()), "a banned spawn_agent was offered");
+        assert!(!names.contains(&prompt::REPLY.to_string()), "a banned reply was offered");
+        assert!(names.contains(&prompt::MESSAGE_AGENT.to_string()));
+        let deepest = advertised(&tools::Policy::default(), 0);
+        assert!(!deepest.contains(&prompt::SPAWN_AGENT.to_string()), "spawn_agent offered with no depth left");
+        assert!(deepest.contains(&prompt::LIST_AGENTS.to_string()));
     }
 
     #[test]
@@ -1420,13 +1513,15 @@ mod tests {
     }
 
     #[test]
-    fn spawn_takes_any_directory_and_defaults_to_tmp() {
+    fn spawn_takes_any_directory_and_defaults_to_its_owner() {
         let h = harness(vec![text("a"), text("b")]);
         let elsewhere = tempfile::tempdir().unwrap();
         assert_eq!(spawn(&h.swarm, Swarm::ROOT, elsewhere.path(), "one"), "agent 2 started");
         assert_eq!(tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"task": "do it"})), "agent 3 started");
+        // A spawn with no path lands in its owner's directory: the root's own temp dir, not `/tmp`.
+        let owner = h.root.path().file_name().unwrap().to_string_lossy().into_owned();
         let listed = list(&h.swarm, Swarm::ROOT);
-        assert!(listed.contains("/tmp"), "{listed}");
+        assert!(listed.contains(&format!("{owner} | do it")), "{listed}");
         assert_eq!(
             tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 7, "text": "x"})),
             "error: no agent 7"

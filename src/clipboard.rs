@@ -1,4 +1,5 @@
 use crate::config;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -48,8 +49,9 @@ end run";
 /// of the picture, far too slow for the frame that drew the chip.
 pub(crate) fn read() -> Paste {
     match text() {
-        Some(text) => Paste::Text(text),
-        None => image(),
+        Ok(Some(text)) => Paste::Text(text),
+        Ok(None) => image(),
+        Err(why) => Paste::Failed(why),
     }
 }
 
@@ -57,8 +59,14 @@ pub(crate) fn read() -> Paste {
 ///
 /// A terminal hands a TUI its clipboard only as text, in bracketed paste, so this covers the paste
 /// that is not an image; arboard reads it without the image support its features would pull in.
-fn text() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get_text().ok()
+fn text() -> Result<Option<String>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard: {e}"))?;
+    match clipboard.get_text() {
+        Ok(text) if !text.is_empty() => Ok(Some(text)),
+        // An image-only pasteboard has no text; that is not a read failure.
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(e) => Err(format!("clipboard: {e}")),
+    }
 }
 
 /// How long `osascript` gets to answer before the read is called off.
@@ -73,15 +81,18 @@ const WAIT: Duration = Duration::from_millis(20);
 /// Reads the clipboard's image into a fresh file in the temp dir.
 ///
 /// Only the paste key calls this, on a thread of its own: it spawns `osascript` and copies every
-/// byte of the image, far too slow for a keystroke.
+/// byte of the image, far too slow for a keystroke. The script writes one short word to its pipes,
+/// so the poll loop does not need to drain them before the child exits.
 pub(crate) fn image() -> Paste {
-    let dir = std::env::temp_dir().join(DIR);
-    if let Err(e) = fs::create_dir_all(&dir) {
+    let dir = attachments();
+    if let Err(e) = ensure_dir(&dir) {
         return Paste::Failed(config::io_error(dir.display(), &e));
     }
     let path = dir.join(format!("paste-{}-{}.png", std::process::id(), stamp()));
-    // A file an earlier run left here must not pass for this paste.
-    let _ = fs::remove_file(&path);
+    // Create the name ourselves, so a pre-created symlink cannot redirect the script's write.
+    if let Err(e) = File::create_new(&path) {
+        return Paste::Failed(config::io_error(path.display(), &e));
+    }
     let mut child = match Command::new("osascript")
         .args(["-e", SCRIPT])
         .arg(&path)
@@ -90,7 +101,10 @@ pub(crate) fn image() -> Paste {
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return Paste::Failed(format!("osascript: {e}")),
+        Err(e) => {
+            let _ = fs::remove_file(&path);
+            return Paste::Failed(format!("osascript: {e}"));
+        }
     };
     let deadline = Instant::now() + TIMEOUT;
     let answered = loop {
@@ -98,7 +112,12 @@ pub(crate) fn image() -> Paste {
             Ok(Some(_)) => break true,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(WAIT),
             Ok(None) => break false,
-            Err(e) => return Paste::Failed(format!("osascript: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&path);
+                return Paste::Failed(format!("osascript: {e}"));
+            }
         }
     };
     if !answered {
@@ -108,13 +127,26 @@ pub(crate) fn image() -> Paste {
         let _ = fs::remove_file(&path);
         return Paste::Failed(format!("osascript gave no answer within {}s", TIMEOUT.as_secs()));
     }
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(e) => return Paste::Failed(format!("osascript: {e}")),
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&path);
+            return Paste::Failed(format!("osascript: {e}"));
+        }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    classify(output.status.code(), stdout.trim(), stderr.trim(), &path)
+    let mut out = String::new();
+    let mut err = String::new();
+    if let Some(pipe) = stdout.as_mut() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    if let Some(pipe) = stderr.as_mut() {
+        let _ = pipe.read_to_string(&mut err);
+    }
+    classify(status.code(), out.trim(), err.trim(), &path)
 }
 
 /// What the attachment chip says about a pasted image.
@@ -122,8 +154,9 @@ pub(crate) fn image() -> Paste {
 pub(crate) struct Info {
     /// The file's name, without its directory: the chip says what was pasted, not where it went.
     pub(crate) name: String,
-    /// Its size on disk, so a screenshot is recognisable before it is sent.
-    pub(crate) bytes: u64,
+    /// Its size on disk, so a screenshot is recognisable before it is sent; `None` when it cannot
+    /// be read, which is not the same as an empty file.
+    pub(crate) bytes: Option<u64>,
     /// The PNG's pixel size, when its header parses: the closest a terminal gets to a thumbnail.
     pub(crate) pixels: Option<(u32, u32)>,
 }
@@ -131,18 +164,21 @@ pub(crate) struct Info {
 impl Info {
     /// The chip's one line: `paste-1.png · 2560×1600 · 12.9 MB`.
     pub(crate) fn chip(&self) -> String {
-        let size = size(self.bytes);
-        match self.pixels {
-            Some((width, height)) => format!("{} · {width}×{height} · {size}", self.name),
-            None => format!("{} · {size}", self.name),
+        let mut chip = self.name.clone();
+        if let Some((width, height)) = self.pixels {
+            let _ = write!(chip, " · {width}×{height}");
         }
+        if let Some(bytes) = self.bytes {
+            let _ = write!(chip, " · {}", size(bytes));
+        }
+        chip
     }
 }
 
 /// Reads what the chip shows about `path`. A file that vanished answers with its name alone.
 pub(crate) fn info(path: &Path) -> Info {
     let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
-    let bytes = fs::metadata(path).map_or(0, |meta| meta.len());
+    let bytes = fs::metadata(path).ok().map(|meta| meta.len());
     Info { name, bytes, pixels: pixels(path) }
 }
 
@@ -178,9 +214,55 @@ fn pixels(path: &Path) -> Option<(u32, u32)> {
 ///
 /// Only files this module wrote are removed: any other path belongs to the user.
 pub(crate) fn discard(path: &Path) {
-    if path.parent().is_some_and(|parent| parent.ends_with(DIR)) {
+    let dir = attachments();
+    let prefix = format!("paste-{}-", std::process::id());
+    let ours = path.parent().is_some_and(|parent| parent == dir.as_path());
+    let prefixed = path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_str()));
+    if ours && prefixed {
         let _ = fs::remove_file(path);
     }
+}
+
+/// The directory this run writes pastes to: its own, so another user's files cannot be read or
+/// swapped for a symlink.
+fn attachments() -> PathBuf {
+    std::env::temp_dir().join(format!("{DIR}-{}", std::process::id()))
+}
+
+/// A path `discard` accepts, for a test that needs its image to be dropped afterwards.
+#[cfg(test)]
+pub(crate) fn pasted(name: &str) -> PathBuf {
+    let dir = attachments();
+    let _ = fs::create_dir_all(&dir);
+    dir.join(format!("paste-{}-{name}", std::process::id()))
+}
+
+/// Creates the attachments directory owner-only, refusing a path that is not a directory.
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o077 != 0 {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            return Ok(());
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "not a directory"));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// What a finished run left behind: an image only when the script said so *and* wrote the file.
@@ -300,7 +382,7 @@ mod tests {
         let path = dir.path().join("vanished.png");
         let info = info(&path);
         assert_eq!(info.name, "vanished.png");
-        assert_eq!(info.bytes, 0);
+        assert_eq!(info.bytes, None);
         assert_eq!(info.pixels, None);
     }
 
@@ -315,11 +397,32 @@ mod tests {
 
     #[test]
     fn discard_removes_a_pasted_image() {
-        let dir = std::env::temp_dir().join(DIR);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("discard-me.png");
+        let dir = attachments();
+        ensure_dir(&dir).unwrap();
+        let path = dir.join(format!("paste-{}-1.png", std::process::id()));
         fs::write(&path, b"x").unwrap();
         discard(&path);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn discard_leaves_a_file_in_a_lookalike_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookalike = dir.path().join(DIR);
+        fs::create_dir_all(&lookalike).unwrap();
+        let path = lookalike.join(format!("paste-{}-1.png", std::process::id()));
+        fs::write(&path, b"x").unwrap();
+        discard(&path);
+        assert!(path.exists(), "only this run's own directory is ours");
+    }
+
+    #[test]
+    fn discard_leaves_a_file_without_this_run_prefix() {
+        let dir = attachments();
+        ensure_dir(&dir).unwrap();
+        let path = dir.join("notes.png");
+        fs::write(&path, b"x").unwrap();
+        discard(&path);
+        assert!(path.exists(), "a name this module did not generate is the user's");
     }
 }

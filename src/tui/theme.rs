@@ -5,6 +5,9 @@
 //! the terminal's own background stays: that is why the light ramp exists, to keep the same slots
 //! readable when that background is light. `mono` sets every slot to the terminal default and marks
 //! the selection with reverse video instead of a fill, so no colour is needed to read the screen.
+//!
+//! The dark and light ramps are 24-bit RGB: on a terminal without truecolor the exact contrast
+//! ratios below no longer hold, and `mono` is the variant that does not depend on them.
 
 use crate::config::Theme;
 use ratatui::style::{Color, Modifier, Style};
@@ -37,7 +40,9 @@ fn chosen() -> &'static Palette {
 
 /// Fixes the palette for this run, from the config and the environment.
 pub(crate) fn install(choice: Theme) {
-    let _ = CHOSEN.set(palette(choice, std::env::var_os("NO_COLOR")));
+    let resolved = palette(choice, std::env::var_os("NO_COLOR"));
+    debug_assert!(CHOSEN.get().is_none(), "the palette must be installed before the first frame");
+    let _ = CHOSEN.set(resolved);
 }
 
 /// The config picks the variant; `auto` is the one that reads `NO_COLOR`, and a non-empty value
@@ -51,7 +56,8 @@ fn palette(choice: Theme, no_color: Option<OsString>) -> Palette {
     }
 }
 
-/// Tuned for a dark terminal; every slot above 4.5:1 on black.
+/// Tuned for a dark terminal: every text-bearing slot is above 4.5:1 on black; the rule, edge and
+/// band are decorative.
 fn dark() -> Palette {
     Palette {
         text: Color::Rgb(0xee, 0xee, 0xee),

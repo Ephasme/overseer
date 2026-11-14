@@ -9,6 +9,7 @@ use crate::event::UiEvent;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,9 +52,15 @@ pub(crate) struct Registry {
     state: Mutex<State>,
     store: Store,
     path: PathBuf,
-    groups: Mutex<Vec<i32>>,
+    /// One process group per server, replaced when that server reconnects, so a group whose client
+    /// is gone is never signalled and a recycled pgid is never hit.
+    groups: Mutex<HashMap<usize, i32>>,
+    /// Refreshes that could not be persisted; the next start would refresh again with the same
+    /// stale token, so the failure has to be visible.
+    warnings: Mutex<Vec<String>>,
     /// For discovery, registration and refresh; each server has its own client for its own calls.
-    http: reqwest::blocking::Client,
+    /// The build error is kept instead of a default client, which would drop the 60s timeout.
+    http: Result<reqwest::blocking::Client, String>,
 }
 
 impl Registry {
@@ -82,12 +89,16 @@ impl Registry {
                 },
             })
             .collect();
-        let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).build().unwrap_or_default();
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("http client: {e}"));
         Self {
             state: Mutex::new(State { servers, index: HashMap::new() }),
             store: Store::load(home),
             path,
-            groups: Mutex::new(Vec::new()),
+            groups: Mutex::new(HashMap::new()),
+            warnings: Mutex::new(Vec::new()),
             http,
         }
     }
@@ -131,12 +142,9 @@ impl Registry {
     /// Connects one server and records what came back; runs on that server's own thread.
     fn connect(&self, index: usize) {
         let Some(config) = self.guard().servers.get(index).and_then(|server| server.config.clone()) else { return };
-        let token = config.url().and_then(|url| self.token(url));
+        let token = config.url().and_then(|url| self.token(index, url));
         match client::connect(&config, token) {
-            Ok(connected) => {
-                self.record_group(&connected.client);
-                self.set_connected(index, connected);
-            }
+            Ok(connected) => self.set_connected(index, connected),
             Err(ConnectError::Unauthorized { challenge }) => {
                 self.set_status(index, Status::OauthRequired { challenge });
             }
@@ -145,14 +153,25 @@ impl Registry {
     }
 
     /// The stored access token for a server URL, refreshed first when it has expired.
-    fn token(&self, url: &str) -> Option<String> {
+    fn token(&self, index: usize, url: &str) -> Option<String> {
         let credential = self.store.get(url)?;
         if !credential.expired() {
             return Some(credential.access_token);
         }
-        match oauth::refresh(&self.http, &credential) {
+        let http = match &self.http {
+            Ok(http) => http,
+            Err(why) => {
+                self.warn(index, why);
+                return Some(credential.access_token);
+            }
+        };
+        match oauth::refresh(http, &credential) {
             Ok(renewed) => {
-                let _ = self.store.put(renewed.clone());
+                // The store keeps the new credential in memory even when the write fails, so the
+                // token works now; the warning is what says the next start will refresh again.
+                if let Err(why) = self.store.put(renewed.clone()) {
+                    self.warn(index, &why);
+                }
                 Some(renewed.access_token)
             }
             // A refresh that fails leaves the old token: the server decides whether it is still good.
@@ -160,9 +179,26 @@ impl Registry {
         }
     }
 
-    fn record_group(&self, client: &Client) {
-        if let Some(group) = client.group() {
-            self.groups.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(group);
+    /// Records a problem that did not fail the call, for `/mcp` and the startup notice.
+    fn warn(&self, index: usize, why: &str) {
+        let Some(name) = self.guard().servers.get(index).map(|server| server.name.clone()) else { return };
+        let warning = format!("{name}: {why}");
+        let mut warnings = self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+
+    /// Keeps at most one process group per server: the previous one is freed when its client goes.
+    fn set_group(&self, index: usize, group: Option<i32>) {
+        let mut groups = self.groups.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match group {
+            Some(group) => {
+                groups.insert(index, group);
+            }
+            None => {
+                groups.remove(&index);
+            }
         }
     }
 
@@ -173,38 +209,43 @@ impl Registry {
         }
     }
 
-    /// Records a live connection: its tools under their runtime names, its notes, its status.
+    /// Publishes a live connection: its client slot, its tools, its notes and the tool index move
+    /// together under the state lock, so no reader sees a client whose tools are not indexed yet.
+    ///
+    /// Lock order is the state lock, then that server's client, then `groups`; nothing takes the
+    /// state lock while holding a client.
     fn set_connected(&self, index: usize, connected: client::Connected) {
         let client::Connected { client, tools, instructions } = connected;
-        {
-            let state = self.guard();
-            let Some(server) = state.servers.get(index) else { return };
-            let slot = Arc::clone(&server.client);
-            drop(state);
-            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
-        }
-        self.record_tools(index, tools, instructions);
-    }
-
-    /// Indexes a server's tools under their runtime names; the client itself is already stored.
-    fn record_tools(&self, index: usize, tools: Vec<ToolDef>, instructions: Option<String>) {
+        let group = client.group();
         let mut state = self.guard();
-        let Some(server) = state.servers.get_mut(index) else { return };
+        let Some(server) = state.servers.get(index) else { return };
+        let slot = Arc::clone(&server.client);
         let notes = server.config.as_ref().filter(|config| config.instructions).and(instructions);
+        let server_name = server.name.clone();
+        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
+        // Names another server already holds stay claimed: a collision must not hide one of the two.
+        let mut entries: HashMap<String, (usize, String)> = std::mem::take(&mut state.index);
+        entries.retain(|_, (owner, _)| *owner != index);
         let mut named: Vec<(String, ToolDef)> = Vec::with_capacity(tools.len());
-        let mut additions: Vec<(String, (usize, String))> = Vec::with_capacity(tools.len());
         for tool in tools {
-            let runtime = runtime_name(&server.name, &tool.name);
-            additions.push((runtime.clone(), (index, tool.name.clone())));
+            let original = tool.name.clone();
+            let wanted = runtime_name(&server_name, &original);
+            let runtime = if entries.contains_key(&wanted) {
+                free_runtime_name(&wanted, &server_name, &original, &entries)
+            } else {
+                wanted
+            };
+            entries.insert(runtime.clone(), (index, original));
             named.push((runtime, tool));
         }
-        server.tools = named;
-        server.notes = notes;
-        server.status = Status::Connected;
-        state.index.retain(|_, (owner, _)| *owner != index);
-        for (runtime, target) in additions {
-            state.index.insert(runtime, target);
+        if let Some(server) = state.servers.get_mut(index) {
+            server.tools = named;
+            server.notes = notes;
+            server.status = Status::Connected;
         }
+        state.index = entries;
+        drop(state);
+        self.set_group(index, group);
     }
 
     /// Every tool a worker may call, in the chat-completions shape.
@@ -254,16 +295,20 @@ impl Registry {
             };
             (server.name.clone(), server.config.clone(), Arc::clone(&server.client))
         };
-        let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(client) = guard.as_mut() else {
-            return format!("error: mcp server {name} is not connected");
+        let outcome = {
+            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_mut() {
+                Some(client) => client.call(&tool, arguments),
+                None => return format!("error: mcp server {name} is not connected"),
+            }
         };
-        let first = client.call(&tool, arguments);
-        match first {
+        match outcome {
             Ok(text) => text,
             Err(CallError::Failed(why)) => format!("error: mcp server {name}: {why}"),
+            // A refresh and a reconnect take seconds: the client lock is already released, so this
+            // server's other calls are not queued behind them.
             Err(CallError::Unauthorized) => {
-                self.retry_after_refresh(index, &name, config.as_ref(), &mut guard, &tool, arguments)
+                self.retry_after_refresh(index, &name, config.as_ref(), &slot, &tool, arguments)
             }
         }
     }
@@ -274,7 +319,7 @@ impl Registry {
         index: usize,
         name: &str,
         config: Option<&ServerConfig>,
-        slot: &mut Option<Client>,
+        slot: &Arc<Mutex<Option<Client>>>,
         tool: &str,
         arguments: &str,
     ) -> String {
@@ -285,59 +330,57 @@ impl Registry {
         let (Some(config), Some(url)) = (config, config.and_then(ServerConfig::url)) else {
             return needs_login();
         };
+        let http = match &self.http {
+            Ok(http) => http,
+            Err(why) => return format!("error: {why}"),
+        };
         let Some(credential) = self.store.get(url) else { return needs_login() };
-        let Ok(renewed) = oauth::refresh(&self.http, &credential) else { return needs_login() };
-        let _ = self.store.put(renewed.clone());
-        let Ok(connected) = client::connect(config, Some(renewed.access_token)) else { return needs_login() };
-        self.record_group(&connected.client);
-        if let Some(old) = slot.as_mut() {
-            old.close();
+        let Ok(renewed) = oauth::refresh(http, &credential) else { return needs_login() };
+        if let Err(why) = self.store.put(renewed.clone()) {
+            self.warn(index, &why);
         }
-        *slot = Some(connected.client);
-        let retry = match slot.as_mut() {
-            Some(client) => client.call(tool, arguments),
-            None => return needs_login(),
+        let Ok(connected) = client::connect(config, Some(renewed.access_token)) else { return needs_login() };
+        // The old client is reaped before the new one takes its slot, so its process is not left
+        // as a zombie and its group is not signalled twice.
+        {
+            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(old) = guard.as_mut() {
+                old.close();
+            }
+            *guard = None;
+        }
+        // Published before the retry, so a retry that fails does not leave the old connection's
+        // tools advertised.
+        self.set_connected(index, connected);
+        let retry = {
+            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(|client| client.call(tool, arguments))
         };
         match retry {
-            Ok(text) => {
-                self.record_tools(index, connected.tools, connected.instructions);
-                text
-            }
-            Err(CallError::Unauthorized) => needs_login(),
-            Err(CallError::Failed(why)) => format!("error: mcp server {name}: {why}"),
+            Some(Ok(text)) => text,
+            Some(Err(CallError::Failed(why))) => format!("error: mcp server {name}: {why}"),
+            Some(Err(CallError::Unauthorized)) | None => needs_login(),
         }
     }
 
     /// `N servers, M tools, K unavailable, /mcp to list`, as the startup notice reads it.
     fn notice(&self) -> String {
-        let (servers, tools, unavailable) = self.counts();
-        format!("mcp: {servers} servers, {tools} tools, {unavailable} unavailable, /mcp to list")
+        let (servers, tools, unavailable) = count(&self.guard());
+        let mut text = format!("mcp: {servers} servers, {tools} tools, {unavailable} unavailable, /mcp to list");
+        for warning in self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            let _ = write!(text, "\n{warning}");
+        }
+        text
     }
 
-    fn counts(&self) -> (usize, usize, usize) {
-        let state = self.guard();
-        let tools = state.servers.iter().map(|server| server.tools.len()).sum();
-        let unavailable = state
-            .servers
-            .iter()
-            .filter(|server| matches!(server.status, Status::Failed(_) | Status::OauthRequired { .. }))
-            .count();
-        (state.servers.len(), tools, unavailable)
-    }
-
-    /// `/mcp`: the counts, then one line per server.
+    /// `/mcp`: the counts, then one line per server, then the warnings.
     pub(crate) fn summary(&self) -> String {
         let state = self.guard();
         if state.servers.is_empty() {
             return format!("no MCP servers in {}", self.path.display());
         }
-        let tools: usize = state.servers.iter().map(|server| server.tools.len()).sum();
-        let unavailable = state
-            .servers
-            .iter()
-            .filter(|server| matches!(server.status, Status::Failed(_) | Status::OauthRequired { .. }))
-            .count();
-        let mut lines = vec![format!("mcp: {} servers, {tools} tools, {unavailable} unavailable", state.servers.len())];
+        let (servers, tools, unavailable) = count(&state);
+        let mut lines = vec![format!("mcp: {servers} servers, {tools} tools, {unavailable} unavailable")];
         for server in &state.servers {
             let kind = server.config.as_ref().map_or("unknown", ServerConfig::kind);
             let status = match &server.status {
@@ -347,6 +390,10 @@ impl Registry {
                 Status::Failed(why) => why.lines().next().unwrap_or_default().to_string(),
             };
             lines.push(format!("- {} {kind} {status}", server.name));
+        }
+        drop(state);
+        for warning in self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            lines.push(format!("! {warning}"));
         }
         lines.join("\n")
     }
@@ -366,29 +413,36 @@ impl Registry {
         };
         let Some((index, config, challenge)) = found else { return format!("unknown MCP server {name}") };
         let Some(config) = config else { return format!("error: mcp server {name} has no usable configuration") };
-        let credential = match oauth::login(&self.http, &config, challenge.as_deref(), notify) {
+        let http = match &self.http {
+            Ok(http) => http,
+            Err(why) => return format!("error: {why}"),
+        };
+        let credential = match oauth::login(http, &config, challenge.as_deref(), notify) {
             Ok(credential) => credential,
             Err(why) => return format!("error: {why}"),
         };
         if let Err(why) = self.store.put(credential.clone()) {
             return format!("error: {why}");
         }
-        // A server that was already connected is re-authorized: its old client is not reused.
+        // A server that was already connected is re-authorized: its old client is closed and the
+        // slot emptied, so a reconnect that fails answers "not connected" instead of a dead pipe.
         let slot = {
             let state = self.guard();
             state.servers.get(index).map(|server| Arc::clone(&server.client))
         };
-        if let Some(slot) = &slot
-            && let Some(old) = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut()
-        {
-            old.close();
+        if let Some(slot) = &slot {
+            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(old) = guard.as_mut() {
+                old.close();
+            }
+            *guard = None;
         }
+        self.set_group(index, None);
         match client::connect(&config, Some(credential.access_token)) {
             Ok(connected) => {
-                let count = connected.tools.len();
-                self.record_group(&connected.client);
+                let tools = connected.tools.len();
                 self.set_connected(index, connected);
-                format!("logged in to {name}: {count} tools")
+                format!("logged in to {name}: {tools} tools")
             }
             Err(ConnectError::Unauthorized { challenge }) => {
                 self.set_status(index, Status::OauthRequired { challenge });
@@ -403,12 +457,28 @@ impl Registry {
 
     /// Kills every stdio server still running; quitting must not leave one behind.
     pub(crate) fn kill_all(&self) {
-        let groups: Vec<i32> =
-            self.groups.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect();
+        let groups: Vec<i32> = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, group)| group)
+            .collect();
         for group in groups {
             let _ = std::process::Command::new("kill").arg("-9").arg(format!("-{group}")).status();
         }
     }
+}
+
+/// Servers, tools and unavailable servers; the startup notice and `/mcp` share one count.
+fn count(state: &State) -> (usize, usize, usize) {
+    let tools = state.servers.iter().map(|server| server.tools.len()).sum();
+    let unavailable = state
+        .servers
+        .iter()
+        .filter(|server| matches!(server.status, Status::Failed(_) | Status::OauthRequired { .. }))
+        .count();
+    (state.servers.len(), tools, unavailable)
 }
 
 impl Drop for Registry {
@@ -436,6 +506,25 @@ pub(crate) fn runtime_name(server: &str, tool: &str) -> String {
     let suffix = format!("_{:08x}", hasher.finish() & 0xffff_ffff);
     let head = name.get(..MAX_NAME.saturating_sub(suffix.len())).unwrap_or_default();
     format!("{head}{suffix}")
+}
+
+/// A runtime name another tool already holds, made unique with a hash of this tool's own name.
+///
+/// Truncated to `MAX_NAME` like `runtime_name`, so both stay inside the same limit.
+fn free_runtime_name(wanted: &str, server: &str, tool: &str, taken: &HashMap<String, (usize, String)>) -> String {
+    let mut hasher = DefaultHasher::new();
+    (server, tool).hash(&mut hasher);
+    let mut attempt = hasher.finish() & 0xffff_ffff;
+    loop {
+        let suffix = format!("_{attempt:08x}");
+        let budget = MAX_NAME.saturating_sub(suffix.len());
+        let head = wanted.get(..wanted.len().min(budget)).unwrap_or_default();
+        let candidate = format!("{head}{suffix}");
+        if !taken.contains_key(&candidate) {
+            return candidate;
+        }
+        attempt = attempt.wrapping_add(1);
+    }
 }
 
 /// Lowercase, every character outside `[a-z0-9_]` replaced, runs collapsed, ends trimmed.
@@ -469,5 +558,16 @@ mod tests {
         assert_eq!(long.len(), MAX_NAME, "{long}");
         assert!(long.starts_with("mcp__"), "{long}");
         assert_eq!(long, runtime_name(&"s".repeat(60), &"t".repeat(60)), "the hash is stable");
+    }
+
+    #[test]
+    fn a_taken_runtime_name_gets_a_stable_suffix() {
+        let mut taken = HashMap::new();
+        taken.insert("mcp__fs_read".to_string(), (0, "read".to_string()));
+        let name = free_runtime_name("mcp__fs_read", "fs", "fs_read", &taken);
+        assert!(name.starts_with("mcp__fs_read_"), "{name}");
+        assert!(name.len() <= MAX_NAME, "{name}");
+        assert!(!taken.contains_key(&name), "{name}");
+        assert_eq!(name, free_runtime_name("mcp__fs_read", "fs", "fs_read", &taken), "the hash is stable");
     }
 }

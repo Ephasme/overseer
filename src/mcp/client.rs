@@ -2,7 +2,7 @@
 
 use super::config::{self, ServerConfig, Transport};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -18,6 +18,9 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Longest error body echoed into a tool result.
 const MAX_ERROR_BODY: usize = 500;
+
+/// Most `tools/list` pages followed before the server is called broken.
+const MAX_TOOL_PAGES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolDef {
@@ -54,7 +57,7 @@ impl Client {
     /// The process group a stdio server runs in, so quitting can kill it.
     pub(crate) fn group(&self) -> Option<i32> {
         match self {
-            Client::Stdio(stdio) => Some(stdio.group),
+            Client::Stdio(stdio) => stdio.group,
             Client::Http(_) => None,
         }
     }
@@ -170,6 +173,7 @@ fn as_connect_error(error: CallError) -> ConnectError {
 fn list_tools(client: &Client) -> Result<Vec<ToolDef>, ConnectError> {
     let mut tools = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen: HashSet<String> = HashSet::new();
     loop {
         let params = match &cursor {
             Some(cursor) => json!({"cursor": cursor}),
@@ -185,8 +189,15 @@ fn list_tools(client: &Client) -> Result<Vec<ToolDef>, ConnectError> {
             });
         }
         cursor = page.get("nextCursor").and_then(Value::as_str).map(ToString::to_string);
-        if cursor.is_none() {
-            return Ok(tools);
+        match cursor {
+            None => return Ok(tools),
+            Some(next) if !seen.insert(next.clone()) => {
+                return Err(ConnectError::Failed(format!("tools/list repeated cursor {next}")));
+            }
+            Some(_) if seen.len() > MAX_TOOL_PAGES => {
+                return Err(ConnectError::Failed(format!("tools/list went past {MAX_TOOL_PAGES} pages")));
+            }
+            Some(_) => {}
         }
     }
 }
@@ -225,13 +236,20 @@ fn debug(on: bool, line: &str) {
 /// A server launched as a child process, one JSON object per line on its stdout.
 pub(crate) struct Stdio {
     name: String,
-    group: i32,
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// Taken by whichever closer runs first: once the child is reaped, its id may name another group.
+    group: Option<i32>,
+    writer: Option<mpsc::Sender<Line>>,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
     next_id: AtomicU64,
     timeout: Option<Duration>,
     child: Mutex<Child>,
     reader: Option<JoinHandle<()>>,
+}
+
+/// One line for the writer thread; `done` carries the write's result when its sender waits for it.
+struct Line {
+    text: String,
+    done: Option<mpsc::Sender<std::io::Result<()>>>,
 }
 
 impl Stdio {
@@ -252,19 +270,23 @@ impl Stdio {
         let mut child = built
             .spawn()
             .map_err(|e| ConnectError::Failed(format!("{command}: {}", crate::config::io_error(command, &e))))?;
-        let group = i32::try_from(child.id())
-            .map_err(|_| ConnectError::Failed(format!("{command}: process id does not fit a process group")))?;
+        let group = i32::try_from(child.id()).map_err(|_| {
+            end(&mut child);
+            ConnectError::Failed(format!("{command}: process id does not fit a process group"))
+        })?;
         let Some(stdin) = child.stdin.take() else {
+            end(&mut child);
             return Err(ConnectError::Failed(format!("{command}: no stdin pipe")));
         };
-        let stdin = Arc::new(Mutex::new(stdin));
+        let (writer, lines) = mpsc::channel();
+        thread::spawn(move || write_lines(stdin, &lines));
         let pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
         let stdout = child.stdout.take();
         let reader = stdout.map(|stdout| {
-            let stdin = Arc::clone(&stdin);
+            let writer = writer.clone();
             let pending = Arc::clone(&pending);
             let name = name.to_string();
-            thread::spawn(move || read_frames(&name, stdout, &stdin, &pending))
+            thread::spawn(move || read_frames(&name, stdout, &writer, &pending))
         });
         if let Some(stderr) = child.stderr.take() {
             let debug_on = std::env::var_os(crate::config::DEBUG).is_some();
@@ -277,8 +299,8 @@ impl Stdio {
         }
         Ok(Self {
             name: name.to_string(),
-            group,
-            stdin,
+            group: Some(group),
+            writer: Some(writer),
             pending,
             next_id: AtomicU64::new(1),
             timeout,
@@ -289,11 +311,20 @@ impl Stdio {
 
     /// Writes one frame; a server whose stdin closed is a server that died.
     fn send(&self, frame: &Value) -> Result<(), CallError> {
-        let mut stdin = lock(&self.stdin);
-        let mut line = frame.to_string();
-        line.push('\n');
-        stdin.write_all(line.as_bytes()).map_err(|e| CallError::Failed(format!("mcp server {}: {e}", self.name)))?;
-        stdin.flush().map_err(|e| CallError::Failed(format!("mcp server {}: {e}", self.name)))
+        let mut text = frame.to_string();
+        text.push('\n');
+        let (done, written) = mpsc::channel();
+        let Some(writer) = self.writer.as_ref() else {
+            return Err(CallError::Failed(format!("mcp server {} exited", self.name)));
+        };
+        writer
+            .send(Line { text, done: Some(done) })
+            .map_err(|_| CallError::Failed(format!("mcp server {} exited", self.name)))?;
+        match written.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CallError::Failed(format!("mcp server {}: {e}", self.name))),
+            Err(_) => Err(CallError::Failed(format!("mcp server {} exited", self.name))),
+        }
     }
 
     fn request(&self, method: &str, params: &Value) -> Result<Value, CallError> {
@@ -326,7 +357,11 @@ impl Stdio {
     }
 
     fn close(&mut self) {
-        let _ = Command::new("kill").arg("-9").arg(format!("-{}", self.group)).status();
+        if let Some(group) = self.group.take() {
+            let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+        }
+        // Dropping the last sender ends the writer thread, which closes the child's stdin.
+        drop(self.writer.take());
         let mut child = lock(&self.child);
         let _ = child.wait();
         drop(child);
@@ -338,7 +373,29 @@ impl Stdio {
 
 impl Drop for Stdio {
     fn drop(&mut self) {
-        let _ = Command::new("kill").arg("-9").arg(format!("-{}", self.group)).status();
+        // Same path as `close`: a dropped client must not leave a zombie or a reader behind.
+        self.close();
+    }
+}
+
+/// Ends a server that was spawned but cannot be kept: its group first, then the child itself.
+fn end(child: &mut Child) {
+    let _ = Command::new("kill").arg("-9").arg(format!("-{}", child.id())).status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Writes every queued line, so neither the reader thread nor a caller waits on a full pipe.
+fn write_lines(mut stdin: ChildStdin, lines: &Receiver<Line>) {
+    for line in lines {
+        let written = stdin.write_all(line.text.as_bytes()).and_then(|()| stdin.flush());
+        let failed = written.is_err();
+        if let Some(done) = line.done {
+            let _ = done.send(written);
+        }
+        if failed {
+            return;
+        }
     }
 }
 
@@ -346,7 +403,7 @@ impl Drop for Stdio {
 fn read_frames<R: std::io::Read>(
     name: &str,
     stdout: R,
-    stdin: &Arc<Mutex<ChildStdin>>,
+    writer: &mpsc::Sender<Line>,
     pending: &Arc<Mutex<HashMap<u64, mpsc::Sender<Value>>>>,
 ) {
     let debug_on = std::env::var_os(crate::config::DEBUG).is_some();
@@ -369,9 +426,8 @@ fn read_frames<R: std::io::Read>(
                         "message": format!("method not found: {other}"),
                     }}),
                 };
-                let mut stdin = lock(stdin);
-                let _ = writeln!(stdin, "{answer}");
-                let _ = stdin.flush();
+                // Queued, never written here: waiting on a full stdin would stop stdout draining.
+                let _ = writer.send(Line { text: format!("{answer}\n"), done: None });
             }
             // A notification: logged under `OVERSEER_DEBUG`, otherwise nothing to do.
             (Some(method), None) => debug(debug_on, &format!("[{name}] notification {method}")),
@@ -478,11 +534,15 @@ impl Http {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("text/event-stream"));
         if streamed {
-            return read_event_stream(response, id)
+            let frame = read_event_stream(response, id)
                 .ok_or_else(|| CallError::Failed(format!("{}: no answer on the event stream", self.name)))?;
+            return unwrap_result(&frame);
         }
         let body = response.text().map_err(|e| CallError::Failed(format!("{}: {e}", self.name)))?;
-        serde_json::from_str(&body).map_err(|e| CallError::Failed(format!("{}: unreadable response: {e}", self.name)))
+        let frame: Value = serde_json::from_str(&body)
+            .map_err(|e| CallError::Failed(format!("{}: unreadable response: {e}", self.name)))?;
+        // The same contract as `Stdio::request`: callers get the `result`, not the envelope.
+        unwrap_result(&frame)
     }
 
     fn notify(&self, method: &str, params: &Value) -> Result<(), CallError> {
@@ -496,12 +556,12 @@ impl Http {
 }
 
 /// Reads `data:` lines until the frame carrying `id` arrives.
-fn read_event_stream<R: std::io::Read>(response: R, id: u64) -> Option<Result<Value, CallError>> {
+fn read_event_stream<R: std::io::Read>(response: R, id: u64) -> Option<Value> {
     for line in BufReader::new(response).lines().map_while(Result::ok) {
         let Some(payload) = line.strip_prefix("data:") else { continue };
         let Ok(frame) = serde_json::from_str::<Value>(payload.trim()) else { continue };
         if frame.get("id").and_then(Value::as_u64) == Some(id) {
-            return Some(Ok(frame));
+            return Some(frame);
         }
     }
     None

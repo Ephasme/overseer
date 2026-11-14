@@ -2,15 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What one server's login produced, and what a refresh needs to renew it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Credential {
     /// Keys this credential: a renamed server keeps its login.
     pub(crate) server_url: String,
@@ -33,6 +35,24 @@ pub(crate) struct Credential {
 impl Credential {
     pub(crate) fn expired(&self) -> bool {
         self.expires_at <= now()
+    }
+}
+
+/// Every secret is printed as this, so an incidental `{:?}` cannot leak a live token.
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("server_url", &self.server_url)
+            .field("authorization_url", &self.authorization_url)
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| super::REDACTED))
+            .field("access_token", &super::REDACTED)
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| super::REDACTED))
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .field("resource", &self.resource)
+            .finish()
     }
 }
 
@@ -66,10 +86,22 @@ impl Store {
     }
 
     pub(crate) fn put(&self, credential: Credential) -> Result<(), String> {
-        let mut known = self.guard();
-        known.insert(credential.server_url.clone(), credential);
-        let text = serde_json::to_string_pretty(&*known).map_err(|e| format!("auth.json: {e}"))?;
-        write_private(&self.path, &text)
+        let url = credential.server_url.clone();
+        let previous = self.guard().insert(url.clone(), credential);
+        // Serialising and fsyncing outside the lock keeps a slow disk from stalling every reader.
+        let text = serde_json::to_string_pretty(&*self.guard()).map_err(|e| format!("auth.json: {e}"))?;
+        match write_private(&self.path, &text) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A credential that was never persisted must not be handed out by `get`.
+                let mut known = self.guard();
+                match previous {
+                    Some(previous) => known.insert(url, previous),
+                    None => known.remove(&url),
+                };
+                Err(e)
+            }
+        }
     }
 }
 
@@ -82,9 +114,16 @@ fn write_private(path: &Path, text: &str) -> Result<(), String> {
             .create(dir)
             .map_err(|e| crate::config::io_error(dir.display(), &e))?;
     }
-    let temporary = path.with_file_name(format!("{}.tmp", path.file_name().unwrap_or_default().to_string_lossy()));
+    // Unique per process and created fresh: `mode(0o600)` only applies to a new inode, and a
+    // planted symlink or leftover file must not redirect or widen the write.
+    let temporary = path.with_file_name(format!(
+        "{}.tmp.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
     let write = || -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temporary)?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()
     };
@@ -123,6 +162,29 @@ mod tests {
         assert_eq!(mode, 0o600, "the token file is readable by its owner alone");
         let reopened = Store::load(home.path());
         assert_eq!(reopened.get("https://x/mcp").map(|c| c.access_token), Some("token".to_string()));
+    }
+
+    #[test]
+    fn a_planted_temporary_file_cannot_widen_the_store_permissions() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".overseer/agent");
+        fs::create_dir_all(&dir).unwrap();
+        let temporary = dir.join(format!("auth.json.tmp.{}", process::id()));
+        fs::write(&temporary, "planted").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).unwrap();
+        Store::load(home.path()).put(credential("https://x/mcp")).unwrap();
+        let mode = fs::metadata(dir.join("auth.json")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a leftover temp file must not carry its mode into the store");
+    }
+
+    #[test]
+    fn a_credential_debug_redacts_its_secrets() {
+        let mut secret = credential("https://x/mcp");
+        secret.client_secret = Some("s3cret".into());
+        let text = format!("{secret:?}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains("\"token\""), "{text}");
+        assert!(!text.contains("\"refresh\""), "{text}");
     }
 
     #[test]

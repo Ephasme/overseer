@@ -88,8 +88,8 @@ pub(crate) fn is_url(path: &str) -> bool {
         return false;
     };
     let mut chars = scheme.chars();
-    chars.next().is_some_and(|first| first.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+    chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Reads `href` through the scheme that owns it.
@@ -141,9 +141,12 @@ fn active() -> impl Iterator<Item = (&'static str, &'static Active)> {
 /// Splits `href` into its scheme and the remainder, or says why no scheme answers to it.
 fn resolve(href: &str) -> Result<(&'static str, &'static Active, &str), String> {
     let Some((name, rest)) = href.split_once("://") else {
-        return Err(format!("`{href}` is not an internal URI: it has no `scheme://` prefix"));
+        return Err(format!("`{}` is not an internal URI: it has no `scheme://` prefix", shown(href)));
     };
-    let found = SCHEMES.iter().find(|scheme| scheme.name == name).map(|scheme| (scheme.name, &scheme.status));
+    let found = SCHEMES
+        .iter()
+        .find(|scheme| scheme.name.eq_ignore_ascii_case(name))
+        .map(|scheme| (scheme.name, &scheme.status));
     match found {
         Some((name, Status::Active(active))) => Ok((name, active, rest)),
         // A reserved name gets the same answer as a name nobody ever wrote, and neither answer
@@ -151,12 +154,18 @@ fn resolve(href: &str) -> Result<(&'static str, &'static Active, &str), String> 
         _ => Err(unavailable(name)),
     }
 }
+
+/// `text` with control characters escaped, so a path cannot forge lines in a diagnostic.
+fn shown(text: &str) -> String {
+    text.chars().flat_map(char::escape_debug).collect()
+}
+
 fn unavailable(name: &str) -> String {
     let known: Vec<String> = active().map(|(name, _)| format!("`{name}://`")).collect();
     if known.is_empty() {
-        return format!("`{name}://` is not an available scheme: this build resolves none");
+        return format!("`{}://` is not an available scheme: this build resolves none", shown(name));
     }
-    format!("`{name}://` is not an available scheme: this build resolves {}", known.join(", "))
+    format!("`{}://` is not an available scheme: this build resolves {}", shown(name), known.join(", "))
 }
 
 fn conflict_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
@@ -175,7 +184,7 @@ fn conflict_write(ctx: &mut Ctx, rest: &str, content: &str) -> Result<String, St
 
 fn skill_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
     let Some(skills) = ctx.skills else {
-        return Err("skills belong to the worker that read the file".to_string());
+        return Err("skills are not available to this caller: it has no skill catalogue".to_string());
     };
     skills.read(rest)
 }
@@ -245,10 +254,23 @@ mod tests {
     #[test]
     fn a_path_without_a_scheme_is_not_a_uri() {
         assert!(is_url("conflict://1"));
+        assert!(is_url("Conflict://1"), "RFC 3986 schemes are case-insensitive");
         assert!(is_url("http://example.com"));
         assert!(!is_url("src/main.rs"));
         assert!(!is_url("/tmp/a://b"));
         assert!(!is_url("C:/x"));
+    }
+
+    #[test]
+    fn a_scheme_name_is_matched_without_regard_to_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src.rs");
+        let text = "<<<<<<< HEAD\nlet x = 1;\n=======\nlet x = 2;\n>>>>>>> other\n";
+        fs::write(&file, text).unwrap();
+        let mut registry = conflict::Registry::default();
+        registry.reconcile(&file, "src.rs", text);
+        let mut ctx = context(&mut registry);
+        assert!(read(&mut ctx, "Conflict://1").unwrap().contains("let x = 1;"));
     }
 
     #[test]

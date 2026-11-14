@@ -1,1 +1,5 @@
 /target
+# Local API key: src/secrets.rs reads .env from the working directory, and `git add -A` would commit it.
+.env
+.env.*
+!.env.example

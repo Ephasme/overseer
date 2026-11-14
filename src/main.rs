@@ -20,6 +20,7 @@ mod version;
 use anyhow::{Context, Result};
 use event::UiEvent;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
@@ -50,10 +51,12 @@ fn main() -> Result<()> {
     let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
     let session_input = input_tx.clone();
     let stop = input_tx.clone();
+    let quit = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::clone(&quit);
     let model = cfg.model.clone();
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
-    let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx, mcp));
+    let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown));
 
     let frontend = if tui_available() {
         tui::run(ui_rx, input_tx, &model, theme)
@@ -62,10 +65,11 @@ fn main() -> Result<()> {
         Ok(())
     };
     // A frontend that returned early leaves the core waiting for an event nobody will send.
+    quit.store(true, Ordering::Relaxed);
     let _ = stop.send(swarm::Event::Exit);
-    // A panicking core must exit non-zero, not look like a clean quit.
-    core.join().map_err(|_| anyhow::anyhow!("the core thread panicked"))?;
-    frontend
+    // A core that failed, panicked or not, must exit non-zero, not look like a clean quit.
+    let session = core.join().map_err(|_| anyhow::anyhow!("the core thread panicked"))?;
+    session.and(frontend)
 }
 
 /// A terminal on both ends, unless `OVERSEER_PLAIN` asks for line mode anyway.

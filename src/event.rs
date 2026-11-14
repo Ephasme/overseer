@@ -5,7 +5,7 @@ use crate::swarm::{AgentEvent, AgentView, Progress};
 pub(crate) enum UiEvent {
     /// Something the user asked for directly, such as a `/resume` outcome.
     Notice(String),
-    /// An agent turn failed.
+    /// A failure the user must see: an agent turn, a model call, or the core failing to start.
     Error(String),
     /// `OVERSEER_DEBUG` output.
     Debug(String),

@@ -7,7 +7,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
@@ -19,6 +18,9 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Longest OAuth error body echoed into a failure line.
 const MAX_ERROR_BODY: usize = 300;
+
+/// Longest request line read from the callback socket, so a silent client cannot grow it.
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
 
 /// What the server or its authorization server advertises.
 #[derive(Debug, Default)]
@@ -57,16 +59,17 @@ pub(crate) fn login(
     let port = listener.local_addr().map_err(|e| format!("127.0.0.1: {e}"))?.port();
     plan.redirect_uri = format!("http://127.0.0.1:{port}{}", plan.callback_path);
     if plan.client_id.is_none() {
-        let (id, secret) = register(client, &plan)?;
-        plan.client_id = Some(id);
-        plan.client_secret = plan.client_secret.or(secret);
+        // A dynamically registered client is public: PKCE is its only credential, so no secret is
+        // stored or sent for it.
+        plan.client_id = Some(register(client, &plan)?);
     }
     let verifier = base64url(random_bytes(32)?);
     let state = hex(&random_bytes(16)?);
     let authorize = authorize_url(&plan, &verifier, &state);
     notify(&authorize);
-    // Best effort: the URL is in the notice, so it can be opened by hand anywhere.
-    let _ = Command::new("open").arg(&authorize).spawn();
+    // Best effort: the URL is in the notice, so it can be opened by hand anywhere. `--` keeps a
+    // URL that starts with `-` from being read as an `open` option.
+    let _ = Command::new("open").arg("--").arg(&authorize).spawn();
     let code = wait_for_callback(&listener, &plan.callback_path, &state)?;
     exchange(client, url, &plan, &code, &verifier)
 }
@@ -90,6 +93,15 @@ fn plan(
     let authorization_url =
         meta.authorization_url.clone().ok_or_else(|| format!("no OAuth metadata advertised at {url}"))?;
     let token_url = meta.token_url.clone().ok_or_else(|| format!("no token endpoint advertised at {url}"))?;
+    // Both endpoints come from the server's own metadata: refuse what the browser must not open and
+    // what would carry the code and the secret off https.
+    for (label, endpoint) in [("authorization", &authorization_url), ("token", &token_url)] {
+        if !is_safe_endpoint(endpoint) {
+            return Err(format!(
+                "refusing the {label} endpoint {endpoint}: only https, or http on loopback, is accepted"
+            ));
+        }
+    }
     let (uri_port, uri_path) = port_and_path(oauth.redirect_uri.as_deref().unwrap_or_default());
     let callback_path = uri_path
         .or_else(|| oauth.callback_path.clone())
@@ -171,7 +183,10 @@ fn challenge_parameter(challenge: &str, key: &str) -> Option<String> {
 }
 
 /// Dynamic client registration, for a server whose authorization server offers it.
-fn register(client: &reqwest::blocking::Client, plan: &Plan) -> Result<(String, Option<String>), String> {
+///
+/// The client it creates is public (`token_endpoint_auth_method: "none"`), so any secret in the
+/// answer is not one this client is meant to send.
+fn register(client: &reqwest::blocking::Client, plan: &Plan) -> Result<String, String> {
     let url = plan
         .registration_url
         .as_deref()
@@ -198,9 +213,8 @@ fn register(client: &reqwest::blocking::Client, plan: &Plan) -> Result<(String, 
     let id = doc
         .get("client_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{url}: no client_id in the registration answer"))?
-        .to_string();
-    Ok((id, doc.get("client_secret").and_then(Value::as_str).map(ToString::to_string)))
+        .ok_or_else(|| format!("{url}: no client_id in the registration answer"))?;
+    Ok(id.to_string())
 }
 
 /// The URL the browser opens, with the endpoint's own query parameters kept.
@@ -251,12 +265,10 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// `len` bytes from the kernel's entropy pool; a `rand` dependency buys nothing more here.
+/// `len` bytes from the OS entropy source, through the one API every supported platform has.
 fn random_bytes(len: usize) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0_u8; len];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| format!("no system entropy: {e}"))?;
     Ok(bytes)
 }
 
@@ -297,7 +309,7 @@ fn wait_for_callback(listener: &TcpListener, path: &str, state: &str) -> Result<
 fn handle_callback(stream: &mut TcpStream, path: &str, state: &str) -> Option<Result<String, String>> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut line = String::new();
-    BufReader::new(stream.try_clone().ok()?).read_line(&mut line).ok()?;
+    BufReader::new(stream.try_clone().ok()?.take(MAX_REQUEST_LINE)).read_line(&mut line).ok()?;
     let target = line.split_whitespace().nth(1)?.to_string();
     let (request_path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     if request_path != path {
@@ -305,14 +317,16 @@ fn handle_callback(stream: &mut TcpStream, path: &str, state: &str) -> Option<Re
         return None;
     }
     let params = parse_query(query);
+    // The state is checked before anything else, including an `error`, so a cross-site request
+    // cannot cancel a login in progress (RFC 6749 §4.1.2.1).
+    if !state_matches(params.get("state").map(String::as_str), state) {
+        respond(stream, "400 Bad Request", "state mismatch");
+        return Some(Err("the OAuth callback did not carry the state this login sent".into()));
+    }
     if let Some(error) = params.get("error") {
         let detail = params.get("error_description").map_or_else(|| error.clone(), |why| format!("{error}: {why}"));
         respond(stream, "200 OK", "overseer could not sign in; see the terminal");
         return Some(Err(detail));
-    }
-    if params.get("state").map(String::as_str) != Some(state) {
-        respond(stream, "400 Bad Request", "state mismatch");
-        return Some(Err("the OAuth callback did not carry the state this login sent".into()));
     }
     if let Some(code) = params.get("code") {
         respond(stream, "200 OK", "overseer is signed in; close this tab");
@@ -321,6 +335,20 @@ fn handle_callback(stream: &mut TcpStream, path: &str, state: &str) -> Option<Re
         respond(stream, "400 Bad Request", "no code");
         Some(Err("the OAuth callback carried no code".into()))
     }
+}
+
+/// Compares the callback's `state` without stopping at the first difference, so the reply time
+/// says nothing about how much of it was right.
+fn state_matches(received: Option<&str>, expected: &str) -> bool {
+    let Some(received) = received else { return false };
+    let (received, expected) = (received.as_bytes(), expected.as_bytes());
+    let mut difference = received.len() ^ expected.len();
+    for index in 0..received.len().max(expected.len()) {
+        let left = received.get(index).copied().unwrap_or(0);
+        let right = expected.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 /// Answers the browser so its tab does not hang; the body is one line of text.
@@ -396,8 +424,10 @@ pub(crate) fn refresh(client: &reqwest::blocking::Client, credential: &Credentia
 /// When an access token stops being usable, with a minute of slack so it cannot expire between the
 /// check and the request.
 fn expiry(doc: &Value) -> i64 {
-    let ttl = doc.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
-    auth::now() + ttl - 60
+    // `expires_in` is the server's number: clamped so the sum cannot overflow and a TTL shorter
+    // than the slack still leaves a usable token.
+    let ttl = doc.get("expires_in").and_then(Value::as_i64).unwrap_or(3600).clamp(120, 86_400);
+    auth::now().saturating_add(ttl - 60)
 }
 
 /// Reads a token response into a credential; a missing `refresh_token` keeps the previous one.
@@ -464,6 +494,17 @@ fn excerpt(body: &str) -> String {
     format!("{}…", body.get(..end).unwrap_or_default().trim())
 }
 
+/// Whether a server-supplied endpoint may be opened or sent a code: https, or http only on loopback.
+fn is_safe_endpoint(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    let Some(host) = parsed.host_str() else { return false };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1"),
+        _ => false,
+    }
+}
+
 /// `scheme://authority` and the path after it, without a query or a fragment.
 fn split_url(url: &str) -> (String, String) {
     let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
@@ -487,7 +528,8 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(percent_decode(key), percent_decode(value));
+        // First value wins: a repeated code or state is a crafted callback, not a browser quirk.
+        params.entry(percent_decode(key)).or_insert_with(|| percent_decode(value));
     }
     params
 }
@@ -552,6 +594,43 @@ mod tests {
         assert_eq!(params.get("state").map(String::as_str), Some("deadbeef"));
         let error = parse_query("error=access_denied&error_description=no+thanks");
         assert_eq!(error.get("error_description").map(String::as_str), Some("no thanks"));
+    }
+
+    #[test]
+    fn only_https_or_loopback_endpoints_are_accepted() {
+        assert!(is_safe_endpoint("https://auth.example/authorize?x=1"));
+        assert!(is_safe_endpoint("http://127.0.0.1:8765/token"));
+        assert!(is_safe_endpoint("http://localhost:9000/token"));
+        assert!(is_safe_endpoint("http://[::1]:9000/token"));
+        assert!(!is_safe_endpoint("http://auth.example/token"));
+        assert!(!is_safe_endpoint("file:///etc/passwd"));
+        assert!(!is_safe_endpoint("javascript:alert(1)"));
+        assert!(!is_safe_endpoint("-a"));
+        assert!(!is_safe_endpoint(""));
+    }
+
+    #[test]
+    fn the_callback_state_must_match_exactly() {
+        assert!(state_matches(Some("deadbeef"), "deadbeef"));
+        assert!(!state_matches(Some("deadbeee"), "deadbeef"));
+        assert!(!state_matches(Some("deadbee"), "deadbeef"));
+        assert!(!state_matches(Some("deadbeef0"), "deadbeef"));
+        assert!(!state_matches(None, "deadbeef"));
+    }
+
+    #[test]
+    fn an_untrusted_expires_in_cannot_overflow_or_expire_at_once() {
+        let now = auth::now();
+        assert!(expiry(&json!({"expires_in": i64::MAX})) > now);
+        assert!(expiry(&json!({"expires_in": -1})) > now);
+        assert!(expiry(&json!({})) >= now.saturating_add(3539), "the default TTL keeps its slack");
+    }
+
+    #[test]
+    fn a_repeated_query_parameter_keeps_the_first_value() {
+        let params = parse_query("code=good&code=evil&state=a&state=b");
+        assert_eq!(params.get("code").map(String::as_str), Some("good"));
+        assert_eq!(params.get("state").map(String::as_str), Some("a"));
     }
 
     #[test]

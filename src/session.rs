@@ -6,14 +6,20 @@ use crate::swarm::{AgentEvent, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
 use crate::version;
+use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often the loop looks at the shutdown flag, so a frontend that returned cannot be waited on.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 /// Routes events between the frontends and the tree; it never calls a model itself.
 ///
 /// Blocking by design: the model client and every agent are blocking, so a frontend keeps this on its own thread.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(crate) fn run(
     llm: Arc<dyn Llm>,
     cfg: &config::Config,
@@ -22,7 +28,8 @@ pub(crate) fn run(
     events: Receiver<Event>,
     ui: Sender<UiEvent>,
     mcp: Arc<mcp::Registry>,
-) {
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
     let swarm = Arc::new(Mutex::new(Swarm::new(
         llm,
@@ -34,13 +41,21 @@ pub(crate) fn run(
         Arc::clone(&mcp),
     )));
     if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
-        let _ = ui.send(UiEvent::Error(e));
-        return;
+        let _ = ui.send(UiEvent::Error(e.clone()));
+        tools::kill_running();
+        mcp.kill_all();
+        let _ = ui.send(UiEvent::Done);
+        return Err(anyhow::Error::msg(e));
     }
     let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
     // Set when stdin closes: the run ends at the first moment no agent is busy.
     let mut draining = false;
-    while let Ok(event) = events.recv() {
+    while !shutdown.load(Ordering::Relaxed) {
+        let event = match events.recv_timeout(SHUTDOWN_POLL) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match event {
             Event::Exit => break,
             Event::Eof => {
@@ -69,9 +84,14 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Notice(line));
             }
             Event::Resume(arg) => {
-                let line = lock(&swarm).resume(&arg);
+                let (line, agents, busy) = {
+                    let mut tree = lock(&swarm);
+                    let line = tree.resume(&arg);
+                    (line, tree.snapshot(), tree.busy())
+                };
                 let _ = ui.send(UiEvent::Notice(line));
-                let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
+                let _ = ui.send(UiEvent::Agents(agents));
+                let _ = ui.send(UiEvent::Busy(busy));
             }
             Event::Progress { id, progress } => {
                 let _ = ui.send(UiEvent::Progress { id, progress });
@@ -128,6 +148,7 @@ pub(crate) fn run(
     tools::kill_running();
     mcp.kill_all();
     let _ = ui.send(UiEvent::Done);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,7 +187,8 @@ mod tests {
                 input_rx,
                 ui,
                 mcp,
-            );
+                Arc::new(AtomicBool::new(false)),
+            )
         });
         frontend.send(Event::User("hello".into())).unwrap();
         let answer = next_answer(&ui_rx);
@@ -182,7 +204,49 @@ mod tests {
             }
         };
         assert_eq!(done, UiEvent::Done);
-        handle.join().unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
+    /// A core whose root cannot start reports it, then ends the frontend like any other quit.
+    #[test]
+    fn a_failed_start_still_ends_the_frontend() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        // No log directory: the root agent's log file cannot be opened.
+        let logs = root.path().join("missing");
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(Scripted::new(vec![text("unused")])),
+                &cfg,
+                logs,
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match ui_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::Done) => break,
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("a failed start never ended the frontend ({e}); it saw {seen:?}"),
+            }
+        }
+        assert!(seen.iter().any(|event| event.starts_with("Error(")), "{seen:?}");
+        assert!(handle.join().unwrap().is_err());
     }
 
     /// The first answer the frontend prints; on a timeout it names everything else that arrived.

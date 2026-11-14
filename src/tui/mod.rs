@@ -21,6 +21,9 @@ use std::time::Duration;
 /// How long the loop waits for a key before draining the core's events.
 const POLL: Duration = Duration::from_millis(50);
 
+/// Core events applied per loop pass: a burst never starves the next draw or a pressed quit.
+const BATCH: usize = 256;
+
 /// A clipboard read on its way back, with the id of the paste that asked for it.
 type Copied = (u64, clipboard::Paste);
 
@@ -30,24 +33,33 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str, them
     let mut app = App::new(model);
     let mut terminal = ratatui::try_init()?;
     // ratatui's hook leaves raw mode and the alternate screen; these two are modes of ours.
-    release_modes_on_panic();
-    let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let previous = release_modes_on_panic();
+    if let Err(err) = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste) {
+        // The terminal never entered these modes: bring the app's flag in line and say why.
+        app.toggle_mouse();
+        app.apply(UiEvent::Error(format!("cannot enable the mouse and paste modes: {err}")));
+    }
     let result = event_loop(&mut terminal, &mut app, ui, input);
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
+    std::panic::set_hook(Box::new(move |info| previous(info)));
     result
 }
 
 /// Restores the two modes `ratatui::restore` does not own, then lets the hook it installed run.
 ///
 /// Without this a panic leaves the terminal reporting the mouse: the shell then prints escape
-/// sequences on every move, and dragging selects nothing.
-fn release_modes_on_panic() {
-    let hook = std::panic::take_hook();
+/// sequences on every move, and dragging selects nothing. Returns the previous hook so the caller
+/// can put it back once the terminal is restored.
+fn release_modes_on_panic() -> std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> {
+    let hook: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+        std::sync::Arc::from(std::panic::take_hook());
+    let inner = std::sync::Arc::clone(&hook);
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
-        hook(info);
+        inner(info);
     }));
+    hook
 }
 
 /// The channels are owned here: the loop ends the frontend when either side disconnects.
@@ -66,7 +78,7 @@ fn event_loop(
         }
         if event::poll(POLL)? {
             match event::read()? {
-                Input::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, &input, &pasted, key),
+                Input::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, &input, &pasted, key)?,
                 Input::Paste(text) => app.paste(&text),
                 Input::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.wheel(true),
@@ -78,7 +90,9 @@ fn event_loop(
                 _ => {}
             }
         }
-        loop {
+        // A busy core can stream faster than this loop empties; a bounded batch keeps the next
+        // draw, and a just-pressed quit, from waiting on the whole burst.
+        for _ in 0..BATCH {
             match ui.try_recv() {
                 Ok(event) => app.apply(event),
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -104,7 +118,7 @@ fn event_loop(
     }
 }
 
-fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key: KeyEvent) {
+fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -115,7 +129,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
             app.drain();
         }
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
-        KeyCode::F(5) => mouse(app),
+        KeyCode::F(5) => mouse(app)?,
         // A worker view owns the keys while it is open: esc returns to the fleet from there.
         _ if app.in_worker_view() => app.worker_key(key),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
@@ -134,6 +148,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::F(4) => app.toggle_worker_view(),
         _ => app.input(key),
     }
+    Ok(())
 }
 
 /// Ctrl+V: the chip goes up at once and the clipboard is read on a thread of its own.
@@ -152,12 +167,13 @@ fn copy(app: &mut App, pasted: &Sender<Copied>) {
 
 /// F5: captures the mouse for clicks and the wheel, or hands it back so the terminal's own
 /// selection and copy work again.
-fn mouse(app: &mut App) {
+fn mouse(app: &mut App) -> Result<()> {
     if app.toggle_mouse() {
-        let _ = execute!(stdout(), EnableMouseCapture);
+        execute!(stdout(), EnableMouseCapture)?;
     } else {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        execute!(stdout(), DisableMouseCapture)?;
     }
+    Ok(())
 }
 
 fn quit(app: &mut App, input: &Sender<Event>) {
@@ -171,12 +187,12 @@ fn submit(app: &mut App, input: &Sender<Event>) {
         return;
     }
     app.echo(&prompt);
-    match Event::from_line(&prompt) {
-        Some(Event::Exit) => quit(app, input),
-        Some(event) => {
-            let _ = input.send(event);
+    if let Some(event) = Event::from_line(&prompt) {
+        if matches!(event, Event::Exit) {
+            quit(app, input);
+        } else if let Err(err) = input.send(event) {
+            app.apply(UiEvent::Error(format!("cannot reach the core: {err}")));
         }
-        None => {}
     }
 }
 
@@ -189,7 +205,7 @@ mod tests {
     fn press(app: &mut App, code: KeyCode) {
         let (input, queue) = mpsc::channel();
         let (pasted, _reads) = mpsc::channel();
-        handle_key(app, &input, &pasted, KeyEvent::from(code));
+        let _ = handle_key(app, &input, &pasted, KeyEvent::from(code));
         assert!(queue.try_recv().is_err(), "a key pressed in an agent view wakes the core");
     }
 

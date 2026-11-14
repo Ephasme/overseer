@@ -18,6 +18,8 @@ jobs:
   # toolchain is rust-toolchain.toml's: rustup on the runner installs it on the first cargo call.
   check:
     strategy:
+      # Both platforms report: a macOS-only break must not be masked by a Linux failure.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -45,7 +47,8 @@ jobs:
   # A v* tag builds one binary per target, then a single job publishes them; the homebrew job points the tap at them.
   build:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: check
+    # hygiene too: a tag whose advisories or licences fail must not publish.
+    needs: [check, hygiene]
     strategy:
       matrix:
         include:
@@ -57,6 +60,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Tag matches the crate version
         run: test "v$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" = "$GITHUB_REF_NAME"
       # The pinned toolchain (rust-toolchain.toml), plus the release target.
@@ -93,6 +97,8 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Cross-repository write credential: released only once this environment allows the run.
+    environment: homebrew-tap
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -108,5 +114,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "overseer ${GITHUB_REF_NAME#v}"
+          # A re-run of the same tag finds the tap already updated: an empty commit exits 1 and would fail
+          # the job after the release was published.
+          git add -u
+          if git diff --cached --quiet; then
+            echo "tap already at ${GITHUB_REF_NAME#v}"
+            exit 0
+          fi
+          git commit -m "overseer ${GITHUB_REF_NAME#v}"
           git push

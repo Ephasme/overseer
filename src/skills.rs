@@ -40,12 +40,15 @@ impl Catalogue {
     /// The user's skills plus those of the project `dir` sits in; the project wins a bare name.
     pub(crate) fn in_dir(home: &Path, dir: &Path) -> Self {
         let mut found = Vec::new();
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
         for ancestor in dir.ancestors() {
-            // Home is covered by the user roots, which come after the project's.
-            if ancestor != home {
-                for suffix in PROJECT_ROOTS {
-                    scan(&ancestor.join(suffix), &mut found);
-                }
+            // Home is covered by the user roots, which come after the project's, so the walk stops
+            // there instead of scanning every directory up to the filesystem root.
+            if ancestor == home.as_path() || ancestor.canonicalize().is_ok_and(|path| path == home) {
+                break;
+            }
+            for suffix in PROJECT_ROOTS {
+                scan(&ancestor.join(suffix), &mut found);
             }
             if ancestor.join(".git").exists() {
                 break;
@@ -116,8 +119,8 @@ impl Catalogue {
             Ok(_) => {}
             Err(e) => return Err(config::io_error(name, &e)),
         }
-        if resolved.is_dir() {
-            return Err(format!("{name}: {label} is a directory"));
+        if !resolved.is_file() {
+            return Err(format!("{name}: {label} is not a regular file"));
         }
         let href = format!("skill://{target}");
         let (text, cut) = tools::read_limited(&resolved, &href)?;
@@ -155,7 +158,7 @@ fn load(dir: &Path) -> Option<Skill> {
         Some(name) => name.to_string(),
         None => dir.file_name()?.to_string_lossy().into_owned(),
     };
-    if name.contains('/') || name.contains('\\') {
+    if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
         return None;
     }
     Some(Skill {
@@ -201,8 +204,8 @@ fn parse(text: &str) -> (HashMap<String, String>, &str) {
         if key.is_empty() {
             continue;
         }
-        let value = value.trim();
-        let block = matches!(value, "" | ">" | ">-" | "|" | "|-");
+        let value = scalar(value.trim());
+        let block = matches!(value, "" | ">" | ">-" | ">+" | "|" | "|-" | "|+");
         if !block {
             fields.insert(key.to_string(), unquote(value).to_string());
             continue;
@@ -230,7 +233,7 @@ fn parse(text: &str) -> (HashMap<String, String>, &str) {
         let dedented: Vec<&str> =
             body.iter().map(|line| line.get(indent.min(line.len())..).unwrap_or_default()).collect();
         let literal = value.starts_with('|');
-        let keep_newline = value.len() == 1;
+        let keep_newline = matches!(value, "|" | ">" | "|+" | ">+");
         let mut joined = String::new();
         if literal {
             joined = dedented.join("\n");
@@ -257,6 +260,18 @@ fn parse(text: &str) -> (HashMap<String, String>, &str) {
         fields.insert(key.to_string(), joined);
     }
     (fields, after.get(consumed..).unwrap_or_default().trim())
+}
+
+/// A scalar with a trailing YAML comment removed; a quoted scalar keeps any `#` it holds.
+fn scalar(value: &str) -> &str {
+    if let Some(quote) = value.chars().next().filter(|c| matches!(*c, '\'' | '"')) {
+        let rest = value.get(1..).unwrap_or_default();
+        return rest.find(quote).map_or(value, |end| value.get(..end + 2).unwrap_or(value));
+    }
+    if value.starts_with('#') {
+        return "";
+    }
+    value.split_once(" #").map_or(value, |(scalar, _)| scalar.trim_end())
 }
 
 /// A plain scalar without the one pair of quotes around it.
@@ -295,6 +310,12 @@ mod tests {
         assert_eq!(fields.get("description").map(String::as_str), Some("one\n"));
         let (fields, _) = parse("---\ndescription: \"quoted: value\"\n---\n");
         assert_eq!(fields.get("description").map(String::as_str), Some("quoted: value"));
+        let (fields, _) = parse("---\ndescription: > # note\n  one\n  two\n---\n");
+        assert_eq!(fields.get("description").map(String::as_str), Some("one two\n"));
+        let (fields, _) = parse("---\ndescription: foo # comment\n---\n");
+        assert_eq!(fields.get("description").map(String::as_str), Some("foo"));
+        let (fields, _) = parse("---\ndescription: |+\n  one\n---\n");
+        assert_eq!(fields.get("description").map(String::as_str), Some("one\n"));
         let (fields, body) = parse("no frontmatter here");
         assert!(fields.is_empty());
         assert_eq!(body, "no frontmatter here");
@@ -305,9 +326,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         skill(root.path(), "caveman", "description: be brief");
         skill(root.path(), "wrong", "name: a/b\ndescription: escaped");
+        skill(root.path(), "injected", "name: |-\n  a\n  b\ndescription: escaped");
         let catalogue = Catalogue::user(Path::new("/nonexistent-home"));
         let named = Catalogue::build(
-            [root.path().join("caveman"), root.path().join("wrong")].into_iter().filter_map(|dir| load(&dir)).collect(),
+            [root.path().join("caveman"), root.path().join("wrong"), root.path().join("injected")]
+                .into_iter()
+                .filter_map(|dir| load(&dir))
+                .collect(),
         );
         assert_eq!(catalogue.catalogue(), "");
         assert_eq!(named.catalogue(), "- caveman: be brief");
