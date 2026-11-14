@@ -93,17 +93,14 @@ fn expand_home(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Canonical repository directory, or why the worker may not use it.
-pub(crate) fn resolve_repo(roots: &[PathBuf], repo: &str) -> Result<PathBuf, String> {
-    let path = fs::canonicalize(expand_home(repo, &home())).map_err(|e| format!("{repo}: {e}"))?;
-    if !path.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
+/// Canonical directory a worker works in, or why the path is unusable.
+pub(crate) fn resolve_dir(path: &str) -> Result<PathBuf, String> {
+    let expanded = expand_home(path, &home());
+    let canonical = fs::canonicalize(&expanded).map_err(|e| format!("{}: {e}", expanded.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
     }
-    if roots.iter().any(|root| path.starts_with(root)) {
-        return Ok(path);
-    }
-    let allowed: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
-    Err(format!("{} is outside the configured roots: {}", path.display(), allowed.join(", ")))
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -136,18 +133,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_repo_enforces_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("repo")).unwrap();
-        let roots = vec![fs::canonicalize(root.path()).unwrap()];
-        let inside = root.path().join("repo");
-        assert_eq!(resolve_repo(&roots, inside.to_str().unwrap()).unwrap(), fs::canonicalize(&inside).unwrap());
-        assert!(
-            resolve_repo(&roots, outside.path().to_str().unwrap())
-                .unwrap_err()
-                .contains("is outside the configured roots")
+    fn resolve_dir_accepts_existing_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+        assert_eq!(resolve_dir(dir.path().to_str().unwrap()).unwrap(), fs::canonicalize(dir.path()).unwrap());
+        let canonical = fs::canonicalize(&file).unwrap();
+        assert_eq!(
+            resolve_dir(file.to_str().unwrap()).unwrap_err(),
+            format!("{} is not a directory", canonical.display())
         );
-        assert!(resolve_repo(&roots, "/nonexistent/overseer").unwrap_err().starts_with("/nonexistent/overseer:"));
+        assert!(resolve_dir("/nonexistent/overseer").unwrap_err().starts_with("/nonexistent/overseer:"));
     }
 }

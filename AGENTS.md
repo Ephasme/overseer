@@ -32,11 +32,13 @@
 | `src/config.rs` | `config.toml`, roots, `resolve_repo`, `~/.config/overseer/.env`, state directory |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
 | `.github/scripts/update-formula.sh` | rewrites the tap's formula from a release |
-| `justfile` | `just install` and `just check` |
+| `justfile` | `just install`, `just run`, `just check` |
 
 ## Key conventions
 
 - Handle errors with `Result`; outside tests, `unwrap`, `panic!`, slice indexing and `as` casts fail the lints.
 - A tool failure goes back to the model as text starting `error: `; it never aborts a turn.
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
+- Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
+- Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.

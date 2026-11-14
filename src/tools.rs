@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -28,30 +29,45 @@ pub(crate) fn definitions() -> Value {
     ])
 }
 
+/// Arguments of each worker tool. `deny_unknown_fields` turns a wrong key into an error naming the right ones.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashArgs {
+    command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
 /// Runs one tool call inside `cwd`; the returned string goes back to the model as the tool result.
 pub(crate) fn execute(cwd: &Path, name: &str, arguments: &str) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(e) => return format!("error: invalid arguments: {e}"),
-    };
     let result = match name {
-        "bash" => bash(cwd, &args),
-        "read_file" => read_file(cwd, &args),
-        "write_file" => write_file(cwd, &args),
+        "bash" => parse::<BashArgs>(arguments).and_then(|args| bash(cwd, &args)),
+        "read_file" => parse::<ReadArgs>(arguments).and_then(|args| read_file(cwd, &args)),
+        "write_file" => parse::<WriteArgs>(arguments).and_then(|args| write_file(cwd, &args)),
         _ => Err(format!("unknown tool {name}")),
     };
     truncate(result.unwrap_or_else(|e| format!("error: {e}")))
 }
 
-pub(crate) fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| format!("missing string argument '{key}'"))
+fn parse<'a, T: Deserialize<'a>>(arguments: &'a str) -> Result<T, String> {
+    serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))
 }
 
-fn bash(cwd: &Path, args: &Value) -> Result<String, String> {
-    let command = str_arg(args, "command")?;
+fn bash(cwd: &Path, args: &BashArgs) -> Result<String, String> {
     let out = Command::new("sh")
         .arg("-c")
-        .arg(command)
+        .arg(&args.command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .output()
@@ -64,20 +80,17 @@ fn bash(cwd: &Path, args: &Value) -> Result<String, String> {
     ))
 }
 
-fn read_file(cwd: &Path, args: &Value) -> Result<String, String> {
-    let path = str_arg(args, "path")?;
-    fs::read_to_string(cwd.join(path)).map_err(|e| format!("{path}: {e}"))
+fn read_file(cwd: &Path, args: &ReadArgs) -> Result<String, String> {
+    fs::read_to_string(cwd.join(&args.path)).map_err(|e| format!("{}: {e}", args.path))
 }
 
-fn write_file(cwd: &Path, args: &Value) -> Result<String, String> {
-    let path = str_arg(args, "path")?;
-    let content = str_arg(args, "content")?;
-    let full = cwd.join(path);
+fn write_file(cwd: &Path, args: &WriteArgs) -> Result<String, String> {
+    let full = cwd.join(&args.path);
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    fs::write(&full, content).map_err(|e| format!("{path}: {e}"))?;
-    Ok(format!("wrote {} bytes to {path}", content.len()))
+    fs::write(&full, &args.content).map_err(|e| format!("{}: {e}", args.path))?;
+    Ok(format!("wrote {} bytes to {}", args.content.len(), args.path))
 }
 
 fn truncate(mut s: String) -> String {
@@ -121,7 +134,11 @@ mod tests {
         let root = Path::new("/");
         assert!(execute(root, "read_file", r#"{"path":"/nonexistent/x"}"#).starts_with("error: /nonexistent/x:"));
         assert!(execute(root, "bash", "not json").starts_with("error: invalid arguments:"));
-        assert_eq!(execute(root, "bash", "{}"), "error: missing string argument 'command'");
+        assert!(execute(root, "bash", "{}").starts_with("error: invalid arguments: missing field `command`"));
+        assert!(
+            execute(root, "bash", r#"{"command":"ls","path":"x"}"#)
+                .starts_with("error: invalid arguments: unknown field `path`, expected `command`")
+        );
         assert_eq!(execute(root, "nope", "{}"), "error: unknown tool nope");
     }
 

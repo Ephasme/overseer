@@ -6,6 +6,11 @@ install:
     mkdir -p "$HOME/.local/bin"
     install -m 755 target/release/overseer "$HOME/.local/bin/overseer"
 
+# Run the built binary by path: a shell may still hash Homebrew's copy under the same name.
+run *args:
+    cargo build --release --locked
+    ./target/release/overseer {{args}}
+
 # Every check CI runs.
 check:
     cargo fmt --all --check

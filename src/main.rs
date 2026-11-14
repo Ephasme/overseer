@@ -61,7 +61,11 @@ fn main() -> Result<()> {
         };
         let mut execute = |call: &ToolCall| {
             eprintln!("· {} {}", call.function.name, call.function.arguments);
-            fleet.execute(call)
+            let result = fleet.execute(call);
+            if std::env::var_os("OVERSEER_DEBUG").is_some() {
+                eprintln!("  → {result}");
+            }
+            result
         };
         match agent::run_turn(llm.as_ref(), &mut history, &input, &tool_defs, &mut execute) {
             Ok(answer) if !answer.is_empty() => println!("{answer}"),
