@@ -1,5 +1,6 @@
 use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
+use crate::tools;
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -14,8 +15,8 @@ use unicode_width::UnicodeWidthChar;
 /// Frames of the busy spinner.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Rows of a tool result the transcript shows before counting the rest.
-const TOOL_LINES: usize = 6;
+/// Shortest call worth timing: below it the number is noise, not information.
+const TIMED: f64 = 0.1;
 
 /// Rows the composer grows to before it scrolls.
 const COMPOSER_ROWS: u16 = 8;
@@ -33,7 +34,7 @@ const TICK: Duration = Duration::from_millis(120);
 const PREVIEW_CHARS: usize = 400;
 
 /// Key hints on the right of the status line.
-const HINT: &str = "enter send · ctrl+j newline · F2 workers · ctrl+d quit";
+const HINT: &str = "enter send · F2 workers · F3 output · ctrl+j newline · ctrl+d quit";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -48,9 +49,9 @@ const YELLOW: Color = Color::Yellow;
 enum Role {
     You,
     Overseer,
+    /// A tool call, by the overseer or by one of its workers.
     Tool,
     Worker(WorkerEvent),
-    Progress,
     Notice,
     Error,
     Debug,
@@ -60,29 +61,64 @@ struct Entry {
     role: Role,
     /// Tool name, or the worker label.
     title: String,
-    /// What the entry says: a message, a tool summary, a worker verb.
+    /// What the entry says: a message, what a tool call acts on, a worker verb.
     body: String,
-    /// Tool result, once the call returns.
+    /// `[w1] ` on a worker's tool call; empty for the overseer's own.
+    label: String,
+    /// The head of a tool result, once the call returns.
     output: Option<String>,
+    /// A tool call's verdict, such as `exit 3`.
+    status: String,
+    /// Result lines beyond the ones shown.
+    more: usize,
+    failed: bool,
     secs: Option<f64>,
 }
 
 impl Entry {
     fn new(role: Role, title: String, body: String) -> Self {
-        Self { role, title, body, output: None, secs: None }
+        Self {
+            role,
+            title,
+            body,
+            label: String::new(),
+            output: None,
+            status: String::new(),
+            more: 0,
+            failed: false,
+            secs: None,
+        }
     }
 
-    fn finish(&mut self, output: String, secs: f64) {
-        self.output = Some(output);
+    /// A tool call's entry, opening with the worker that made it when one did.
+    fn tool(tool: String, summary: String, worker: Option<usize>) -> Self {
+        let mut entry = Self::new(Role::Tool, tool, summary);
+        if let Some(id) = worker {
+            entry.label = format!("[w{id}] ");
+        }
+        entry
+    }
+
+    fn finish(&mut self, preview: tools::Preview, secs: f64) {
+        self.output = Some(preview.head);
+        self.status = preview.status;
+        self.more = preview.more;
+        self.failed = preview.failed;
         self.secs = Some(secs);
     }
 
-    fn lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// Closes a call whose owner stopped before it could report.
+    fn abandon(&mut self) {
+        self.output = Some("(no result: its worker stopped)".into());
+        self.failed = true;
+    }
+
+    fn lines(&self, width: u16, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let width = usize::from(width).max(8);
         match self.role {
             Role::You => block("› ", Style::new().fg(CYAN), &self.body, Style::new(), width),
             Role::Overseer => block("● ", Style::new().fg(MAGENTA), &self.body, Style::new(), width),
-            Role::Tool => self.tool_lines(width),
+            Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
                     WorkerEvent::Reply => ("says", CYAN),
@@ -92,48 +128,73 @@ impl Entry {
                 let prefix = format!("[{}] {label} ", self.title);
                 block(&prefix, Style::new().fg(colour), &self.body, Style::new(), width)
             }
-            Role::Progress => {
-                vec![Line::from(Span::styled(truncate(&format!("· {} {}", self.title, self.body), width), DIM))]
-            }
             Role::Notice => block("· ", Style::new().fg(BLUE), &self.body, DIM, width),
             Role::Error => block("error ", Style::new().fg(RED), &self.body, Style::new().fg(RED), width),
             Role::Debug => block("… ", DIM, &self.body, DIM, width),
         }
     }
 
-    fn tool_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let head = if self.body.is_empty() {
-            format!("⚙ {}", self.title)
+    /// A tool call: a header naming what it acts on, then the head of what it returned.
+    fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
+        let (glyph, colour) = if self.output.is_none() {
+            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), YELLOW)
+        } else if self.failed {
+            ("✕", RED)
         } else {
-            format!("⚙ {} {}", self.title, self.body)
+            ("✓", GREEN)
         };
-        let mut lines = vec![Line::from(Span::styled(truncate(&head, width), Style::new().fg(YELLOW)))];
-        let Some(output) = &self.output else {
-            lines.push(Line::from(Span::styled("  … running", DIM)));
+        let mut chips: Vec<String> = Vec::new();
+        if !self.status.is_empty() {
+            chips.push(self.status.clone());
+        }
+        if let Some(secs) = self.secs.filter(|secs| *secs >= TIMED) {
+            chips.push(format!("{secs:.1}s"));
+        }
+        let chips = if chips.is_empty() { String::new() } else { format!(" · {}", chips.join(" · ")) };
+        let action = if self.body.is_empty() {
+            verb(&self.title).to_string()
+        } else {
+            format!("{} {}", verb(&self.title), self.body)
+        };
+        let lead = text_width(&self.label) + 1 + text_width(glyph);
+        let room = width.saturating_sub(lead + text_width(&chips)).max(12);
+        let mut lines = vec![Line::from(vec![
+            Span::styled(self.label.clone(), DIM),
+            Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+            Span::styled(truncate(&action, room), Style::new().fg(YELLOW)),
+            Span::styled(chips, DIM),
+        ])];
+        let Some(output) = &self.output else { return lines };
+        if !expand {
             return lines;
-        };
-        let failed = output.starts_with("error:");
-        let style = if failed { Style::new().fg(RED) } else { DIM };
+        }
+        let style = if self.failed { Style::new().fg(RED) } else { DIM };
         let mut rows: Vec<String> = Vec::new();
         for source in output.trim_end().lines() {
-            rows.extend(wrap(source, width.saturating_sub(2)));
+            rows.extend(wrap(source, width.saturating_sub(4)));
         }
-        if rows.is_empty() {
+        let hidden = self.more + rows.len().saturating_sub(tools::PREVIEW_LINES);
+        if rows.is_empty() && hidden == 0 {
             rows.push("(no output)".into());
         }
-        let total = rows.len();
-        for row in rows.iter().take(TOOL_LINES) {
-            lines.push(Line::from(vec![Span::raw("  "), Span::styled(row.clone(), style)]));
+        for row in rows.iter().take(tools::PREVIEW_LINES) {
+            lines.push(Line::from(vec![Span::styled("  │ ", DIM), Span::styled(row.clone(), style)]));
         }
-        if total > TOOL_LINES {
-            lines.push(Line::from(Span::styled(format!("  … {} more lines", total - TOOL_LINES), DIM)));
-        }
-        if let Some(secs) = self.secs
-            && let Some(head) = lines.first_mut()
-        {
-            head.spans.push(Span::styled(format!("  {secs:.1}s"), DIM));
+        if hidden > 0 {
+            let plural = if hidden == 1 { "line" } else { "lines" };
+            lines.push(Line::from(Span::styled(format!("  │ … {hidden} more {plural}"), DIM)));
         }
         lines
+    }
+}
+
+/// How a tool call reads: a shell command is `$`, the file tools say what they do.
+fn verb(tool: &str) -> &str {
+    match tool {
+        tools::BASH => "$",
+        tools::READ_FILE => "read",
+        tools::WRITE_FILE => "write",
+        other => other,
     }
 }
 
@@ -260,8 +321,10 @@ pub(super) struct App {
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
     recall: Option<usize>,
-    /// Where each tool call's entry landed, by the id the core sends.
+    /// Where each overseer tool call's entry landed, by the id the core sends.
     tools: Vec<Option<usize>>,
+    /// Where each worker tool call's entry landed: (worker, its call number, entry index).
+    calls: Vec<(usize, usize, usize)>,
     /// Index of the entry the overseer's streamed text is filling.
     live: Option<usize>,
     workers: Vec<WorkerView>,
@@ -274,6 +337,8 @@ pub(super) struct App {
     /// Height and total rows of the last transcript frame.
     view: (u16, u16),
     worker_panel: bool,
+    /// Show what each tool call returned; off shows one row per call.
+    tool_output: bool,
     busy: bool,
     busy_since: Instant,
     last_tick: Instant,
@@ -297,6 +362,7 @@ impl App {
             history: Vec::new(),
             recall: None,
             tools: Vec::new(),
+            calls: Vec::new(),
             live: None,
             workers: Vec::new(),
             previews: Vec::new(),
@@ -304,6 +370,7 @@ impl App {
             scroll: 0,
             view: (0, 0),
             worker_panel: true,
+            tool_output: true,
             busy: false,
             busy_since: Instant::now(),
             last_tick: Instant::now(),
@@ -325,7 +392,7 @@ impl App {
             UiEvent::TurnBoundary => self.boundary(),
             UiEvent::ToolStarted { id, tool, summary } => {
                 let index = self.entries.len();
-                self.entries.push(Entry::new(Role::Tool, tool, summary));
+                self.entries.push(Entry::tool(tool, summary, None));
                 self.entry_rows.push(0);
                 self.invalidate(index);
                 if self.tools.len() <= id {
@@ -335,10 +402,10 @@ impl App {
                     *slot = Some(index);
                 }
             }
-            UiEvent::ToolFinished { id, output, secs } => {
+            UiEvent::ToolFinished { id, preview, secs } => {
                 let index = self.tools.get(id).copied().flatten();
                 if let Some(entry) = index.and_then(|i| self.entries.get_mut(i)) {
-                    entry.finish(output, secs);
+                    entry.finish(preview, secs);
                 }
                 if let Some(index) = index {
                     self.invalidate(index);
@@ -349,12 +416,11 @@ impl App {
                 self.push(Role::Worker(kind), format!("worker {id}"), text);
             }
             UiEvent::WorkerDelta { id, text } => self.preview(id, &text),
-            UiEvent::Progress { id, progress } => {
-                if let Progress::Finished { tool, secs } = progress {
-                    self.push(Role::Progress, format!("worker {id}"), format!("{tool} · {secs:.1}s"));
-                }
+            UiEvent::Progress { id, progress } => self.progress(id, progress),
+            UiEvent::Workers(workers) => {
+                self.workers = workers;
+                self.close_dead_calls();
             }
-            UiEvent::Workers(workers) => self.workers = workers,
             UiEvent::Busy(moving) => {
                 self.busy = moving;
                 if moving {
@@ -367,6 +433,44 @@ impl App {
                 }
             }
             UiEvent::Done => self.quit = true,
+        }
+    }
+
+    /// A worker's tool call: one entry that opens when it starts and closes when it returns.
+    fn progress(&mut self, id: usize, progress: Progress) {
+        match progress {
+            Progress::Started { call, tool, summary } => {
+                let index = self.entries.len();
+                self.entries.push(Entry::tool(tool, summary, Some(id)));
+                self.entry_rows.push(0);
+                self.calls.push((id, call, index));
+                self.invalidate(index);
+            }
+            Progress::Finished { call, secs, preview, .. } => {
+                let Some(slot) = self.calls.iter().position(|(worker, seq, _)| *worker == id && *seq == call) else {
+                    return;
+                };
+                let (_, _, index) = self.calls.swap_remove(slot);
+                if let Some(entry) = self.entries.get_mut(index) {
+                    entry.finish(preview, secs);
+                }
+                self.invalidate(index);
+            }
+        }
+    }
+
+    /// A worker that stopped mid-call leaves a call that will never return; it closes as failed.
+    fn close_dead_calls(&mut self) {
+        while let Some(slot) = self
+            .calls
+            .iter()
+            .position(|(worker, _, _)| self.workers.iter().any(|view| view.id == *worker && view.finished))
+        {
+            let (_, _, index) = self.calls.swap_remove(slot);
+            if let Some(entry) = self.entries.get_mut(index) {
+                entry.abandon();
+            }
+            self.invalidate(index);
         }
     }
 
@@ -462,7 +566,11 @@ impl App {
             if !self.transcript.is_empty() {
                 self.transcript.push(Line::default());
             }
-            let lines = self.entries.get(index).map_or_else(Vec::new, |entry| entry.lines(self.transcript_width));
+            let (spinning, expand) = (self.spinning, self.tool_output);
+            let lines = self
+                .entries
+                .get(index)
+                .map_or_else(Vec::new, |entry| entry.lines(self.transcript_width, spinning, expand));
             if let Some(slot) = self.entry_rows.get_mut(index) {
                 *slot = lines.len();
             }
@@ -483,12 +591,17 @@ impl App {
         self.dirty = true;
     }
 
-    /// Advances the spinner.
+    /// Advances the spinner, which turns for a thinking overseer and for a tool call in flight.
     pub(super) fn tick(&mut self) {
-        if self.busy && self.last_tick.elapsed() >= TICK {
-            self.last_tick = Instant::now();
-            self.spinning = self.spinning.wrapping_add(1);
-            self.dirty = true;
+        let running = self.entries.iter().position(|entry| entry.role == Role::Tool && entry.output.is_none());
+        if (!self.busy && running.is_none()) || self.last_tick.elapsed() < TICK {
+            return;
+        }
+        self.last_tick = Instant::now();
+        self.spinning = self.spinning.wrapping_add(1);
+        self.dirty = true;
+        if let Some(index) = running {
+            self.invalidate(index);
         }
     }
 
@@ -596,7 +709,7 @@ impl App {
         }
         let used = Line::from(spans.clone()).width();
         let room = usize::from(area.width).saturating_sub(used + HINT.len() + 1);
-        spans.push(Span::raw(" ".repeat(room)));
+        spans.push(Span::raw(" ".repeat(room.max(1))));
         spans.push(Span::styled(HINT, DIM));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -630,6 +743,13 @@ impl App {
 
     pub(super) fn toggle_workers(&mut self) {
         self.worker_panel = !self.worker_panel;
+        self.dirty = true;
+    }
+
+    /// Hides or shows what tool calls returned; every entry changes height, so the cache is dropped.
+    pub(super) fn toggle_tool_output(&mut self) {
+        self.tool_output = !self.tool_output;
+        self.dirty_from = 0;
         self.dirty = true;
     }
 
@@ -785,13 +905,75 @@ mod tests {
     fn apply_pairs_tool_calls_with_their_results() {
         let mut app = App::new("m");
         app.apply(UiEvent::ToolStarted { id: 3, tool: "spawn_worker".into(), summary: "/tmp · do it".into() });
-        let started = row_text(&app.entries[0].lines(80));
-        assert!(started.contains("running"), "{started}");
-        app.apply(UiEvent::ToolFinished { id: 3, output: "worker 1 started".into(), secs: 0.4 });
-        let finished = row_text(&app.entries[0].lines(80));
-        assert!(finished.contains("worker 1 started"), "{finished}");
-        assert!(finished.contains("spawn_worker"), "{finished}");
+        let started = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(started.contains("⠋ spawn_worker /tmp · do it"), "{started}");
+        app.apply(UiEvent::ToolFinished {
+            id: 3,
+            preview: tools::preview("spawn_worker", "worker 1 started"),
+            secs: 0.4,
+        });
+        let finished = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(finished.contains("✓ spawn_worker /tmp · do it"), "{finished}");
         assert!(finished.contains("0.4s"), "{finished}");
+        assert!(finished.contains("│ worker 1 started"), "{finished}");
+    }
+
+    #[test]
+    fn a_worker_tool_call_shows_its_command_then_the_head_of_its_output() {
+        let mut app = App::new("m");
+        let started = Progress::Started { call: 7, tool: tools::BASH.into(), summary: "cargo test".into() };
+        app.apply(UiEvent::Progress { id: 2, progress: started });
+        let head = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(head.contains("[w2]"), "{head}");
+        assert!(head.contains("$ cargo test"), "{head}");
+        let output = "exit code: 0\nstdout:\none\ntwo\nthree\nfour\nfive\nsix\nstderr:\n";
+        let preview = tools::preview(tools::BASH, output);
+        let finished = Progress::Finished { call: 7, secs: 2.4, preview };
+        app.apply(UiEvent::Progress { id: 2, progress: finished });
+        let text = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(text.contains("✓ $ cargo test"), "{text}");
+        assert!(text.contains("2.4s"), "{text}");
+        assert!(text.contains("│ one"), "{text}");
+        assert!(!text.contains("five"), "only the head is shown: {text}");
+        assert!(text.contains("… 2 more lines"), "{text}");
+        assert!(!text.contains("stdout:"), "the result's scaffolding is not output: {text}");
+        assert_eq!(app.entries[0].lines(80, 0, false).len(), 1, "F3 leaves one row per call");
+    }
+
+    #[test]
+    fn a_failed_command_shows_its_exit_code_and_error() {
+        let mut app = App::new("m");
+        let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "cargo build".into() };
+        app.apply(UiEvent::Progress { id: 1, progress: started });
+        let output = "exit code: 101\nstdout:\nstderr:\nerror[E0308]: mismatched types\n";
+        let preview = tools::preview(tools::BASH, output);
+        let finished = Progress::Finished { call: 0, secs: 0.5, preview };
+        app.apply(UiEvent::Progress { id: 1, progress: finished });
+        let text = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(text.contains("✕ $ cargo build"), "{text}");
+        assert!(text.contains("exit 101"), "{text}");
+        assert!(text.contains("error[E0308]"), "{text}");
+    }
+
+    #[test]
+    fn a_dead_worker_closes_the_call_it_left_running() {
+        let mut app = App::new("m");
+        let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "sleep 900".into() };
+        app.apply(UiEvent::Progress { id: 1, progress: started });
+        app.workers = vec![WorkerView {
+            id: 1,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "wait".into(),
+            pending: 1,
+            failed: false,
+            finished: true,
+            busy_for: Some(Duration::from_secs(9)),
+        }];
+        app.apply(UiEvent::Workers(app.workers.clone()));
+        assert!(app.calls.is_empty(), "a call that can never return is unpaired");
+        let text = row_text(&app.entries[0].lines(80, 0, true));
+        assert!(text.contains("no result"), "{text}");
+        assert!(!text.contains('⠋'), "a stopped worker never keeps the spinner turning: {text}");
     }
 
     #[test]
@@ -812,7 +994,7 @@ mod tests {
         app.apply(UiEvent::TurnBoundary);
         app.apply(UiEvent::Delta("second call".into()));
         assert_eq!(app.entries[0].body, "first call\n\nsecond call");
-        assert_eq!(app.entries[0].lines(40).len(), 3);
+        assert_eq!(app.entries[0].lines(40, 0, true).len(), 3);
     }
 
     #[test]
@@ -952,7 +1134,7 @@ mod tests {
         app.apply(UiEvent::ToolStarted { id: 0, tool: "bash".into(), summary: "ls".into() });
         app.apply(UiEvent::Answer("after".into()));
         screen(&mut app, 60, 16);
-        app.apply(UiEvent::ToolFinished { id: 0, output: "done".into(), secs: 1.0 });
+        app.apply(UiEvent::ToolFinished { id: 0, preview: tools::preview(tools::BASH, "done"), secs: 1.0 });
         assert_eq!(app.dirty_from, 0);
         let rendered = screen(&mut app, 60, 16);
         assert!(rendered.contains("done"), "{rendered}");

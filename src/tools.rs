@@ -50,6 +50,70 @@ pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
 
+/// Output lines a tool result shows before the rest is only counted.
+pub(crate) const PREVIEW_LINES: usize = 4;
+
+/// Longest column of one previewed output line.
+const PREVIEW_WIDTH: usize = 160;
+
+/// What a tool result shows at a glance: a verdict, the head of its output, and what it hid.
+///
+/// The tool result itself is what the model reads, and stays the whole text.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Preview {
+    /// A one-line verdict such as `exit 3`; empty when the output speaks for itself.
+    pub(crate) status: String,
+    /// The first lines of output, newline separated.
+    pub(crate) head: String,
+    /// Output lines past `head`.
+    pub(crate) more: usize,
+    pub(crate) failed: bool,
+}
+
+/// Distils a tool result for display, so a chatty command does not flood the transcript.
+pub(crate) fn preview(name: &str, output: &str) -> Preview {
+    let mut failed = output.starts_with("error:");
+    let mut status = String::new();
+    let mut rows: Vec<&str> = Vec::new();
+    for line in output.trim_end().lines() {
+        if let Some(code) = line.strip_prefix("exit code: ") {
+            failed |= code != "0";
+            if failed {
+                status = format!("exit {code}");
+            }
+            continue;
+        }
+        // The two stream labels describe the result's shape, not what the command did.
+        if line == "stdout:" || line == "stderr:" {
+            continue;
+        }
+        if line.starts_with("killed after ") {
+            status = line.to_string();
+            failed = true;
+            continue;
+        }
+        rows.push(line);
+    }
+    let mut rows: Vec<&str> = rows.into_iter().skip_while(|row| row.trim().is_empty()).collect();
+    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+        rows.pop();
+    }
+    if status.is_empty() && name == READ_FILE && !rows.is_empty() {
+        status = format!("{} lines", rows.len());
+    }
+    let head: Vec<String> = rows.iter().take(PREVIEW_LINES).map(|row| shorten(row, PREVIEW_WIDTH)).collect();
+    Preview { status, head: head.join("\n"), more: rows.len().saturating_sub(PREVIEW_LINES), failed }
+}
+
+/// `text` in at most `width` characters, the cut marked with an ellipsis.
+pub(crate) fn shorten(text: &str, width: usize) -> String {
+    let mut short: String = text.chars().take(width).collect();
+    if text.chars().count() > width {
+        short.push('…');
+    }
+    short
+}
+
 /// Schemas of the file and shell tools every worker gets.
 pub(crate) fn definitions() -> Value {
     json!([
@@ -336,6 +400,24 @@ mod tests {
                 "{name} is defined but not dispatched"
             );
         }
+    }
+
+    #[test]
+    fn preview_separates_the_verdict_from_the_output() {
+        let ok = preview(BASH, "exit code: 0\nstdout:\na\nb\nstderr:\n");
+        assert_eq!(ok.status, "", "a success needs no chip");
+        assert_eq!(ok.head, "a\nb");
+        assert_eq!(ok.more, 0);
+        assert!(!ok.failed);
+        let failed = preview(BASH, "exit code: 2\nstdout:\nstderr:\nmissing\n");
+        assert_eq!(failed.status, "exit 2");
+        assert!(failed.failed);
+        assert_eq!(failed.head, "missing");
+        let file = (1..=9).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let read = preview(READ_FILE, &file);
+        assert_eq!(read.status, "9 lines");
+        assert_eq!(read.head.lines().count(), PREVIEW_LINES);
+        assert_eq!(read.more, 9 - PREVIEW_LINES);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
+use crate::tools;
 
 /// Everything the core asks a frontend to show. The core itself never prints.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,8 +18,8 @@ pub(crate) enum UiEvent {
     Answer(String),
     /// An overseer tool call started; `summary` is what it acts on.
     ToolStarted { id: usize, tool: String, summary: String },
-    /// The same call returned, after `secs` and with the text the model reads.
-    ToolFinished { id: usize, output: String, secs: f64 },
+    /// The same call returned, after `secs` and with what its result is worth showing.
+    ToolFinished { id: usize, preview: tools::Preview, secs: f64 },
     /// A worker's reply, final answer or failure.
     Worker { id: usize, kind: WorkerEvent, text: String },
     /// A worker's model output, as it streams.

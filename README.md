@@ -40,6 +40,7 @@ On a terminal it opens a full-screen UI: the transcript, a worker panel on the r
 |ctrl+j|new line in the prompt|
 |PageUp / PageDown|scroll the transcript; End follows new output again|
 |F2|hide or show the worker panel|
+|F3|hide or show what tool calls returned, leaving one row per call|
 |ctrl+p / ctrl+n|recall the previous or next prompt|
 |ctrl+d|quit once no worker is busy|
 |ctrl+c|quit now|

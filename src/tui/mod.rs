@@ -94,6 +94,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
         KeyCode::Home => app.scroll_top(),
         KeyCode::End => app.scroll_bottom(),
         KeyCode::F(2) => app.toggle_workers(),
+        KeyCode::F(3) => app.toggle_tool_output(),
         _ => app.input(key),
     }
 }
