@@ -1,4 +1,5 @@
 use crate::mcp;
+use crate::profiles;
 use crate::skills;
 use crate::tools;
 use serde_json::{Value, json};
@@ -71,6 +72,7 @@ fn swarm_tool_definitions() -> Vec<Value> {
     let spawn = with_policy(json!({
         "type": "object",
         "properties": {
+            "profile": {"type": "string", "description": "Flavor for the new agent, from the profiles your prompt lists. It fixes that profile's model and reasoning effort and adds its restrictions to yours; it can never take one back."},
             "path": {"type": "string", "description": "Directory the agent works in; relative paths resolve there. Defaults to your own directory."},
             "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
         },
@@ -79,7 +81,7 @@ fn swarm_tool_definitions() -> Vec<Value> {
     vec![
         json!({"type": "function", "function": {
             "name": SPAWN_AGENT,
-            "description": "Start a new agent below you, in a directory, under the rights you give it. Returns the agent id at once; its final answer arrives later as an [agent N · <name> finished] message. Its rights are fixed for its lifetime: deny `spawn_agent` in `deny_tools` and it can never start sub-agents. To change a running agent's rights, stop it (which stops everything below it) and spawn a new one.",
+            "description": "Start a new agent below you, in a directory, under the rights you give it. A profile gives it a flavor and, when the profile names one, a different model. Returns the agent id at once; its final answer arrives later as an [agent N · <name> finished] message. Its rights are fixed for its lifetime: deny `spawn_agent` in `deny_tools` and it can never start sub-agents. To change a running agent's rights, stop it (which stops everything below it) and spawn a new one.",
             "parameters": spawn
         }}),
         json!({"type": "function", "function": {
@@ -101,7 +103,7 @@ fn swarm_tool_definitions() -> Vec<Value> {
         }}),
         json!({"type": "function", "function": {
             "name": LIST_AGENTS,
-            "description": "List the agents you own — yourself and everything below you — with depth, state, rights, directory and initial task.",
+            "description": "List the agents you own — yourself and everything below you — with depth, state, rights, profile, directory and initial task.",
             "parameters": {"type": "object", "properties": {}}
         }}),
         json!({"type": "function", "function": {
@@ -146,6 +148,10 @@ pub(crate) struct AgentFacts<'a> {
     /// The skills it may read, and the servers whose tools it may call.
     pub(crate) skills: &'a skills::Catalogue,
     pub(crate) mcp: &'a mcp::Registry,
+    /// The flavor this agent runs, when its spawner named one.
+    pub(crate) profile: Option<&'a profiles::Profile>,
+    /// Every profile a spawner may pick from.
+    pub(crate) profiles: &'a profiles::Catalogue,
     /// The agent the user talks to.
     pub(crate) root: bool,
 }
@@ -178,6 +184,17 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
         let _ = writeln!(out, "Agents you own right now: {}.", listed.join(", "));
     }
     out.push_str(facts.policy.describe().as_str());
+    if let Some(profile) = facts.profile {
+        let _ = writeln!(out, "Profile {}: {}", profile.name, profile.body);
+    }
+    let may_spawn = remaining > 0 && !facts.policy.deny_tools.iter().any(|tool| tool == SPAWN_AGENT);
+    if may_spawn {
+        let _ = write!(
+            out,
+            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. Their restrictions add to yours.\n<profiles>\n{}\n</profiles>\n",
+            facts.profiles.catalogue()
+        );
+    }
     let catalogue = facts.skills.catalogue();
     if !catalogue.is_empty() {
         let _ = write!(
@@ -236,4 +253,72 @@ fn tool_section(defs: &Value) -> String {
         })
         .collect();
     format!("Tools:\n{}\n", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_profile_appends_its_flavor_and_the_catalogue_to_the_base_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".overseer/agent/profiles");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("reviewer.md"),
+            "---\ndescription: Reviews a diff.\nkeywords: [review, audit]\nread_only: true\n---\nYou review. Never edit.\n",
+        )
+        .unwrap();
+        let profiles = profiles::Catalogue::load(home.path());
+        let policy = tools::Policy::default();
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let reviewer = profiles.get("reviewer").unwrap();
+        let facts = AgentFacts {
+            id: 2,
+            parent: Some(1),
+            depth: 1,
+            max_depth: 3,
+            dir: home.path(),
+            policy: &policy,
+            children: Vec::new(),
+            skills: &skills,
+            mcp: &mcp,
+            root: false,
+            profile: Some(reviewer),
+            profiles: &profiles,
+        };
+        let prompt = agent_prompt(&facts);
+        assert!(prompt.contains("You are agent 2 of a tree of identical agents"), "the base prompt stays");
+        assert!(prompt.contains("Profile reviewer: You review. Never edit."), "{prompt}");
+        assert!(prompt.contains("- reviewer: Reviews a diff. (keywords: review, audit) [read-only]"), "{prompt}");
+        assert!(prompt.contains("profile://<name>"), "the detail path is named: {prompt}");
+    }
+
+    #[test]
+    fn an_agent_that_cannot_spawn_reads_no_catalogue() {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = profiles::Catalogue::default();
+        let policy = tools::Policy::default().set(None, Some(vec![SPAWN_AGENT.into()]), None, None);
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let facts = AgentFacts {
+            id: 2,
+            parent: Some(1),
+            depth: 3,
+            max_depth: 3,
+            dir: home.path(),
+            policy: &policy,
+            children: Vec::new(),
+            skills: &skills,
+            mcp: &mcp,
+            root: false,
+            profile: None,
+            profiles: &profiles,
+        };
+        let prompt = agent_prompt(&facts);
+        assert!(!prompt.contains("Profiles for your sub-agents"), "{prompt}");
+        assert!(!prompt.contains("profile://<name>"), "{prompt}");
+    }
 }

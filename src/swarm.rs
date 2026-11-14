@@ -365,6 +365,7 @@ fn progress(sender: &Sender<Event>, id: usize, progress: Progress) {
 #[derive(Deserialize, Default)]
 struct Described {
     path: Option<String>,
+    profile: Option<String>,
     task: Option<String>,
     text: Option<String>,
     command: Option<String>,
@@ -393,8 +394,13 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
     let line = match name {
         prompt::SPAWN_AGENT => {
             let path = field(args.path.as_ref());
+            let profile = field(args.profile.as_ref());
             let dir = if path.is_empty() { "owner's dir" } else { path };
-            format!("{dir} · {}", field(args.task.as_ref()))
+            if profile.is_empty() {
+                format!("{dir} · {}", field(args.task.as_ref()))
+            } else {
+                format!("{dir} · {profile} · {}", field(args.task.as_ref()))
+            }
         }
         prompt::MESSAGE_AGENT => {
             let urgent = if args.urgent { "urgent " } else { "" };
@@ -977,10 +983,11 @@ impl Swarm {
             "idle"
         };
         let read_only = if agent.control.policy().read_only { " · read-only" } else { "" };
+        let profile = agent.profile.as_deref().map_or(String::new(), |name| format!(" · profile: {name}"));
         let you = if agent.id == caller { " · you" } else { "" };
         let task: String = agent.initial_task.lines().next().unwrap_or("").chars().take(TASK_PREVIEW_WIDTH).collect();
         format!(
-            "{} [depth {} · {state}{read_only}{you}] {} | {task}",
+            "{} [depth {} · {state}{read_only}{profile}{you}] {} | {task}",
             agent.label(),
             agent.depth,
             agent.working_dir.display()
@@ -1106,11 +1113,12 @@ impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let (home, mcp) = {
+        let (home, mcp, catalogue) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
             let tree = lock(&swarm);
-            (tree.home.clone(), Arc::clone(&tree.mcp))
+            (tree.home.clone(), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles))
         };
+        let profile = self.profile.as_deref().and_then(|name| catalogue.get(name));
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&home, self.working_dir);
         let mut history: Vec<Message> = Vec::new();
@@ -1131,6 +1139,8 @@ impl AgentRun<'_> {
                     skills: &skills,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
+                    profile,
+                    profiles: catalogue.as_ref(),
                 };
                 (facts, tree.max_depth.saturating_sub(self.depth))
             };
@@ -1450,6 +1460,27 @@ mod tests {
         assert_eq!(view[0].profile.as_deref(), Some(profiles::ORCHESTRATOR));
     }
 
+    #[test]
+    fn the_roster_names_the_profile() {
+        let h = harness_full(Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))), &[("reviewer", REVIEWER)]);
+        tool(
+            &h.swarm,
+            Swarm::ROOT,
+            prompt::SPAWN_AGENT,
+            &json!({"path": h.repo, "task": "review", "profile": "reviewer"}),
+        );
+        let roster = list(&h.swarm, Swarm::ROOT);
+        assert!(roster.contains("profile: reviewer"), "{roster}");
+        assert!(roster.contains("profile: orchestrator"), "the root names its own: {roster}");
+    }
+
+    #[test]
+    fn a_spawn_progress_line_names_the_profile_it_was_given() {
+        assert_eq!(describe(prompt::SPAWN_AGENT, &json!({"task": "x"}).to_string()), "owner's dir · x");
+        let profiled = describe(prompt::SPAWN_AGENT, &json!({"task": "x", "profile": "reviewer"}).to_string());
+        assert_eq!(profiled, "owner's dir · reviewer · x");
+    }
+
     /// One tree tool call, as an agent makes it.
     fn tool(swarm: &Arc<Mutex<Swarm>>, caller: usize, name: &str, args: &Value) -> String {
         tools::outcome(
@@ -1564,6 +1595,8 @@ mod tests {
             max_depth: 3,
             dir: Path::new("/tmp"),
             policy: &policy,
+            profile: None,
+            profiles: &profiles::Catalogue::default(),
             children: vec![3],
             skills: &skills,
             mcp: &mcp,
