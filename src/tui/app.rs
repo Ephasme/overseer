@@ -858,7 +858,7 @@ impl App {
                 break;
             }
             let top = inner.y.saturating_add(u16::try_from(rows.len()).unwrap_or(u16::MAX));
-            ranges.push((top, top.saturating_add(u16::try_from(height).unwrap_or(u16::MAX)), worker.id));
+            ranges.push((top, top.saturating_add(height), worker.id));
             let head = if self.selected == Some(worker.id) {
                 Style::new().fg(colour).add_modifier(Modifier::REVERSED)
             } else {
