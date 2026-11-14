@@ -794,22 +794,21 @@ impl App {
             |_| std::env::temp_dir().join("overseer/pastes"),
             |home| crate::config::state_dir(&home).join("pastes"),
         );
-        self.apply_paste(crate::clipboard::read(), &dir);
+        self.dirty = true;
+        self.apply_paste(crate::clipboard::read(&dir));
     }
 
     /// Applies one paste: an image becomes a pending attachment, text goes in the composer, and a
     /// clipboard holding neither says so instead of doing nothing.
-    fn apply_paste(&mut self, content: crate::clipboard::Content, dir: &Path) {
+    fn apply_paste(&mut self, content: crate::clipboard::Content) {
         match content {
             crate::clipboard::Content::Text(text) => self.insert(&text),
             crate::clipboard::Content::Empty => self.notice(EMPTY_CLIPBOARD),
-            image => match crate::clipboard::save(&image, dir) {
-                Ok(path) => {
-                    self.attachment = Some(path);
-                    self.dirty = true;
-                }
-                Err(e) => self.notice(&format!("cannot save the pasted image: {e}")),
-            },
+            crate::clipboard::Content::Failed(why) => self.notice(&format!("cannot read the clipboard: {why}")),
+            crate::clipboard::Content::Image(path) => {
+                self.attachment = Some(path);
+                self.dirty = true;
+            }
         }
     }
 
@@ -997,29 +996,25 @@ mod paste_tests {
     use crate::clipboard::Content;
     use std::fs;
 
+    fn saved(dir: &Path) -> PathBuf {
+        let path = dir.join("paste-1-1.png");
+        fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("a png");
+        path
+    }
+
     #[test]
     fn a_pasted_screenshot_becomes_a_pending_attachment() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(
-            Content::Rgba {
-                width: 2,
-                height: 2,
-                bytes: vec![0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 9, 9, 9, 255],
-            },
-            dir.path(),
-        );
-        let path = app.attachment.clone().expect("an attachment");
-        assert!(path.starts_with(dir.path()), "{}", path.display());
-        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
-        assert!(fs::read(&path).expect("the png").starts_with(b"\x89PNG"));
+        let path = saved(dir.path());
+        app.apply_paste(Content::Image(path.clone()));
+        assert_eq!(app.attachment.as_deref(), Some(path.as_path()));
     }
 
     #[test]
     fn an_empty_clipboard_says_so_instead_of_doing_nothing() {
-        let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Content::Empty, dir.path());
+        app.apply_paste(Content::Empty);
         assert!(app.attachment.is_none());
         let last = app.entries.last().expect("a notice");
         assert_eq!(last.role, Role::Notice);
@@ -1027,10 +1022,18 @@ mod paste_tests {
     }
 
     #[test]
+    fn a_clipboard_that_cannot_be_read_says_why() {
+        let mut app = App::new("m");
+        app.apply_paste(Content::Failed("osascript: not found".into()));
+        let last = app.entries.last().expect("a notice");
+        assert_eq!(last.body, "cannot read the clipboard: osascript: not found");
+    }
+
+    #[test]
     fn an_attachment_rides_one_message_as_its_absolute_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.apply_paste(Content::Rgba { width: 1, height: 1, bytes: vec![0, 0, 0, 255] }, dir.path());
+        app.apply_paste(Content::Image(saved(dir.path())));
         app.insert("what is this?");
         let prompt = app.take_prompt();
         assert!(prompt.starts_with("what is this?"), "{prompt}");
@@ -1038,8 +1041,15 @@ mod paste_tests {
         assert!(prompt.contains(".png]"), "{prompt}");
         assert!(app.attachment.is_none(), "the attachment belongs to one message");
     }
-}
 
+    #[test]
+    fn pasted_text_still_lands_in_the_composer() {
+        let mut app = App::new("m");
+        app.apply_paste(Content::Text("hello".into()));
+        assert_eq!(app.composer.lines(), ["hello"]);
+        assert!(app.attachment.is_none());
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
