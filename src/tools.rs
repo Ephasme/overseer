@@ -123,7 +123,6 @@ impl Policy {
     /// `read_only` sticks, deny lists are unioned, and two allow lists intersect — a child of a
     /// restricted agent cannot be handed back a capability the owner refused. Called once, on the
     /// spawn path: an agent's policy never changes after that.
-    #[allow(dead_code)] // called by the spawn path once the tree replaces the fleet
     pub(crate) fn inherit(&self, given: &Self) -> Self {
         let mut deny_tools = self.deny_tools.clone();
         for tool in &given.deny_tools {

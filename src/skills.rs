@@ -27,7 +27,8 @@ pub(crate) struct Catalogue {
 }
 
 impl Catalogue {
-    /// The skills every worker in every directory sees: the user's own.
+    /// The skills every agent in every directory sees: the user's own.
+    #[cfg(test)] // the tree always starts from a directory, so `in_dir` covers the product path.
     pub(crate) fn user(home: &Path) -> Self {
         let mut found = Vec::new();
         for suffix in USER_ROOTS {

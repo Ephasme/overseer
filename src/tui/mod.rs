@@ -4,7 +4,7 @@ mod theme;
 use crate::clipboard;
 use crate::config::Theme;
 use crate::event::UiEvent;
-use crate::fleet::Event;
+use crate::swarm::Event;
 use anyhow::Result;
 use app::App;
 use ratatui::DefaultTerminal;
@@ -183,22 +183,24 @@ fn submit(app: &mut App, input: &Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::WorkerView;
+    use crate::swarm::AgentView;
     use std::path::PathBuf;
 
     fn press(app: &mut App, code: KeyCode) {
         let (input, queue) = mpsc::channel();
         let (pasted, _reads) = mpsc::channel();
         handle_key(app, &input, &pasted, KeyEvent::from(code));
-        assert!(queue.try_recv().is_err(), "a key pressed in a worker view wakes the core");
+        assert!(queue.try_recv().is_err(), "a key pressed in an agent view wakes the core");
     }
 
-    /// Esc inside a worker view returns to the fleet: it neither types into the prompt nor quits.
+    /// Esc inside an agent view returns to the tree: it neither types into the prompt nor quits.
     #[test]
-    fn escape_leaves_a_worker_view_without_quitting() {
+    fn escape_leaves_an_agent_view_without_quitting() {
         let mut app = App::new("m");
-        let worker = WorkerView {
-            id: 1,
+        let agent = AgentView {
+            id: 2,
+            parent: Some(crate::swarm::Swarm::ROOT),
+            depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: "do it".into(),
             pending: 0,
@@ -209,13 +211,13 @@ mod tests {
             read_only: false,
             busy_for: None,
         };
-        app.apply(UiEvent::Workers(vec![worker]));
+        app.apply(UiEvent::Agents(vec![agent]));
         press(&mut app, KeyCode::F(4));
-        assert!(app.in_worker_view(), "F4 opens a worker's view");
+        assert!(app.in_worker_view(), "F4 opens an agent's view");
         press(&mut app, KeyCode::Char('x'));
-        assert!(app.take_prompt().is_empty(), "no key reaches the prompt from a worker view");
+        assert!(app.take_prompt().is_empty(), "no key reaches the prompt from an agent view");
         press(&mut app, KeyCode::Esc);
-        assert!(!app.in_worker_view(), "esc returns to the fleet");
+        assert!(!app.in_worker_view(), "esc returns to the tree");
         assert!(!app.quit, "esc never quits the app");
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.take_prompt(), "x", "the prompt takes keys again once the view is closed");

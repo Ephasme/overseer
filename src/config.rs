@@ -27,10 +27,8 @@ pub(crate) struct Config {
     pub(crate) model: String,
     pub(crate) theme: Theme,
     /// Delegations allowed below the root; `0` means the root may not spawn anyone.
-    #[allow(dead_code)] // read once the tree replaces the fleet
     pub(crate) max_depth: usize,
     /// The directory the root agent starts in; children get the path `spawn_agent` names.
-    #[allow(dead_code)] // read once the tree replaces the fleet
     pub(crate) dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,

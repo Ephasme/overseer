@@ -1,7 +1,7 @@
 use super::theme;
 use crate::clipboard;
 use crate::event::UiEvent;
-use crate::fleet::{Progress, WorkerEvent, WorkerView};
+use crate::swarm::{AgentEvent, AgentView, Progress, Swarm};
 use crate::tools;
 use crate::version;
 use ratatui::Frame;
@@ -90,7 +90,7 @@ enum Role {
     Overseer,
     /// A tool call, by the overseer or by one of its workers.
     Tool,
-    Worker(WorkerEvent),
+    Worker(AgentEvent),
     Notice,
     Error,
     Debug,
@@ -147,10 +147,10 @@ impl Entry {
             Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
-                    WorkerEvent::Reply => ("says", theme::info()),
-                    WorkerEvent::Finished => ("done", theme::success()),
-                    WorkerEvent::Failed => ("failed", theme::error()),
-                    WorkerEvent::Interrupted => ("interrupted", theme::warning()),
+                    AgentEvent::Reply => ("says", theme::info()),
+                    AgentEvent::Finished => ("done", theme::success()),
+                    AgentEvent::Failed => ("failed", theme::error()),
+                    AgentEvent::Interrupted => ("interrupted", theme::warning()),
                 };
                 let prefix = format!("[{}] {label} ", self.title);
                 block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::muted()), width)
@@ -533,7 +533,7 @@ impl Stream {
 }
 
 /// One worker's view: its own stream, plus the lines that arrived while nobody was looking at it.
-struct WorkerStream {
+struct AgentStream {
     id: usize,
     stream: Stream,
     /// Entries received while this worker's view was closed; cleared when it opens.
@@ -570,7 +570,7 @@ fn composer() -> TextArea<'static> {
             .border_style(Style::new().fg(theme::edge()))
             .padding(Padding::new(1, 1, 1, 0)),
     );
-    area.set_placeholder_text("Ask the overseer, /resume <id>, /schemes, or exit");
+    area.set_placeholder_text("Ask agent 1, /resume <id>, /schemes, or exit");
     area.set_wrap_mode(WrapMode::WordOrGlyph);
     area.set_max_rows(COMPOSER_ROWS);
     area
@@ -581,7 +581,7 @@ pub(super) struct App {
     /// The lead's stream: the overseer's own turns and tool calls, and one line per worker lifecycle event.
     lead: Stream,
     /// One stream per worker, created when the worker joins the roster.
-    worker_streams: Vec<WorkerStream>,
+    worker_streams: Vec<AgentStream>,
     composer: TextArea<'static>,
     /// What ctrl+V found: sent with the next message, or a read still in flight, or why there is none.
     attachment: Option<Attachment>,
@@ -591,13 +591,11 @@ pub(super) struct App {
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
     recall: Option<usize>,
-    /// Where each overseer tool call's entry landed, by the id the core sends.
-    tools: Vec<Option<usize>>,
-    /// Where each worker tool call's entry landed: (worker, its call number, entry index).
+    /// Where each agent tool call's entry landed: (agent, its call number, entry index).
     calls: Vec<(usize, usize, usize)>,
     /// Index of the entry the overseer's streamed text is filling.
     live: Option<usize>,
-    workers: Vec<WorkerView>,
+    workers: Vec<AgentView>,
     /// Last streamed text per worker, for the panel.
     previews: Vec<(usize, String)>,
     worker_panel: bool,
@@ -635,7 +633,6 @@ impl App {
             model: model.to_string(),
             history: Vec::new(),
             recall: None,
-            tools: Vec::new(),
             calls: Vec::new(),
             live: None,
             workers: Vec::new(),
@@ -665,30 +662,11 @@ impl App {
             UiEvent::Answer(text) => self.answer(text),
             UiEvent::Error(text) => self.push(Role::Error, String::new(), text),
             UiEvent::Debug(text) => self.push(Role::Debug, String::new(), text),
-            UiEvent::Delta(text) => self.stream(&text),
             UiEvent::TurnBoundary => self.boundary(),
-            UiEvent::ToolStarted { id, tool, summary } => {
-                let index = self.lead.push(Entry::tool(tool, summary));
-                if self.tools.len() <= id {
-                    self.tools.resize(id + 1, None);
-                }
-                if let Some(slot) = self.tools.get_mut(id) {
-                    *slot = Some(index);
-                }
-            }
-            UiEvent::ToolFinished { id, preview, secs } => {
-                let index = self.tools.get(id).copied().flatten();
-                if let Some(entry) = index.and_then(|i| self.lead.entries.get_mut(i)) {
-                    entry.finish(preview, secs);
-                }
-                if let Some(index) = index {
-                    self.lead.invalidate(index);
-                }
-            }
-            UiEvent::Worker { id, kind, text } => {
+            UiEvent::Agent { id, kind, text } => {
                 self.clear_preview(id);
-                let name = format!("worker {id}");
-                // The worker's own stream keeps the whole message; the lead gets one lifecycle line.
+                let name = format!("agent {id}");
+                // The agent's own stream keeps the whole message; the lead gets one lifecycle line.
                 let first = text.lines().next().unwrap_or_default().trim().to_string();
                 let line = if first.is_empty() {
                     format!("{name} {}", kind.verb())
@@ -699,19 +677,27 @@ impl App {
                 self.note_unread(id);
                 self.push(Role::Notice, String::new(), line);
             }
-            UiEvent::WorkerDelta { id, text } => self.preview(id, &text),
+            UiEvent::AgentDelta { id, text } => {
+                if id == Swarm::ROOT {
+                    self.stream(&text);
+                } else {
+                    self.preview(id, &text);
+                }
+            }
             UiEvent::Progress { id, progress } => self.progress(id, progress),
-            UiEvent::Workers(workers) => {
-                // A worker that just joined gets a stream of its own and one line in the lead's.
-                let joined: Vec<(usize, String)> = workers
+            UiEvent::Agents(agents) => {
+                // A child that just joined gets a stream of its own and one line in the lead's. The
+                // root already writes into the lead's stream, so it gets neither.
+                let joined: Vec<(usize, String)> = agents
                     .iter()
-                    .filter(|worker| !self.worker_streams.iter().any(|stream| stream.id == worker.id))
-                    .map(|worker| (worker.id, worker.dir.display().to_string()))
+                    .filter(|agent| agent.id != Swarm::ROOT)
+                    .filter(|agent| !self.worker_streams.iter().any(|stream| stream.id == agent.id))
+                    .map(|agent| (agent.id, agent.dir.display().to_string()))
                     .collect();
-                self.workers = workers;
+                self.workers = agents;
                 for (id, dir) in joined {
                     self.worker_stream_mut(id);
-                    let line = format!("worker {id} started · {dir}");
+                    let line = format!("agent {id} started · {dir}");
                     self.push(Role::Notice, String::new(), line);
                 }
                 self.close_dead_calls();
@@ -731,20 +717,22 @@ impl App {
         }
     }
 
-    /// A worker's tool call: one entry that opens when it starts and closes when it returns.
+    /// An agent's tool call: one entry that opens when it starts and closes when it returns.
     fn progress(&mut self, id: usize, progress: Progress) {
         match progress {
             Progress::Started { call, tool, summary } => {
-                let index = self.worker_stream_mut(id).push(Entry::tool(tool, summary));
+                let index = self.stream_mut(id).push(Entry::tool(tool, summary));
                 self.calls.push((id, call, index));
-                self.note_unread(id);
+                if id != Swarm::ROOT {
+                    self.note_unread(id);
+                }
             }
             Progress::Finished { call, secs, preview, .. } => {
                 let Some(slot) = self.calls.iter().position(|(worker, seq, _)| *worker == id && *seq == call) else {
                     return;
                 };
                 let (_, _, index) = self.calls.swap_remove(slot);
-                let stream = self.worker_stream_mut(id);
+                let stream = self.stream_mut(id);
                 if let Some(entry) = stream.entries.get_mut(index) {
                     entry.finish(preview, secs);
                 }
@@ -850,13 +838,18 @@ impl App {
         let slot = if let Some(slot) = self.worker_streams.iter().position(|stream| stream.id == id) {
             slot
         } else {
-            self.worker_streams.push(WorkerStream { id, stream: Stream::new(), unread: 0 });
+            self.worker_streams.push(AgentStream { id, stream: Stream::new(), unread: 0 });
             self.worker_streams.len().saturating_sub(1)
         };
         match self.worker_streams.get_mut(slot) {
             Some(worker) => &mut worker.stream,
             None => &mut self.lead,
         }
+    }
+
+    /// The stream an agent's events belong to: the transcript for the root, its own buffer otherwise.
+    fn stream_mut(&mut self, id: usize) -> &mut Stream {
+        if id == Swarm::ROOT { &mut self.lead } else { self.worker_stream_mut(id) }
     }
 
     /// Counts a line a worker's stream received while its view was closed.
@@ -963,7 +956,7 @@ impl App {
         self.lead.draw(frame, area, spinning, expand);
     }
 
-    /// The fleet's roster: one quiet rule, then a block per worker, the picked one banded.
+    /// The tree's roster: one quiet rule, then a block per agent, the picked one banded.
     fn render_workers(&mut self, frame: &mut Frame, area: Rect) {
         let rule = Block::new()
             .borders(Borders::LEFT)
@@ -975,7 +968,7 @@ impl App {
         self.workers_area = inner;
         self.worker_rows.clear();
         let mut head = vec![
-            Span::styled("workers", Style::new().fg(theme::muted())),
+            Span::styled("agents", Style::new().fg(theme::muted())),
             Span::styled(format!(" {}", self.workers.len()), Style::new().fg(theme::faint())),
         ];
         if self.workers.is_empty() {
@@ -997,11 +990,12 @@ impl App {
                 break;
             }
             let unread = self.unread_of(worker.id);
+            let indent = "  ".repeat(worker.depth);
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+                    Span::styled(format!("{indent}{glyph} "), Style::new().fg(colour)),
                     Span::styled(
-                        format!("w{}", worker.id),
+                        format!("a{}", worker.id),
                         Style::new().fg(if self.selected == Some(worker.id) { theme::text() } else { theme::info() }),
                     ),
                     Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
@@ -1146,7 +1140,7 @@ impl App {
     }
 
     /// The worker the view is about.
-    fn focused(&self) -> Option<&WorkerView> {
+    fn focused(&self) -> Option<&AgentView> {
         let id = self.viewed()?;
         self.workers.iter().find(|worker| worker.id == id)
     }
@@ -1203,7 +1197,7 @@ impl App {
             return;
         }
         if self.workers.is_empty() {
-            self.push(Role::Notice, String::new(), "no workers yet: F4 opens a view once one starts".into());
+            self.push(Role::Notice, String::new(), "no agents yet: F4 opens a view once one starts".into());
             return;
         }
         let picked = self.selected.filter(|id| self.workers.iter().any(|worker| worker.id == *id));
@@ -1240,16 +1234,16 @@ impl App {
         let width = usize::from(top.width.saturating_sub(4));
         let (glyph, colour, state) = worker_state(&worker);
         let crumb = Line::from(vec![
-            Span::styled("Fleet ", Style::new().fg(theme::muted())),
+            Span::styled("agents ", Style::new().fg(theme::muted())),
             Span::styled("› ", Style::new().fg(theme::faint())),
-            Span::styled(format!("worker {}", worker.id), Style::new().fg(theme::info())),
+            Span::styled(format!("agent {}", worker.id), Style::new().fg(theme::info())),
         ]);
         let mut line = vec![
             Span::styled(format!("{glyph} "), Style::new().fg(colour)),
             Span::styled(state, Style::new().fg(theme::muted())),
             Span::styled(format!(" · {}", worker.dir.display()), Style::new().fg(theme::faint())),
         ];
-        let hint = "esc back to fleet";
+        let hint = "esc back to agents";
         let used = Line::from(line.clone()).width();
         line.push(Span::raw(" ".repeat(width.saturating_sub(used + text_width(hint)).max(1))));
         line.push(Span::styled(hint, Style::new().fg(theme::faint())));
@@ -1535,7 +1529,7 @@ impl App {
     }
 }
 
-fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
+fn worker_state(worker: &AgentView) -> (&'static str, Color, String) {
     if worker.stopped {
         return ("■", theme::faint(), "stopped".into());
     }
@@ -1769,7 +1763,7 @@ mod tests {
     fn an_instruction_to_a_worker_is_shown_whole_across_rows() {
         let mut app = App::new("m");
         let text = format!("first line\n{}tail", "word ".repeat(40));
-        app.apply(UiEvent::ToolStarted { id: 0, tool: "message_worker".into(), summary: format!("#2 · {text}") });
+        tool_call(&mut app, 0, "message_agent", &format!("#2 · {text}"));
         let lines = app.lead.entries[0].lines(40, 0, false);
         assert!(lines.len() > 2, "a long instruction wraps: {}", lines.len());
         let joined = row_text(&lines);
@@ -1784,26 +1778,22 @@ mod tests {
     #[test]
     fn apply_pairs_tool_calls_with_their_results() {
         let mut app = App::new("m");
-        app.apply(UiEvent::ToolStarted { id: 3, tool: "spawn_worker".into(), summary: "/tmp · do it".into() });
+        tool_call(&mut app, 3, "spawn_agent", "/tmp · do it");
         let started = row_text(&app.lead.entries[0].lines(80, 0, true));
-        assert!(started.contains("⠋ spawn_worker /tmp · do it"), "{started}");
-        app.apply(UiEvent::ToolFinished {
-            id: 3,
-            preview: tools::preview("spawn_worker", "worker 1 started"),
-            secs: 0.4,
-        });
+        assert!(started.contains("⠋ spawn_agent /tmp · do it"), "{started}");
+        tool_result(&mut app, 3, "spawn_agent", "agent 2 started", 0.4);
         let finished = row_text(&app.lead.entries[0].lines(80, 0, true));
-        assert!(finished.contains("✓ spawn_worker /tmp · do it"), "{finished}");
+        assert!(finished.contains("✓ spawn_agent /tmp · do it"), "{finished}");
         assert!(finished.contains("0.4s"), "{finished}");
-        assert!(finished.contains("│ worker 1 started"), "{finished}");
+        assert!(finished.contains("│ agent 2 started"), "{finished}");
     }
 
     #[test]
-    fn a_worker_tool_call_shows_its_command_then_the_head_of_its_output() {
+    fn an_agent_tool_call_shows_its_command_then_the_head_of_its_output() {
         let mut app = App::new("m");
         let started = Progress::Started { call: 7, tool: tools::BASH.into(), summary: "cargo test".into() };
         app.apply(UiEvent::Progress { id: 2, progress: started });
-        assert!(app.lead.entries.is_empty(), "a worker's tool call never reaches the lead's stream");
+        assert!(app.lead.entries.is_empty(), "an agent's tool call never reaches the lead's stream");
         let head = row_text(&worker_entries(&app, 2)[0].lines(80, 0, true));
         assert!(head.contains("$ cargo test"), "{head}");
         let output = "exit code: 0\nstdout:\none\ntwo\nthree\nfour\nfive\nsix\nstderr:\n";
@@ -1824,46 +1814,38 @@ mod tests {
     fn a_failed_command_shows_its_exit_code_and_error() {
         let mut app = App::new("m");
         let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "cargo build".into() };
-        app.apply(UiEvent::Progress { id: 1, progress: started });
+        app.apply(UiEvent::Progress { id: 2, progress: started });
         let output = "exit code: 101\nstdout:\nstderr:\nerror[E0308]: mismatched types\n";
         let preview = tools::preview(tools::BASH, output);
         let finished = Progress::Finished { call: 0, secs: 0.5, preview };
-        app.apply(UiEvent::Progress { id: 1, progress: finished });
-        let text = row_text(&worker_entries(&app, 1)[0].lines(80, 0, true));
+        app.apply(UiEvent::Progress { id: 2, progress: finished });
+        let text = row_text(&worker_entries(&app, 2)[0].lines(80, 0, true));
         assert!(text.contains("✕ $ cargo build"), "{text}");
         assert!(text.contains("exit 101"), "{text}");
         assert!(text.contains("error[E0308]"), "{text}");
     }
 
     #[test]
-    fn a_dead_worker_closes_the_call_it_left_running() {
+    fn a_dead_agent_closes_the_call_it_left_running() {
         let mut app = App::new("m");
         let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "sleep 900".into() };
-        app.apply(UiEvent::Progress { id: 1, progress: started });
-        app.workers = vec![WorkerView {
-            id: 1,
-            dir: PathBuf::from("/tmp/repo"),
-            task: "wait".into(),
-            pending: 1,
-            failed: false,
-            finished: true,
-            stopped: false,
-            paused: false,
-            read_only: false,
-            busy_for: Some(Duration::from_secs(9)),
-        }];
-        app.apply(UiEvent::Workers(app.workers.clone()));
+        app.apply(UiEvent::Progress { id: 2, progress: started });
+        let mut dead = agent_view(2, "wait");
+        dead.pending = 1;
+        dead.finished = true;
+        dead.busy_for = Some(Duration::from_secs(9));
+        app.apply(UiEvent::Agents(vec![dead]));
         assert!(app.calls.is_empty(), "a call that can never return is unpaired");
-        let text = row_text(&worker_entries(&app, 1)[0].lines(80, 0, true));
+        let text = row_text(&worker_entries(&app, 2)[0].lines(80, 0, true));
         assert!(text.contains("no result"), "{text}");
-        assert!(!text.contains('⠋'), "a stopped worker never keeps the spinner turning: {text}");
+        assert!(!text.contains('⠋'), "a stopped agent never keeps the spinner turning: {text}");
     }
 
     #[test]
     fn streamed_text_is_one_entry_that_the_answer_completes() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Delta("Worker ".into()));
-        app.apply(UiEvent::Delta("1 is done.".into()));
+        delta(&mut app, "Worker ");
+        delta(&mut app, "1 is done.");
         assert_eq!(app.lead.entries.len(), 1);
         app.apply(UiEvent::Answer("Worker 1 is done.".into()));
         assert_eq!(app.lead.entries.len(), 1);
@@ -1873,9 +1855,9 @@ mod tests {
     #[test]
     fn model_call_boundary_becomes_a_blank_line() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Delta("first call".into()));
+        delta(&mut app, "first call");
         app.apply(UiEvent::TurnBoundary);
-        app.apply(UiEvent::Delta("second call".into()));
+        delta(&mut app, "second call");
         assert_eq!(app.lead.entries[0].body, "first call\n\nsecond call");
         assert_eq!(app.lead.entries[0].lines(40, 0, true).len(), 3);
     }
@@ -1890,18 +1872,18 @@ mod tests {
     #[test]
     fn a_literal_newline_delta_stays_text() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Delta("a".into()));
-        app.apply(UiEvent::Delta("\n".into()));
-        app.apply(UiEvent::Delta("b".into()));
+        delta(&mut app, "a");
+        delta(&mut app, "\n");
+        delta(&mut app, "b");
         assert_eq!(app.lead.entries[0].body, "a\nb");
     }
 
     #[test]
     fn a_new_turn_never_extends_the_previous_stream() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Delta("first turn".into()));
+        delta(&mut app, "first turn");
         app.apply(UiEvent::Busy(false));
-        app.apply(UiEvent::Delta("second turn".into()));
+        delta(&mut app, "second turn");
         assert_eq!(app.lead.entries.len(), 2);
         assert_eq!(app.lead.entries[0].body, "first turn");
         assert_eq!(app.lead.entries[1].body, "second turn");
@@ -1916,73 +1898,50 @@ mod tests {
     }
 
     #[test]
-    fn renders_transcript_worker_panel_and_status() {
+    fn renders_transcript_agent_panel_and_status() {
         let mut app = App::new("test-model");
-        app.apply(UiEvent::Notice("worker logs in /tmp/logs".into()));
-        app.apply(UiEvent::Delta("spawned ".into()));
-        app.apply(UiEvent::Delta("two workers".into()));
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "tests pass".into() });
-        app.workers = vec![WorkerView {
-            id: 1,
-            dir: PathBuf::from("/tmp/overseer"),
-            task: "run the tests".into(),
-            pending: 0,
-            failed: false,
-            finished: true,
-            stopped: false,
-            paused: false,
-            read_only: false,
-            busy_for: None,
-        }];
+        app.apply(UiEvent::Notice("agent logs in /tmp/logs".into()));
+        delta(&mut app, "spawned ");
+        delta(&mut app, "two agents");
+        let mut child = agent_view(2, "run the tests");
+        child.finished = true;
+        child.dir = PathBuf::from("/tmp/overseer");
+        app.apply(UiEvent::Agents(vec![child]));
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "tests pass".into() });
         let screen = screen(&mut app, 100, 24);
-        assert!(screen.contains("spawned two workers"), "{screen}");
-        assert!(screen.contains("worker 1 finished: tests pass"), "{screen}");
+        assert!(screen.contains("spawned two agents"), "{screen}");
+        assert!(screen.contains("agent 2 finished: tests pass"), "{screen}");
         assert!(screen.contains("overseer"), "{screen}");
         assert!(screen.contains("idle"), "{screen}");
         assert!(screen.contains("┃"), "the composer keeps its bar: {screen}");
-        assert!(screen.contains("Ask the overseer"), "{screen}");
+        assert!(screen.contains("Ask agent 1"), "{screen}");
         assert!(screen.contains("test-model"), "the status line names the model: {screen}");
         assert!(screen.contains(version::VERSION), "{screen}");
     }
 
     #[test]
-    fn worker_preview_shows_the_live_line_then_clears() {
+    fn agent_preview_shows_the_live_line_then_clears() {
         let mut app = App::new("m");
-        app.workers = vec![WorkerView {
-            id: 1,
-            dir: PathBuf::from("/tmp/repo"),
-            task: "long job".into(),
-            pending: 1,
-            failed: false,
-            finished: false,
-            stopped: false,
-            paused: false,
-            read_only: false,
-            busy_for: Some(Duration::from_secs(3)),
-        }];
-        app.apply(UiEvent::WorkerDelta { id: 1, text: "reading the config".into() });
+        let mut busy = agent_view(2, "long job");
+        busy.pending = 1;
+        busy.busy_for = Some(Duration::from_secs(3));
+        app.apply(UiEvent::Agents(vec![busy]));
+        app.apply(UiEvent::AgentDelta { id: 2, text: "reading the config".into() });
         let rendered = screen(&mut app, 100, 24);
         assert!(rendered.contains("reading the config"), "{rendered}");
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "done".into() });
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "done".into() });
         let rendered = screen(&mut app, 100, 24);
         assert!(!rendered.contains("reading the config"), "{rendered}");
     }
 
     #[test]
-    fn a_dead_worker_shows_as_failed() {
+    fn a_dead_agent_shows_as_failed() {
         let mut app = App::new("m");
-        app.workers = vec![WorkerView {
-            id: 1,
-            dir: PathBuf::from("/tmp/repo"),
-            task: "long job".into(),
-            pending: 1,
-            failed: false,
-            finished: true,
-            stopped: false,
-            paused: false,
-            read_only: false,
-            busy_for: Some(Duration::from_secs(3)),
-        }];
+        let mut dead = agent_view(2, "long job");
+        dead.pending = 1;
+        dead.finished = true;
+        dead.busy_for = Some(Duration::from_secs(3));
+        app.apply(UiEvent::Agents(vec![dead]));
         let screen = screen(&mut app, 100, 24);
         assert!(screen.contains("failed"), "{screen}");
         assert!(!screen.contains("working 3s"), "{screen}");
@@ -2025,10 +1984,10 @@ mod tests {
     #[test]
     fn finishing_an_early_tool_call_reflattens_from_its_entry() {
         let mut app = App::new("m");
-        app.apply(UiEvent::ToolStarted { id: 0, tool: "bash".into(), summary: "ls".into() });
+        tool_call(&mut app, 0, "bash", "ls");
         app.apply(UiEvent::Answer("after".into()));
         screen(&mut app, 60, 16);
-        app.apply(UiEvent::ToolFinished { id: 0, preview: tools::preview(tools::BASH, "done"), secs: 1.0 });
+        tool_result(&mut app, 0, "bash", "done", 1.0);
         assert_eq!(app.lead.dirty_from, 0);
         let rendered = screen(&mut app, 60, 16);
         assert!(rendered.contains("done"), "{rendered}");
@@ -2044,9 +2003,11 @@ mod tests {
         &app.worker_streams.iter().find(|stream| stream.id == id).expect("the worker has a stream").stream
     }
 
-    fn worker_view(id: usize, task: &str) -> WorkerView {
-        WorkerView {
+    fn agent_view(id: usize, task: &str) -> AgentView {
+        AgentView {
             id,
+            parent: Some(Swarm::ROOT),
+            depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: task.into(),
             pending: 0,
@@ -2059,41 +2020,66 @@ mod tests {
         }
     }
 
-    /// Clicks the first worker's block in the panel, the way the mouse does.
-    fn click_first_worker(app: &mut App) {
+    /// The root's streamed text, which lands in the transcript.
+    fn delta(app: &mut App, text: &str) {
+        app.apply(UiEvent::AgentDelta { id: Swarm::ROOT, text: text.into() });
+    }
+
+    /// One tool call in the transcript, started and finished.
+    fn tool_call(app: &mut App, call: usize, tool: &str, summary: &str) {
+        let progress = Progress::Started { call, tool: tool.into(), summary: summary.into() };
+        app.apply(UiEvent::Progress { id: Swarm::ROOT, progress });
+    }
+
+    fn tool_result(app: &mut App, call: usize, tool: &str, output: &str, secs: f64) {
+        let progress = Progress::Finished { call, secs, preview: tools::preview(tool, output) };
+        app.apply(UiEvent::Progress { id: Swarm::ROOT, progress });
+    }
+
+    /// Clicks the first agent's block in the panel that is not the root, the way the mouse does.
+    fn click_first_agent(app: &mut App) {
         screen(app, 100, 24);
-        let (top, _, id) = *app.worker_rows.first().expect("the panel draws a block per worker");
+        let (top, _, id) =
+            *app.worker_rows.iter().find(|(_, _, id)| *id != Swarm::ROOT).expect("the panel draws a block per agent");
         app.click(app.workers_area.x + 2, top);
-        assert_eq!(app.selected, Some(id), "the click picked that worker");
+        assert_eq!(app.selected, Some(id), "the click picked that agent");
+    }
+
+    /// The root's own view, which the panel always draws first.
+    fn root_view() -> AgentView {
+        let mut root = agent_view(Swarm::ROOT, "");
+        root.parent = None;
+        root.depth = 0;
+        root
     }
 
     #[test]
-    fn a_click_opens_the_worker_view_and_esc_returns_to_the_fleet() {
+    fn a_click_opens_the_agent_view_and_esc_returns_to_the_tree() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(3, "fix the nav")]));
-        app.apply(UiEvent::Worker { id: 3, kind: WorkerEvent::Finished, text: "done".into() });
-        click_first_worker(&mut app);
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(3, "fix the nav")]));
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "done".into() });
+        click_first_agent(&mut app);
         assert!(app.in_worker_view());
         let view = screen(&mut app, 100, 24);
-        assert!(view.contains("Fleet › worker 3"), "{view}");
-        assert!(view.contains("fix the nav"), "the view shows the task handed to the worker: {view}");
-        assert!(view.contains("esc back to fleet"), "the way out is on the header: {view}");
-        assert!(view.contains("[worker 3] done done"), "the view shows the worker's own lines: {view}");
-        assert!(!view.contains("Ask the overseer"), "the overseer's prompt is out of the way: {view}");
+        assert!(view.contains("agents › agent 3"), "{view}");
+        assert!(view.contains("fix the nav"), "the view shows the task handed to the agent: {view}");
+        assert!(view.contains("esc back to agents"), "the way out is on the header: {view}");
+        assert!(view.contains("[agent 3] done done"), "the view shows the agent's own lines: {view}");
+        assert!(!view.contains("Ask agent 1"), "the composer is out of the way: {view}");
         app.worker_key(KeyEvent::from(KeyCode::Esc));
-        assert!(!app.in_worker_view(), "esc returns to the fleet");
+        assert!(!app.in_worker_view(), "esc returns to the tree");
         assert!(!app.quit, "esc never quits the app");
-        assert_eq!(app.selected, Some(3), "the fleet keeps the worker picked");
+        assert_eq!(app.selected, Some(3), "the tree keeps the agent picked");
         let list = screen(&mut app, 100, 24);
-        assert!(list.contains("Ask the overseer"), "{list}");
-        assert!(list.contains("worker 3"), "the transcript still names the worker it kept picked: {list}");
+        assert!(list.contains("Ask agent 1"), "{list}");
+        assert!(list.contains("agent 3"), "the transcript still names the agent it kept picked: {list}");
     }
 
     #[test]
-    fn clicking_the_back_line_returns_to_the_fleet() {
+    fn clicking_the_back_line_returns_to_the_tree() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "job")]));
-        click_first_worker(&mut app);
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "job")]));
+        click_first_agent(&mut app);
         screen(&mut app, 100, 24);
         let back = app.back_area;
         app.click(back.x, back.y);
@@ -2101,45 +2087,48 @@ mod tests {
     }
 
     #[test]
-    fn down_and_up_move_the_view_between_workers() {
+    fn down_and_up_move_the_view_between_agents() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a"), worker_view(2, "b")]));
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "a"), agent_view(3, "b")]));
         app.toggle_worker_view();
+        assert_eq!(app.selected, Some(Swarm::ROOT), "F4 starts at the root");
         app.worker_key(KeyEvent::from(KeyCode::Down));
-        assert_eq!(app.selected, Some(2), "down is the next worker");
+        assert_eq!(app.selected, Some(2), "down is the next agent");
         app.worker_key(KeyEvent::from(KeyCode::Down));
-        assert_eq!(app.selected, Some(2), "the last worker is the end of the list");
+        assert_eq!(app.selected, Some(3), "down again is the deepest");
+        app.worker_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.selected, Some(3), "the last agent is the end of the list");
         app.worker_key(KeyEvent::from(KeyCode::Up));
-        assert_eq!(app.selected, Some(1), "up is the previous worker");
-        assert!(app.in_worker_view(), "moving between workers stays in the view");
+        assert_eq!(app.selected, Some(2), "up is the previous agent");
+        assert!(app.in_worker_view(), "moving between agents stays in the view");
     }
 
     #[test]
-    fn f4_opens_and_closes_a_worker_view() {
+    fn f4_opens_and_closes_an_agent_view() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a"), worker_view(2, "b")]));
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "a"), agent_view(3, "b")]));
         app.toggle_worker_view();
         assert!(app.in_worker_view());
-        assert_eq!(app.selected, Some(1), "F4 picks the first worker when none is picked");
+        assert_eq!(app.selected, Some(Swarm::ROOT), "F4 picks the first agent when none is picked");
         app.toggle_worker_view();
         assert!(!app.in_worker_view());
         app.toggle_worker_view();
-        assert_eq!(app.selected, Some(1), "F4 reopens the worker still picked");
+        assert_eq!(app.selected, Some(Swarm::ROOT), "F4 reopens the agent still picked");
         assert!(app.in_worker_view());
     }
 
     #[test]
-    fn f4_with_no_workers_says_so_and_opens_nothing() {
+    fn f4_with_no_agents_says_so_and_opens_nothing() {
         let mut app = App::new("m");
         app.toggle_worker_view();
         assert!(!app.in_worker_view());
-        assert!(row_text(&app.lead.entries[0].lines(80, 0, true)).contains("no workers yet"));
+        assert!(row_text(&app.lead.entries[0].lines(80, 0, true)).contains("no agents yet"));
     }
 
     #[test]
-    fn a_click_outside_the_worker_panel_opens_nothing() {
+    fn a_click_outside_the_agent_panel_opens_nothing() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "job")]));
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "job")]));
         screen(&mut app, 100, 24);
         app.click(1, 1);
         assert_eq!(app.selected, None);
@@ -2147,13 +2136,13 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_event_reaches_its_own_stream_and_one_lead_lifecycle_line() {
+    fn an_agent_event_reaches_its_own_stream_and_one_lead_lifecycle_line() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(3, "fix the nav")]));
-        app.apply(UiEvent::Worker { id: 3, kind: WorkerEvent::Reply, text: "halfway\nsecond line".into() });
-        app.apply(UiEvent::Worker { id: 3, kind: WorkerEvent::Finished, text: "tests pass".into() });
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(3, "fix the nav")]));
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Reply, text: "halfway\nsecond line".into() });
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "tests pass".into() });
         let stream = worker_entries(&app, 3);
-        assert_eq!(stream.len(), 2, "the worker's stream keeps one entry per event");
+        assert_eq!(stream.len(), 2, "the agent's stream keeps one entry per event");
         assert_eq!(stream[0].body, "halfway\nsecond line", "and the whole message, lines and all");
         let lead: Vec<&str> = app.lead.entries.iter().map(|entry| entry.body.as_str()).collect();
         assert_eq!(lead.len(), 3, "one started line and one per event class: {lead:?}");
@@ -2166,63 +2155,64 @@ mod tests {
     #[test]
     fn unread_counts_what_arrived_while_the_view_was_closed_and_clears_on_open() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a"), worker_view(2, "b")]));
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "done".into() });
-        assert_eq!(app.unread_of(1), 1);
-        assert_eq!(app.unread_of(2), 0);
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "a"), agent_view(3, "b")]));
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "done".into() });
+        assert_eq!(app.unread_of(2), 1);
+        assert_eq!(app.unread_of(3), 0);
         let panel = screen(&mut app, 100, 24);
         assert!(panel.contains("· 1 new"), "the list counts what was missed: {panel}");
-        click_first_worker(&mut app);
-        assert_eq!(app.unread_of(1), 0, "opening the view clears its counter");
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Reply, text: "more".into() });
-        assert_eq!(app.unread_of(1), 0, "what the open view shows is read");
-        app.apply(UiEvent::Worker { id: 2, kind: WorkerEvent::Finished, text: "b done".into() });
-        assert_eq!(app.unread_of(2), 1, "another worker's lines still count");
+        click_first_agent(&mut app);
+        assert_eq!(app.unread_of(2), 0, "opening the view clears its counter");
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Reply, text: "more".into() });
+        assert_eq!(app.unread_of(2), 0, "what the open view shows is read");
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "b done".into() });
+        assert_eq!(app.unread_of(3), 1, "another agent's lines still count");
     }
 
     #[test]
     fn each_view_keeps_its_own_buffer_and_scroll_position() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a")]));
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "a")]));
         for index in 0..40 {
             app.apply(UiEvent::Answer(format!("lead line {index}")));
         }
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "worker line".into() });
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "agent line".into() });
         screen(&mut app, 80, 16);
         app.scroll_up();
         assert!(!app.lead.follow, "the lead stops following when scrolled up");
         let lead_scroll = app.lead.scroll;
         assert!(lead_scroll > 0, "the lead has somewhere to scroll");
         app.toggle_worker_view();
+        app.worker_key(KeyEvent::from(KeyCode::Down));
         screen(&mut app, 80, 16);
         app.scroll_top();
-        assert!(!stream_of(&app, 1).follow, "the worker's stream has its own tail state");
+        assert!(!stream_of(&app, 2).follow, "the agent's stream has its own tail state");
         app.leave_worker();
         screen(&mut app, 80, 16);
         assert_eq!(app.lead.scroll, lead_scroll, "the lead kept its position");
         assert!(!app.lead.follow);
         app.toggle_worker_view();
         screen(&mut app, 80, 16);
-        assert!(!stream_of(&app, 1).follow, "and the worker kept its own");
+        assert!(!stream_of(&app, 2).follow, "and the agent kept its own");
     }
 
     #[test]
-    fn a_worker_view_shows_only_that_workers_stream() {
+    fn an_agent_view_shows_only_that_agents_stream() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a"), worker_view(2, "b")]));
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "a"), agent_view(3, "b")]));
         app.apply(UiEvent::Answer("lead only line".into()));
-        app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "worker one line".into() });
-        app.apply(UiEvent::Worker { id: 2, kind: WorkerEvent::Finished, text: "worker two line".into() });
-        click_first_worker(&mut app);
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "agent one line".into() });
+        app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "agent two line".into() });
+        click_first_agent(&mut app);
         let view = screen(&mut app, 100, 24);
-        assert!(view.contains("worker one line"), "{view}");
-        assert!(!view.contains("worker two line"), "another worker's stream stays out: {view}");
+        assert!(view.contains("agent one line"), "{view}");
+        assert!(!view.contains("agent two line"), "another agent's stream stays out: {view}");
         assert!(!view.contains("lead only line"), "the lead's stream stays out: {view}");
         app.leave_worker();
         let lead = screen(&mut app, 100, 24);
         assert!(lead.contains("lead only line"), "{lead}");
-        assert_eq!(lead.matches("worker one line").count(), 1, "one lifecycle line, not the message entry: {lead}");
-        assert!(lead.contains("finished: worker one line"), "{lead}");
+        assert_eq!(lead.matches("agent one line").count(), 1, "one lifecycle line, not the message entry: {lead}");
+        assert!(lead.contains("finished: agent one line"), "{lead}");
     }
 
     /// A PNG header with a pixel size, so the chip has something to read.
@@ -2291,13 +2281,13 @@ mod tests {
     fn a_tool_call_hangs_off_its_message_and_the_next_entry_starts_a_paragraph() {
         let mut app = App::new("m");
         app.apply(UiEvent::Answer("on it".into()));
-        app.apply(UiEvent::ToolStarted { id: 0, tool: tools::BASH.into(), summary: "ls".into() });
+        tool_call(&mut app, 0, "bash", "ls");
         screen(&mut app, 60, 16);
         let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
         assert_eq!(rows.len(), 2, "the call sits under its message, no blank row between: {rows:?}");
         assert!(rows[0].contains("on it"), "{rows:?}");
         assert!(rows[1].contains("$ ls"), "{rows:?}");
-        app.apply(UiEvent::Notice("worker 1 is idle".into()));
+        app.apply(UiEvent::Notice("agent 2 is idle".into()));
         screen(&mut app, 60, 16);
         let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
         assert_eq!(rows.len(), 4, "a notice opens a new paragraph: {rows:?}");
@@ -2316,21 +2306,21 @@ mod tests {
     }
 
     #[test]
-    fn f5_in_a_worker_view_says_so_there_and_not_behind_it() {
+    fn f5_in_an_agent_view_says_so_there_and_not_behind_it() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a")]));
+        app.apply(UiEvent::Agents(vec![agent_view(2, "a")]));
         app.toggle_worker_view();
         let lead = app.lead.entries.len();
         assert!(!app.toggle_mouse());
         assert_eq!(app.lead.entries.len(), lead, "the lead's stream stays out of sight while a view is open");
-        let said = worker_entries(&app, 1).last().expect("the view says what F5 did");
+        let said = worker_entries(&app, 2).last().expect("the view says what F5 did");
         assert!(row_text(&said.lines(200, 0, true)).contains("select and copy with the terminal"));
     }
 
     #[test]
     fn a_paste_never_fills_a_prompt_nobody_can_see() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Workers(vec![worker_view(1, "a")]));
+        app.apply(UiEvent::Agents(vec![agent_view(2, "a")]));
         app.toggle_worker_view();
         app.paste("a pasted sentence");
         assert!(app.take_prompt().is_empty(), "a paste in a worker view never fills the hidden prompt");
