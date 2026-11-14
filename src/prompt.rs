@@ -1,89 +1,97 @@
+use crate::config;
 use crate::mcp;
-use crate::repos;
 use crate::skills;
 use crate::tools;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Names of the overseer's tools. The schema and the dispatch match both use these.
-pub(crate) const SPAWN_WORKER: &str = "spawn_worker";
-pub(crate) const MESSAGE_WORKER: &str = "message_worker";
-pub(crate) const CONTROL_WORKER: &str = "control_worker";
-pub(crate) const RESTRICT_WORKER: &str = "restrict_worker";
-pub(crate) const LIST_WORKERS: &str = "list_workers";
+/// Names of the tree tools. The schema and the dispatch match both use these.
+pub(crate) const SPAWN_AGENT: &str = "spawn_agent";
+pub(crate) const MESSAGE_AGENT: &str = "message_agent";
+pub(crate) const CONTROL_AGENT: &str = "control_agent";
+pub(crate) const LIST_AGENTS: &str = "list_agents";
 pub(crate) const LIST_REPOS: &str = "list_repos";
 
-/// Name of the worker's progress-note tool.
+/// Name of the progress-note tool an agent writes to its owner with.
 pub(crate) const REPLY: &str = "reply";
 
-/// Where a worker starts when `spawn_worker` names no directory.
-pub(crate) const DEFAULT_WORKING_DIR: &str = "/tmp";
-
-/// Longest repository list the prompt or the `list_repos` answer shows.
+/// Longest repository list `list_repos` shows.
 pub(crate) const MAX_REPOS: usize = 300;
 
-pub(crate) fn overseer_tool_definitions() -> Value {
+/// Every tool every agent has: the same set for the root and for the deepest child.
+pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy) -> Value {
+    let mut defs = tools::definitions();
+    let Some(functions) = defs.as_array_mut() else {
+        return defs;
+    };
+    functions.push(json!({"type": "function", "function": {
+        "name": REPLY,
+        "description": "Send a short progress note to the agent that owns you, without ending your turn.",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+    }}));
+    for tool in swarm_tool_definitions() {
+        functions.push(tool);
+    }
+    // A read-only agent is offered none of the MCP tools: their side effects are the server's,
+    // not something the policy can predict.
+    if !policy.read_only {
+        functions.extend(mcp.tool_defs());
+    }
+    defs
+}
+
+/// The tools an agent commands the tree with, below the file tools.
+fn swarm_tool_definitions() -> Vec<Value> {
     let spawn = with_policy(json!({
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": format!("Directory the worker works in; relative paths resolve there. Defaults to {DEFAULT_WORKING_DIR}.")},
-            "task": {"type": "string", "description": "Complete, self-contained instructions. The worker sees nothing else."}
+            "path": {"type": "string", "description": format!("Directory the agent works in; relative paths resolve there. Defaults to {}.", config::DEFAULT_WORKING_DIR)},
+            "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
         },
         "required": ["task"]
     }));
-    let restrict = with_policy(json!({
-        "type": "object",
-        "properties": {"id": {"type": "integer"}},
-        "required": ["id"]
-    }));
-    json!([
-        {"type": "function", "function": {
-            "name": SPAWN_WORKER,
-            "description": "Start a new worker agent in a directory, under the restrictions you give it. Returns the worker id at once; the worker's final answer arrives later as a [worker N finished] message.",
+    vec![
+        json!({"type": "function", "function": {
+            "name": SPAWN_AGENT,
+            "description": "Start a new agent below you, in a directory, under the rights you give it. Returns the agent id at once; its final answer arrives later as an [agent N finished] message. Its rights are fixed for its lifetime: deny `spawn_agent` in `deny_tools` and it can never start sub-agents. To change a running agent's rights, stop it (which stops everything below it) and spawn a new one.",
             "parameters": spawn
-        }},
-        {"type": "function", "function": {
-            "name": MESSAGE_WORKER,
-            "description": "Send a follow-up instruction to an existing worker. It keeps its history; a busy worker reads it after its current instruction unless the message is urgent.",
+        }}),
+        json!({"type": "function", "function": {
+            "name": MESSAGE_AGENT,
+            "description": "Send a follow-up instruction to an agent you own. It keeps its history; a busy agent reads it after its current instruction unless the message is urgent.",
             "parameters": {"type": "object", "properties": {
                 "id": {"type": "integer"},
                 "text": {"type": "string"},
-                "urgent": {"type": "boolean", "description": "Cut the running turn short and deliver this now, ahead of anything queued. Its running command is killed and its partial history dropped; a model call already in flight finishes first."}
+                "urgent": {"type": "boolean", "description": "Cut the running turn short and deliver this now, ahead of anything queued. Its running command is killed; a model call already in flight finishes first."}
             }, "required": ["id", "text"]}
-        }},
-        {"type": "function", "function": {
-            "name": CONTROL_WORKER,
-            "description": "Administer a worker. pause: it finishes the current instruction, then holds every queued one. resume: it takes work again. stop: its running turn is killed and it never takes work again. restart: kill the running turn, drop the history and start again from the given task.",
+        }}),
+        json!({"type": "function", "function": {
+            "name": CONTROL_AGENT,
+            "description": "Administer an agent you own. pause: it finishes the current instruction, then holds every queued one. resume: it takes work again. stop: its running turn is killed, it takes no more work, and everything below it is stopped too.",
             "parameters": {"type": "object", "properties": {
                 "id": {"type": "integer"},
-                "action": {"type": "string", "enum": ["pause", "resume", "stop", "restart"]},
-                "task": {"type": "string", "description": "Restart only: the instruction to start from. Defaults to the worker's original task."}
+                "action": {"type": "string", "enum": ["pause", "resume", "stop"]}
             }, "required": ["id", "action"]}
-        }},
-        {"type": "function", "function": {
-            "name": RESTRICT_WORKER,
-            "description": "Change what a worker may do from now on. An omitted field keeps its current value; the worker's prompt is rewritten to match.",
-            "parameters": restrict
-        }},
-        {"type": "function", "function": {
-            "name": LIST_WORKERS,
-            "description": "List workers with their state (working, paused, stopped, idle, failed), restrictions, directory and initial task.",
+        }}),
+        json!({"type": "function", "function": {
+            "name": LIST_AGENTS,
+            "description": "List the agents you own — yourself and everything below you — with depth, state, rights, directory and initial task.",
             "parameters": {"type": "object", "properties": {}}
-        }},
-        {"type": "function", "function": {
+        }}),
+        json!({"type": "function", "function": {
             "name": LIST_REPOS,
-            "description": "List the git repositories that already exist under the configured roots, so a worker can start in one. Never ask the user for a path.",
+            "description": "List the git repositories that already exist under the configured roots, so an agent can start in one. Never ask the user for a path.",
             "parameters": {"type": "object", "properties": {}}
-        }}
-    ])
+        }}),
+    ]
 }
 
-/// The restrictions an overseer tool may set, shared so the two schemas cannot drift.
+/// The restrictions `spawn_agent` may set, as the schema states them.
 fn policy_properties() -> Value {
     json!({
         "read_only": {"type": "boolean", "description": "Refuse write_file, and refuse any bash command that is not a read-only program (ls cat head tail wc stat file tree pwd rg grep diff jq, and read-only git subcommands)."},
-        "deny_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool names this worker may never call: bash, read_file, write_file, reply."},
+        "deny_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools this agent may never call: bash, read_file, write_file, reply, spawn_agent, message_agent, control_agent, list_agents, list_repos. Denying spawn_agent stops it from ever starting sub-agents."},
         "allow_commands": {"type": "array", "items": {"type": "string"}, "description": "When non-empty, a bash command must start with one of these prefixes."},
         "deny_commands": {"type": "array", "items": {"type": "string"}, "description": "A bash command starting with one of these prefixes never runs. Deny beats allow."}
     })
@@ -100,118 +108,86 @@ fn with_policy(mut parameters: Value) -> Value {
     parameters
 }
 
-/// Every tool a worker may call: the built-ins, `reply`, and the MCP servers' tools.
-///
-/// A read-only worker is offered none of the MCP tools: their side effects are the server's, not
-/// something the policy can predict.
-pub(crate) fn worker_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy) -> Value {
-    let mut defs = tools::definitions();
-    if let Some(functions) = defs.as_array_mut() {
-        functions.push(json!({"type": "function", "function": {
-            "name": REPLY,
-            "description": "Send a short progress note to Overseer without ending your turn.",
-            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
-        }}));
-        if !policy.read_only {
-            functions.extend(mcp.tool_defs());
-        }
-    }
-    defs
+/// What one agent is told about itself and its place in the tree.
+pub(crate) struct AgentFacts<'a> {
+    pub(crate) id: usize,
+    pub(crate) parent: Option<usize>,
+    pub(crate) depth: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) dir: &'a Path,
+    pub(crate) policy: &'a tools::Policy,
+    /// Agents it owns right now.
+    pub(crate) children: Vec<usize>,
+    /// The skills it may read, and the servers whose tools it may call.
+    pub(crate) skills: &'a skills::Catalogue,
+    pub(crate) mcp: &'a mcp::Registry,
+    /// The agent the user talks to.
+    pub(crate) root: bool,
 }
 
-pub(crate) fn overseer_prompt(roots: &[PathBuf], skills: &skills::Catalogue, mcp: &mcp::Registry) -> String {
-    let listed: Vec<String> = roots.iter().map(|root| format!("- {}", root.display())).collect();
-    let mut repos = repos::find(roots);
-    let total = repos.len();
-    repos.truncate(MAX_REPOS);
-    let mut known = if repos.is_empty() {
-        "none found under those roots".to_string()
+pub(crate) fn agent_prompt(facts: &AgentFacts<'_>) -> String {
+    let remaining = facts.max_depth.saturating_sub(facts.depth);
+    let mut out = format!(
+        "You are agent {} of a tree of identical agents, working in {}; relative paths resolve there.\n\
+Depth: you are at depth {} and agents may be nested to depth {} (config `max_depth`), so you can start {} more level(s) of agents with `spawn_agent`.\n",
+        facts.id,
+        facts.dir.display(),
+        facts.depth,
+        facts.max_depth,
+        remaining
+    );
+    if facts.root {
+        out.push_str("The user talks to you directly; your final answer is what they read.\n");
     } else {
-        repos.iter().map(|repo| format!("- {}", repo.display())).collect::<Vec<_>>().join("\n")
-    };
-    if total > MAX_REPOS {
-        let _ = write!(known, "\n[{} more repositories not listed]", total - MAX_REPOS);
-    }
-    let catalogue = skills.catalogue();
-    let mut reachable = String::new();
-    if !catalogue.is_empty() {
-        let _ = write!(
-            reachable,
-            "Skills you and your workers can read (a worker reads one with `read_file skill://<name>`; name it in a task when it fits):\n{catalogue}\n"
+        let parent = facts.parent.unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "Agent {parent} started you and owns you: your final answer goes to it, so make it a complete report."
         );
     }
-    let servers = mcp.tool_counts();
-    if !servers.is_empty() {
-        let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
-        let _ = writeln!(reachable, "MCP servers your workers have: {}", names.join(", "));
+    if !facts.children.is_empty() {
+        let listed: Vec<String> = facts.children.iter().map(|id| format!("agent {id}")).collect();
+        let _ = writeln!(out, "Agents you own right now: {}.", listed.join(", "));
     }
-    format!(
-        "You are Overseer: you coordinate a fleet of worker agents and never do the work yourself.\n{}\n\
-Roots you know about:\n{}\n\
-Repositories that exist right now:\n{}\n\
-{}\
-Delegate every request to a worker, one worker per independent task, and give each worker complete instructions: it sees nothing else.\n\
-Never ask the user for a path, a command output or any other fact a worker could find.\n\
-Reuse an idle worker for follow-ups in the same directory instead of starting another. Put a task in the repository listed above when one matches; start a repository hunt only when none does.\n\
-Parallel work in one repository means one worktree per worker on its own branch: `git worktree add ../<repo>-<slug> -b <type>/<slug> <base-branch>`. Two workers editing the same checkout is a dispatch bug, not a merge problem to fix later.\n\
-Base every worktree on the branch whose build is actually deployed or installed, not on whatever HEAD happens to be, and state that base branch in each worker's instructions.\n\
-Messages that start with [worker N ...] come from workers, not the user: \"says\" is a progress note or question, \"finished\" carries the worker's final report, \"failed\" an error, \"interrupted\" a turn you cut short. \
-Answer a worker question yourself when you can; otherwise ask the user. Orchestration is not done when workers report: integrate their branches into the main repository one at a time, in dependency order, with a PR where the repository has a remote and a review flow and with a rebase (or rebase-then-fast-forward) where it is local only, so history stays linear and never merge-commit soup. Workers never merge or rebase each other's branches: a worker pushes its branch and opens a PR against the agreed base branch when it finishes, or leaves a local branch and says so when the repository has no remote. The orchestrator owns integration: merge in dependency order, ask the next worker to rebase onto the updated base between merges when the branches touch the same code, and verify build and tests green on the integrated result before announcing completion. If branches conflict, rebase the offending branch onto the updated base and re-run build and tests instead of hand-resolving in the shared checkout. Remove integrated worktrees with `git worktree remove` and report the final branch state to the user. Verify the reconciliation yourself before declaring the job done: build and tests green on the integrated result, and the deployed artifact rebuilt from the integrated branch if the user runs an installed binary.",
-        tool_section(&overseer_tool_definitions()),
-        listed.join("\n"),
-        known,
-        reachable
-    )
-}
-
-pub(crate) fn worker_prompt(
-    dir: &Path,
-    policy: &tools::Policy,
-    skills: &skills::Catalogue,
-    mcp: &mcp::Registry,
-) -> String {
-    let defs = worker_tool_definitions(mcp, policy);
-    let mut sections: Vec<String> = vec![format!(
-        "You are a worker agent working in the directory {}; relative paths resolve there. Overseer, a coordinator, sends you instructions.",
-        dir.display()
-    )];
-    let restrictions = policy.describe();
-    if !restrictions.trim().is_empty() {
-        sections.push(restrictions.trim_end().to_string());
-    }
-    let catalogue = skills.catalogue();
+    out.push_str(facts.policy.describe().as_str());
+    let catalogue = facts.skills.catalogue();
     if !catalogue.is_empty() {
-        sections.push(format!(
-            "Skills: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>"
-        ));
+        let _ = write!(
+            out,
+            "Skills you can read: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>\n"
+        );
     }
-    for (server, notes) in mcp.instructions() {
-        sections.push(format!("MCP server notes ({server}):\n{notes}"));
+    for (server, notes) in facts.mcp.instructions() {
+        let _ = write!(out, "MCP server notes ({server}):\n{notes}\n");
     }
-    sections.push(tool_section(&defs));
+    out.push_str(
+        "Ownership is one way: you may message, pause, resume or stop any agent below you, and nobody below you may do any of that to you. You cannot command your parent, your siblings, or any agent outside your own subtree.\n\
+Your rights are fixed: nothing can widen or narrow them while you run, and the same holds for the agents you own.\n\
+Messages that start with [agent N ...] come from an agent you own: \"says\" is a progress note or a question, \"finished\" carries its final report, \"failed\" an error, \"interrupted\" a turn you cut short. Answer a question yourself when you can.\n\
+Do the work yourself when it is yours to do; delegate when a task splits into independent parts, one agent per part, each with complete instructions because it sees nothing of your context except what you write. Parallel work in one repository means one worktree per agent on its own branch: `git worktree add ../<repo>-<slug> -b <type>/<slug> <base-branch>`. Two agents editing the same checkout is a dispatch bug, not a merge problem to fix later.\n\
+Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
+If you need a decision to continue, end your turn with the question as your final answer.\n",
+    );
+    let defs = agent_tool_definitions(facts.mcp, facts.policy);
+    out.push_str(&tool_section(&defs));
     // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
-    let counts = mcp.tool_counts();
-    if !policy.read_only && !counts.is_empty() {
+    let counts = facts.mcp.tool_counts();
+    if !facts.policy.read_only && !counts.is_empty() {
         let lines: Vec<String> = counts
             .iter()
             .map(|(server, count)| {
                 format!("MCP tools on {server}: {count} (mcp__<server>_<tool>; schemas are in the tools array)")
             })
             .collect();
-        sections.push(lines.join("\n"));
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
     }
-    sections.push(
-        "Do the work yourself and keep Overseer informed as you go. When you stop calling tools, your final answer is delivered to Overseer, so make it a complete report. \
-Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes. \
-If you need a decision to continue, end your turn with the question as your final answer."
-            .to_string(),
-    );
-    sections.join("\n")
+    out
 }
 
 /// Renders tool names and descriptions into prompt lines; the `tools` array carries the schemas.
 fn tool_section(defs: &Value) -> String {
-    let tools: Vec<String> = defs
+    let lines: Vec<String> = defs
         .as_array()
         .into_iter()
         .flatten()
@@ -226,5 +202,5 @@ fn tool_section(defs: &Value) -> String {
             Some(format!("- {name}: {description}"))
         })
         .collect();
-    format!("Your tools (same schemas as the `tools` array of every request):\n{}", tools.join("\n"))
+    format!("Tools:\n{}\n", lines.join("\n"))
 }

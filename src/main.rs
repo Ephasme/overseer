@@ -3,7 +3,6 @@ mod clipboard;
 mod config;
 mod conflict;
 mod event;
-mod fleet;
 mod llm;
 mod mcp;
 mod plain;
@@ -12,6 +11,7 @@ mod repos;
 mod secrets;
 mod session;
 mod skills;
+mod swarm;
 mod tools;
 mod tui;
 mod url;
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         Ok(())
     };
     // A frontend that returned early leaves the core waiting for an event nobody will send.
-    let _ = stop.send(fleet::Event::Exit);
+    let _ = stop.send(swarm::Event::Exit);
     // A panicking core must exit non-zero, not look like a clean quit.
     core.join().map_err(|_| anyhow::anyhow!("the core thread panicked"))?;
     frontend

@@ -1,5 +1,5 @@
 use crate::event::UiEvent;
-use crate::fleet::{Event, Progress};
+use crate::swarm::{Event, Progress};
 use std::io::{self, BufRead};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -15,15 +15,12 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
             UiEvent::Error(line) => eprintln!("error: {line}"),
             UiEvent::Debug(line) => eprintln!("{line}"),
             UiEvent::Answer(text) => println!("{text}"),
-            UiEvent::ToolStarted { tool, summary, .. } => eprintln!("· {tool} {summary}"),
-            UiEvent::Progress { id, progress } => eprintln!("[worker {id}] {}", describe(&progress)),
-            UiEvent::ToolFinished { .. }
-            | UiEvent::Worker { .. }
-            | UiEvent::Delta(_)
-            | UiEvent::TurnBoundary
-            | UiEvent::WorkerDelta { .. }
-            | UiEvent::Workers(_)
-            | UiEvent::Busy(_) => {}
+            UiEvent::Agent { id, kind, text } => {
+                let line = text.lines().next().unwrap_or_default();
+                eprintln!("agent {id} {}: {line}", kind.verb());
+            }
+            UiEvent::Progress { id, progress } => eprintln!("[agent {id}] {}", describe(&progress)),
+            UiEvent::AgentDelta { .. } | UiEvent::TurnBoundary | UiEvent::Agents(_) | UiEvent::Busy(_) => {}
             UiEvent::Done => break,
         }
     }
