@@ -1,5 +1,6 @@
 use crate::config;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +11,8 @@ const DIR: &str = "overseer-attachments";
 /// What a paste found on the clipboard.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Paste {
+    /// The clipboard's text, which belongs in the composer.
+    Text(String),
     /// The clipboard's image, written to this file.
     Image(PathBuf),
     /// The clipboard holds no image.
@@ -39,11 +42,22 @@ on run argv
 \treturn \"ok\"
 end run";
 
+/// What the clipboard holds, read in one go.
+///
+/// The caller runs this off its own thread: the image path spawns `osascript` and copies every byte
+/// of the picture, far too slow for the frame that drew the chip.
+pub(crate) fn read() -> Paste {
+    match text() {
+        Some(text) => Paste::Text(text),
+        None => image(),
+    }
+}
+
 /// The clipboard's text, when it holds some.
 ///
 /// A terminal hands a TUI its clipboard only as text, in bracketed paste, so this covers the paste
 /// that is not an image; arboard reads it without the image support its features would pull in.
-pub(crate) fn text() -> Option<String> {
+fn text() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
@@ -66,6 +80,63 @@ pub(crate) fn image() -> Paste {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     classify(output.status.code(), stdout.trim(), stderr.trim(), &path)
+}
+
+/// What the attachment chip says about a pasted image.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Info {
+    /// The file's name, without its directory: the chip says what was pasted, not where it went.
+    pub(crate) name: String,
+    /// Its size on disk, so a screenshot is recognisable before it is sent.
+    pub(crate) bytes: u64,
+    /// The PNG's pixel size, when its header parses: the closest a terminal gets to a thumbnail.
+    pub(crate) pixels: Option<(u32, u32)>,
+}
+
+impl Info {
+    /// The chip's one line: `paste-1.png · 2560×1600 · 12.9 MB`.
+    pub(crate) fn chip(&self) -> String {
+        let size = size(self.bytes);
+        match self.pixels {
+            Some((width, height)) => format!("{} · {width}×{height} · {size}", self.name),
+            None => format!("{} · {size}", self.name),
+        }
+    }
+}
+
+/// Reads what the chip shows about `path`. A file that vanished answers with its name alone.
+pub(crate) fn info(path: &Path) -> Info {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
+    let bytes = fs::metadata(path).map_or(0, |meta| meta.len());
+    Info { name, bytes, pixels: pixels(path) }
+}
+
+/// A byte count a glance can read: `812 B`, `128.5 kB`, `12.9 MB`.
+///
+/// Decimal units, integer arithmetic: a size on screen is an aid, and a cast to `f64` for one
+/// decimal place is not worth the lint it trips.
+fn size(bytes: u64) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    let (divisor, unit) = if bytes < 1_000_000 { (1_000, "kB") } else { (1_000_000, "MB") };
+    let tenths = bytes.saturating_mul(10) / divisor;
+    format!("{}.{} {unit}", tenths / 10, tenths % 10)
+}
+
+/// The PNG's pixel size, read from the 24 bytes that hold the signature and the `IHDR` header.
+///
+/// The image crate went away with the move to `osascript`; a header this cheap keeps the chip
+/// informative without it, and anything that does not parse simply has no size.
+fn pixels(path: &Path) -> Option<(u32, u32)> {
+    let mut head = [0_u8; 24];
+    File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if head.get(..8)? != b"\x89PNG\r\n\x1a\n" || head.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(head.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(head.get(20..24)?.try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// Drops a pasted image once nothing needs it.
@@ -144,6 +215,58 @@ mod tests {
         let outcome = classify(Some(1), "", "execution error: no permission (-5000)", &path);
         assert!(matches!(&outcome, Paste::Failed(why) if why.contains("no permission")), "{outcome:?}");
         assert!(!path.exists(), "a partial write is dropped");
+    }
+
+    #[test]
+    fn a_size_is_read_at_a_glance() {
+        assert_eq!(size(812), "812 B");
+        assert_eq!(size(1_000), "1.0 kB");
+        assert_eq!(size(128_500), "128.5 kB");
+        assert_eq!(size(12_875_152), "12.8 MB");
+        assert_eq!(size(u64::MAX), "1844674407370.9 MB", "a size past any disk still reads");
+    }
+
+    #[test]
+    fn the_pixel_size_comes_from_the_png_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&2560_u32.to_be_bytes());
+        bytes.extend_from_slice(&1600_u32.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(pixels(&path), Some((2560, 1600)));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_png_has_no_pixel_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = dir.path().join("short.png");
+        fs::write(&short, b"\x89PNG").unwrap();
+        assert_eq!(pixels(&short), None, "a file too short to hold a header has no size");
+        let other = dir.path().join("other.png");
+        fs::write(&other, b"GIF89a\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        assert_eq!(pixels(&other), None, "only a PNG header is read");
+    }
+
+    #[test]
+    fn the_chip_line_names_the_file_its_pixels_and_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&1024_u32.to_be_bytes());
+        bytes.extend_from_slice(&768_u32.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(info(&path).chip(), "shot.png · 1024×768 · 24 B");
+    }
+
+    #[test]
+    fn a_file_that_is_gone_still_has_a_name_to_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanished.png");
+        let info = info(&path);
+        assert_eq!(info.name, "vanished.png");
+        assert_eq!(info.bytes, 0);
+        assert_eq!(info.pixels, None);
     }
 
     #[test]

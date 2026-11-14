@@ -1,5 +1,6 @@
 mod app;
 
+use crate::clipboard;
 use crate::event::UiEvent;
 use crate::fleet::Event;
 use anyhow::Result;
@@ -17,6 +18,9 @@ use std::time::Duration;
 
 /// How long the loop waits for a key before draining the core's events.
 const POLL: Duration = Duration::from_millis(50);
+
+/// A clipboard read on its way back, with the id of the paste that asked for it.
+type Copied = (u64, clipboard::Paste);
 
 /// Runs the full-screen frontend until the user quits or the core ends.
 pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str) -> Result<()> {
@@ -37,13 +41,15 @@ fn event_loop(
     ui: Receiver<UiEvent>,
     input: Sender<Event>,
 ) -> Result<()> {
+    // Clipboard reads come back here: they run on their own thread so a paste never stalls a frame.
+    let (pasted, copied) = mpsc::channel::<Copied>();
     loop {
         if app.take_dirty() {
             terminal.draw(|frame| app.render(frame))?;
         }
         if event::poll(POLL)? {
             match event::read()? {
-                Input::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, &input, key),
+                Input::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, &input, &pasted, key),
                 Input::Paste(text) => app.insert(&text),
                 Input::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.wheel(true),
@@ -65,6 +71,11 @@ fn event_loop(
                 }
             }
         }
+        // A read that landed shows up in the frame after this one; a sender that went away with the
+        // loop's reader is not news.
+        while let Ok((id, found)) = copied.try_recv() {
+            app.attach(id, found);
+        }
         app.tick();
         if app.quit {
             // The events that ended the session are already applied: show them once before leaving.
@@ -76,7 +87,7 @@ fn event_loop(
     }
 }
 
-fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
+fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -89,7 +100,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
         // A worker view owns the keys while it is open: esc returns to the fleet from there.
         _ if app.in_worker_view() => app.worker_key(key),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
-        KeyCode::Char('v') if ctrl => app.paste(),
+        KeyCode::Char('v') if ctrl => copy(app, pasted),
         KeyCode::Char('x') if ctrl => app.detach(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
         KeyCode::Char('n') if ctrl => app.recall_next(),
@@ -104,6 +115,20 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
         KeyCode::F(4) => app.toggle_worker_view(),
         _ => app.input(key),
     }
+}
+
+/// Ctrl+V: the chip goes up at once and the clipboard is read on a thread of its own.
+///
+/// Reading it on this thread would freeze the frame while `osascript` copies the whole image; the
+/// loop applies the answer when it lands.
+fn copy(app: &mut App, pasted: &Sender<Copied>) {
+    let Some(id) = app.begin_paste() else { return };
+    let sender = pasted.clone();
+    std::thread::spawn(move || {
+        let found = clipboard::read();
+        // The loop drops this receiver when it ends, and then there is nobody left to tell.
+        let _ = sender.send((id, found));
+    });
 }
 
 fn quit(app: &mut App, input: &Sender<Event>) {
@@ -134,7 +159,8 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         let (input, queue) = mpsc::channel();
-        handle_key(app, &input, KeyEvent::from(code));
+        let (pasted, _reads) = mpsc::channel();
+        handle_key(app, &input, &pasted, KeyEvent::from(code));
         assert!(queue.try_recv().is_err(), "a key pressed in a worker view wakes the core");
     }
 

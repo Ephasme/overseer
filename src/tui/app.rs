@@ -44,6 +44,12 @@ const ATTACHMENT_LEAD: &str = " ▸ image ";
 /// Its remove affordance, kept visible whatever the path's length.
 const ATTACHMENT_HINT: &str = " · ctrl+x removes";
 
+/// The same affordance while the chip holds no image to remove.
+const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
+
+/// What the chip says while the clipboard is being read.
+const ATTACHMENT_READING: &str = "reading the clipboard…";
+
 /// Key hints on the right of the status line.
 const HINT: &str =
     "enter send · F2 workers · F3 output · F4 view · ctrl+v paste · ctrl+x drop image · ctrl+j newline · ctrl+d quit";
@@ -295,6 +301,21 @@ fn truncate(text: &str, width: usize) -> String {
     format!("{head}…")
 }
 
+/// Columns a chip's middle keeps before its trailing hint is worth showing.
+const CHIP_ROOM: usize = 12;
+
+/// The columns left for a chip's variable middle, and the hint when the line can still hold it.
+///
+/// A narrow terminal drops the hint rather than the middle: the status line carries the same keys.
+fn tail(hint: &str, fixed: usize, width: usize) -> (Option<Span<'static>>, usize) {
+    let hint = Span::styled(hint.to_string(), DIM);
+    let columns = hint.width();
+    if width >= fixed + columns + CHIP_ROOM {
+        return (Some(hint), width - fixed - columns);
+    }
+    (None, width.saturating_sub(fixed).max(CHIP_ROOM))
+}
+
 /// One view's scrollback: its own entries, the cache of their lines, and its own position.
 ///
 /// Every view keeps its own, so switching views loses neither a buffer nor a scroll position.
@@ -445,6 +466,26 @@ struct WorkerStream {
     unread: usize,
 }
 
+/// The image the composer carries into the next message, as the chip above it shows it.
+enum Attachment {
+    /// Ctrl+V landed and the clipboard is being read: the chip says so before the read starts.
+    Reading,
+    /// The image the paste wrote, with what the chip says about it.
+    Ready { path: PathBuf, info: clipboard::Info },
+    /// The paste found no image: the chip says why until it is dismissed.
+    Failed(String),
+}
+
+impl Attachment {
+    /// The file this chip holds, when it holds one.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Ready { path, .. } => Some(path),
+            Self::Reading | Self::Failed(_) => None,
+        }
+    }
+}
+
 fn composer(model: &str) -> TextArea<'static> {
     let mut area = TextArea::default();
     area.set_block(Block::bordered().border_style(DIM).title(format!(" message · {model} ")).title_style(DIM));
@@ -461,8 +502,10 @@ pub(super) struct App {
     /// One stream per worker, created when the worker joins the roster.
     worker_streams: Vec<WorkerStream>,
     composer: TextArea<'static>,
-    /// PNG saved from the clipboard, sent with the next message and then dropped.
-    attachment: Option<PathBuf>,
+    /// What ctrl+V found: sent with the next message, or a read still in flight, or why there is none.
+    attachment: Option<Attachment>,
+    /// Id of the read the chip is waiting for; a read whose id is stale lands as nobody's.
+    paste: u64,
     model: String,
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
@@ -505,6 +548,7 @@ impl App {
             worker_streams: Vec::new(),
             composer: composer(model),
             attachment: None,
+            paste: 0,
             model: model.to_string(),
             history: Vec::new(),
             recall: None,
@@ -763,7 +807,7 @@ impl App {
     /// Advances the spinner, which turns for a thinking overseer and for a tool call in flight.
     pub(super) fn tick(&mut self) {
         let running = self.running_tool();
-        if (!self.busy && running.is_none()) || self.last_tick.elapsed() < TICK {
+        if (!self.busy && running.is_none() && !self.reading()) || self.last_tick.elapsed() < TICK {
             return;
         }
         self.last_tick = Instant::now();
@@ -891,17 +935,36 @@ impl App {
         frame.render_widget(Paragraph::new(rows), inner);
     }
 
-    /// The pending image, one compact chip above the composer.
+    /// The pending image, one compact chip above the composer: what was pasted, what it weighs, and
+    /// whether it is still being read. The chip never wraps, and a long name is cut rather than the
+    /// verdict or the way out being pushed off the line.
     fn render_attachment(&self, frame: &mut Frame, area: Rect) {
-        let Some(path) = &self.attachment else { return };
-        // The hint is the point of the chip, so a long path is cut instead of pushing it off the line.
-        let fixed = ATTACHMENT_LEAD.len() + ATTACHMENT_HINT.len() + 2;
-        let room = usize::from(area.width).saturating_sub(fixed).max(8);
-        let line = Line::from(vec![
-            Span::styled(ATTACHMENT_LEAD, Style::new().fg(MAGENTA)),
-            Span::styled(truncate(&path.display().to_string(), room), Style::new()),
-            Span::styled(ATTACHMENT_HINT, DIM),
-        ]);
+        let Some(attachment) = &self.attachment else { return };
+        let lead = Span::styled(ATTACHMENT_LEAD, Style::new().fg(MAGENTA));
+        // The chip pays for its padding before it places a single column of text.
+        let width = usize::from(area.width).saturating_sub(2);
+        let line = match attachment {
+            Attachment::Reading => {
+                let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
+                let room = width.saturating_sub(ATTACHMENT_LEAD.len());
+                let message = truncate(&format!("{glyph} {ATTACHMENT_READING}"), room);
+                Line::from(vec![lead, Span::styled(message, Style::new().fg(YELLOW))])
+            }
+            Attachment::Ready { info, .. } => {
+                let status = Span::styled(" · ✓ attached", Style::new().fg(GREEN));
+                let (hint, room) = tail(ATTACHMENT_HINT, ATTACHMENT_LEAD.len() + status.width(), width);
+                let mut spans = vec![lead, Span::styled(truncate(&info.chip(), room), Style::new()), status];
+                spans.extend(hint);
+                Line::from(spans)
+            }
+            Attachment::Failed(why) => {
+                let (hint, room) = tail(ATTACHMENT_DISMISS, ATTACHMENT_LEAD.len() + 2, width);
+                let verdict = Span::styled(format!("✗ {}", truncate(why, room)), Style::new().fg(RED));
+                let mut spans = vec![lead, verdict];
+                spans.extend(hint);
+                Line::from(spans)
+            }
+        };
         frame.render_widget(Paragraph::new(line).block(Block::new().padding(Padding::horizontal(1))), area);
     }
 
@@ -1095,7 +1158,14 @@ impl App {
     /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
         let mut text = self.composer.lines().join("\n").trim().to_string();
-        if let Some(path) = self.attachment.take() {
+        let path = match self.attachment.take() {
+            Some(Attachment::Ready { path, .. }) => Some(path),
+            // A read still in flight, or a chip that found nothing, has no file to name.
+            _ => None,
+        };
+        // Whatever the chip held is spent: a read that lands after this message belongs to none.
+        self.paste = self.paste.wrapping_add(1);
+        if let Some(path) = path {
             // The chat-completions request carries text only: the picture rides along as the path of a
             // file the model can open with its own tools.
             let note = format!("[attached image: {}]", path.display());
@@ -1122,38 +1192,72 @@ impl App {
         self.dirty = true;
     }
 
-    /// Ctrl+V: the system clipboard, which a terminal hands a TUI only as text, in bracketed paste.
+    /// Ctrl+V, the instant the key lands: the chip goes up before the clipboard is read.
     ///
-    /// Text goes in first, the common case and the fast one; an image becomes an attachment, since a
-    /// PNG cannot be typed into a composer and the model only reads text.
-    pub(super) fn paste(&mut self) {
-        if let Some(text) = clipboard::text() {
-            self.insert(&text);
-            return;
+    /// The read spawns `osascript` and copies the whole image, which would freeze the frame for as
+    /// long as it runs; it belongs on a thread of its own. Returns the id the read must carry back,
+    /// or nothing while one is already in flight, so a held key cannot start a second.
+    pub(super) fn begin_paste(&mut self) -> Option<u64> {
+        if matches!(self.attachment, Some(Attachment::Reading)) {
+            return None;
         }
-        self.attach(clipboard::image());
+        self.clear_attachment();
+        self.paste = self.paste.wrapping_add(1);
+        self.attachment = Some(Attachment::Reading);
+        self.dirty = true;
+        Some(self.paste)
     }
 
-    /// Takes what a paste found: an image to attach, or a notice saying why there is none.
-    pub(super) fn attach(&mut self, paste: clipboard::Paste) {
-        match paste {
-            clipboard::Paste::Image(path) => {
-                self.detach();
-                self.attachment = Some(path);
+    /// Takes what a paste found: an image to attach, text for the composer, or why there is neither.
+    ///
+    /// A read whose id went stale was dropped or replaced while it ran: it shows nothing, and a file
+    /// it wrote is removed, since no message will ever name it.
+    pub(super) fn attach(&mut self, id: u64, paste: clipboard::Paste) {
+        if id != self.paste {
+            if let clipboard::Paste::Image(path) = paste {
+                clipboard::discard(&path);
             }
-            clipboard::Paste::Empty => self.notice(NO_CLIPBOARD),
+            return;
+        }
+        self.clear_attachment();
+        match paste {
+            clipboard::Paste::Text(text) => self.insert(&text),
+            clipboard::Paste::Image(path) => {
+                let info = clipboard::info(&path);
+                self.attachment = Some(Attachment::Ready { path, info });
+            }
+            clipboard::Paste::Empty => {
+                self.attachment = Some(Attachment::Failed(NO_CLIPBOARD.to_string()));
+                self.notice(NO_CLIPBOARD);
+            }
             clipboard::Paste::Failed(why) => {
+                self.attachment = Some(Attachment::Failed(why.clone()));
                 self.push(Role::Error, String::new(), format!("cannot read the clipboard: {why}"));
             }
         }
         self.dirty = true;
     }
 
+    /// Whether the clipboard is being read, which keeps the chip's spinner turning.
+    fn reading(&self) -> bool {
+        matches!(self.attachment, Some(Attachment::Reading))
+    }
+
     /// Drops the attachment and its temp file.
     pub(super) fn detach(&mut self) {
-        if let Some(path) = self.attachment.take() {
-            clipboard::discard(&path);
-            self.dirty = true;
+        if self.attachment.is_none() {
+            return;
+        }
+        self.clear_attachment();
+        // A read still in flight lands as nobody's once its id is stale.
+        self.paste = self.paste.wrapping_add(1);
+        self.dirty = true;
+    }
+
+    /// Drops what the chip holds, removing a pasted file, and keeps the read's id as it is.
+    fn clear_attachment(&mut self) {
+        if let Some(path) = self.attachment.take().as_ref().and_then(Attachment::path) {
+            clipboard::discard(path);
         }
     }
 
@@ -1290,11 +1394,42 @@ mod paste_tests {
     use super::*;
     use clipboard::Paste;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A PNG header the chip can read a size from.
     fn saved(dir: &Path) -> PathBuf {
         let path = dir.join("paste-1-1.png");
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&2560_u32.to_be_bytes());
+        png.extend_from_slice(&1600_u32.to_be_bytes());
+        fs::write(&path, &png).expect("a png");
+        path
+    }
+
+    /// A file where a real paste writes it, so the chip can drop it: `discard` only removes its own.
+    fn pasted() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join("overseer-attachments");
+        fs::create_dir_all(&dir).expect("the attachments dir");
+        let name = format!("chip-test-{}-{}.png", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+        let path = dir.join(name);
         fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("a png");
         path
+    }
+
+    /// What the loop does with a read that landed: the paste's own id, then its answer.
+    fn land(app: &mut App, paste: Paste) {
+        let id = app.begin_paste().expect("nothing else is being read");
+        app.attach(id, paste);
+    }
+
+    fn chip(app: &App) -> String {
+        match &app.attachment {
+            Some(Attachment::Ready { info, .. }) => info.chip(),
+            Some(Attachment::Reading) => ATTACHMENT_READING.to_string(),
+            Some(Attachment::Failed(why)) => format!("failed: {why}"),
+            None => String::new(),
+        }
     }
 
     #[test]
@@ -1302,15 +1437,55 @@ mod paste_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
         let path = saved(dir.path());
-        app.attach(Paste::Image(path.clone()));
-        assert_eq!(app.attachment.as_deref(), Some(path.as_path()));
+        land(&mut app, Paste::Image(path.clone()));
+        match &app.attachment {
+            Some(Attachment::Ready { path: kept, info }) => {
+                assert_eq!(kept, &path);
+                assert_eq!(info.name, "paste-1-1.png");
+                assert_eq!(info.pixels, Some((2560, 1600)));
+            }
+            other => panic!("expected a ready attachment: {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn the_chip_is_up_before_the_clipboard_is_read() {
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("the first paste reads");
+        assert!(matches!(app.attachment, Some(Attachment::Reading)), "the chip shows the read in flight");
+        assert!(app.take_dirty(), "the frame is due in the tick the key landed");
+        assert!(app.begin_paste().is_none(), "a held key never starts a second read");
+        app.attach(id, Paste::Empty);
+        assert!(matches!(app.attachment, Some(Attachment::Failed(_))), "the read replaces the pending chip");
+    }
+
+    #[test]
+    fn a_read_whose_chip_was_dismissed_lands_as_nobodys() {
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("a read");
+        app.detach();
+        let path = pasted();
+        app.attach(id, Paste::Image(path.clone()));
+        assert!(app.attachment.is_none(), "the chip stays dismissed");
+        assert!(!path.exists(), "and the file it wrote is dropped, since no message will name it");
+    }
+
+    #[test]
+    fn a_late_image_never_rides_a_message_sent_before_it_landed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("a read");
+        app.insert("what is this?");
+        assert_eq!(app.take_prompt(), "what is this?", "a read in flight has no file to name");
+        app.attach(id, Paste::Image(saved(dir.path())));
+        assert!(app.attachment.is_none(), "the message that left never carried it");
     }
 
     #[test]
     fn an_empty_clipboard_says_so_instead_of_doing_nothing() {
         let mut app = App::new("m");
-        app.attach(Paste::Empty);
-        assert!(app.attachment.is_none());
+        land(&mut app, Paste::Empty);
+        assert!(matches!(&app.attachment, Some(Attachment::Failed(why)) if why == NO_CLIPBOARD));
         let last = app.lead.entries.last().expect("a notice");
         assert_eq!(last.role, Role::Notice);
         assert_eq!(last.body, NO_CLIPBOARD);
@@ -1319,24 +1494,56 @@ mod paste_tests {
     #[test]
     fn a_clipboard_that_cannot_be_read_says_why() {
         let mut app = App::new("m");
-        app.attach(Paste::Failed("osascript: not found".into()));
+        land(&mut app, Paste::Failed("osascript: not found".into()));
         let last = app.lead.entries.last().expect("a notice");
         assert_eq!(last.body, "cannot read the clipboard: osascript: not found");
+        assert!(matches!(&app.attachment, Some(Attachment::Failed(why)) if why.contains("not found")));
+    }
+
+    #[test]
+    fn clipboard_text_goes_into_the_composer_and_leaves_no_chip() {
+        let mut app = App::new("m");
+        land(&mut app, Paste::Text("a sentence".into()));
+        assert_eq!(app.take_prompt(), "a sentence");
+        assert!(app.attachment.is_none(), "text is not an attachment");
+    }
+
+    #[test]
+    fn ctrl_x_drops_a_ready_attachment_and_its_temp_file() {
+        let mut app = App::new("m");
+        let path = pasted();
+        land(&mut app, Paste::Image(path.clone()));
+        app.detach();
+        assert!(app.attachment.is_none());
+        assert!(!path.exists(), "the temp file goes with the chip");
+    }
+
+    #[test]
+    fn the_chip_names_the_file_its_size_and_its_pixels() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        land(&mut app, Paste::Image(saved(dir.path())));
+        let text = chip(&app);
+        assert!(text.starts_with("paste-1-1.png · 2560×1600 · "), "{text}");
+        assert!(text.ends_with(" B"), "a 24-byte header is under a kilobyte: {text}");
     }
 
     #[test]
     fn an_attachment_rides_one_message_as_its_absolute_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut app = App::new("m");
-        app.attach(Paste::Image(saved(dir.path())));
+        let path = saved(dir.path());
+        land(&mut app, Paste::Image(path.clone()));
         app.insert("what is this?");
         let prompt = app.take_prompt();
         assert!(prompt.starts_with("what is this?"), "{prompt}");
         assert!(prompt.contains("[attached image: "), "{prompt}");
         assert!(prompt.contains(".png]"), "{prompt}");
         assert!(app.attachment.is_none(), "the attachment belongs to one message");
+        assert!(path.exists(), "the file is the message's: it outlives the chip");
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,6 +2001,59 @@ mod tests {
         assert!(lead.contains("lead only line"), "{lead}");
         assert_eq!(lead.matches("worker one line").count(), 1, "one lifecycle line, not the message entry: {lead}");
         assert!(lead.contains("finished: worker one line"), "{lead}");
+    }
+
+    /// A PNG header with a pixel size, so the chip has something to read.
+    fn png(dir: &Path, name: &str, width: u32, height: u32) -> PathBuf {
+        let path = dir.join(name);
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_chip_shows_the_paste_in_the_tick_the_key_lands_and_what_it_became() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("a paste");
+        let pending = screen(&mut app, 80, 24);
+        assert!(pending.contains("reading the clipboard"), "the chip is up before the read: {pending}");
+        app.attach(id, clipboard::Paste::Image(png(dir.path(), "shot.png", 64, 32)));
+        let ready = screen(&mut app, 80, 24);
+        assert!(ready.contains("shot.png"), "{ready}");
+        assert!(ready.contains("64×32"), "the chip shows the pixels: {ready}");
+        assert!(ready.contains("✓ attached"), "and a verdict that is not colour alone: {ready}");
+        assert!(ready.contains("ctrl+x removes"), "{ready}");
+    }
+
+    #[test]
+    fn a_paste_that_found_no_image_says_so_in_the_chip() {
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("a paste");
+        app.attach(id, clipboard::Paste::Empty);
+        let failed = screen(&mut app, 80, 24);
+        assert!(failed.contains("✗"), "the chip carries a glyph, not just a colour: {failed}");
+        assert!(failed.contains(NO_CLIPBOARD), "{failed}");
+        assert!(failed.contains("ctrl+x dismisses"), "{failed}");
+    }
+
+    #[test]
+    fn a_narrow_chip_cuts_the_name_and_keeps_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new("m");
+        let id = app.begin_paste().expect("a paste");
+        let long = png(dir.path(), &"a-very-long-screenshot-name".repeat(4), 2560, 1440);
+        app.attach(id, clipboard::Paste::Image(long));
+        let narrow = screen(&mut app, 40, 24);
+        for row in narrow.lines() {
+            assert!(row.chars().count() <= 40, "the chip never wraps: {row:?}");
+        }
+        assert!(narrow.contains("· ✓ attached"), "the verdict survives a narrow line: {narrow}");
+        assert!(narrow.contains('…'), "a long name is what gets cut: {narrow}");
+        let wide = screen(&mut app, 100, 24);
+        assert!(wide.contains("ctrl+x removes"), "a wide chip keeps the way out on the line: {wide}");
     }
 
     #[test]
