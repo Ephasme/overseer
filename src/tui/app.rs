@@ -1343,6 +1343,21 @@ impl App {
         self.viewed().is_some()
     }
 
+    /// The agent the stop key would end: the open worker's, while it still has work. The root is
+    /// never one: it is the user's only voice, and nothing in the program restarts it.
+    pub(super) fn stop_target(&self) -> Option<usize> {
+        let id = self.viewed().filter(|id| *id != Swarm::ROOT)?;
+        let worker = self.workers.iter().find(|worker| worker.id == id)?;
+        (worker.pending > 0 && !worker.finished && !worker.stopped).then_some(id)
+    }
+
+    /// Acknowledges the stop key before the core reports it: a model call already in flight cannot
+    /// be cut mid-answer, and the wait must not read as a dead key.
+    pub(super) fn stopping(&mut self, id: usize) {
+        self.active().push(Entry::new(Role::Notice, String::new(), format!("stopping agent {id}…")));
+        self.dirty = true;
+    }
+
     /// The worker whose view is open; the lead's stream is the view otherwise.
     fn viewed(&self) -> Option<usize> {
         if !self.open {
@@ -1457,7 +1472,7 @@ impl App {
             Span::styled(state, Style::new().fg(theme::muted())),
             Span::styled(format!(" · {}", worker.dir.display()), Style::new().fg(theme::faint())),
         ];
-        let hint = "esc back to agents";
+        let hint = if self.stop_target() == Some(worker.id) { "esc stop · F4 back" } else { "esc back to agents" };
         let used = Line::from(line.clone()).width();
         line.push(Span::raw(" ".repeat(width.saturating_sub(used + text_width(hint)).max(1))));
         line.push(Span::styled(hint, Style::new().fg(theme::faint())));
@@ -1478,7 +1493,7 @@ impl App {
     pub(super) fn worker_key(&mut self, key: KeyEvent) {
         self.dirty = true;
         match key.code {
-            // Esc leaves the view; it never quits the app.
+            // Esc with nothing to stop leaves the view; it never quits the app.
             KeyCode::Esc => self.open = false,
             KeyCode::F(4) => self.toggle_worker_view(),
             // The view scrolls itself: each stream keeps its own position and tail state.

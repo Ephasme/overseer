@@ -56,7 +56,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |click a worker row|open that worker's view; click its `esc back to fleet` line to come back|
 |↑ / ↓|inside a worker view: the previous or next worker|
 |PageUp / Home|inside a worker view: scroll its own stream|
-|esc|inside a worker view: back to the lead's stream; it never quits the app|
+|esc|in a worker's view: stop that worker and everything below it now; with nothing running, back to the lead's stream. It never stops the overseer and never quits the app|
 |ctrl+p / ctrl+n|recall the previous or next prompt|
 |ctrl+d|quit once no worker is busy|
 |ctrl+c|quit now|

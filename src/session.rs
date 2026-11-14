@@ -93,6 +93,22 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
             }
+            Event::Stop { id } => {
+                let (result, agents, busy) = {
+                    let mut tree = lock(&swarm);
+                    let result = tree.stop(id);
+                    (result, tree.snapshot(), tree.busy())
+                };
+                let _ = ui.send(match result {
+                    Ok(line) => UiEvent::Notice(line),
+                    Err(line) => UiEvent::Error(line),
+                });
+                let _ = ui.send(UiEvent::Agents(agents));
+                let _ = ui.send(UiEvent::Busy(busy));
+                if draining && !busy {
+                    break;
+                }
+            }
             Event::Progress { id, progress } => {
                 let _ = ui.send(UiEvent::Progress { id, progress });
             }

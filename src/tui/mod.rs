@@ -130,7 +130,19 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         }
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
         KeyCode::F(5) => mouse(app)?,
-        // A worker view owns the keys while it is open: esc returns to the fleet from there.
+        // A menu in front of the caret takes esc first; a worker's view takes it next, stopping a
+        // working agent and leaving when there is nothing to stop. The root is never a target: it
+        // is the user's only voice.
+        KeyCode::Esc if !app.in_worker_view() && app.completing() => app.close_completion(),
+        KeyCode::Esc => match app.stop_target() {
+            Some(id) => {
+                app.stopping(id);
+                let _ = input.send(Event::Stop { id });
+            }
+            None if app.in_worker_view() => app.worker_key(key),
+            None => app.input(key),
+        },
+        // A worker view owns the keys while it is open: every other key acts inside it.
         _ if app.in_worker_view() => app.worker_key(key),
         // The completion popup owns these keys while it is open, above the composer's own bindings:
         // a menu in front of the caret takes the arrows, and Enter picks from it rather than sending.
@@ -139,7 +151,6 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::Tab if app.completing() => {
             app.accept_completion();
         }
-        KeyCode::Esc if app.completing() => app.close_completion(),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
         KeyCode::Char('v') if ctrl => copy(app, pasted),
         KeyCode::Char('x') if ctrl => app.detach(),
@@ -271,6 +282,59 @@ mod tests {
         assert!(!app.quit, "esc never quits the app");
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.take_prompt(), "x", "the prompt takes keys again once the view is closed");
+    }
+
+    /// A worker with one instruction in flight, as the panel and the view take it.
+    fn working(id: usize) -> AgentView {
+        AgentView {
+            id,
+            parent: Some(crate::swarm::Swarm::ROOT),
+            depth: 1,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "do it".into(),
+            pending: 1,
+            failed: false,
+            finished: false,
+            stopped: false,
+            paused: false,
+            read_only: false,
+            busy_for: Some(Duration::from_secs(3)),
+        }
+    }
+
+    /// Esc on a working agent stops it and everything below it, and its view stays open to show it.
+    #[test]
+    fn escape_stops_a_working_agent_and_keeps_its_view() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![working(2)]));
+        press(&mut app, KeyCode::F(4));
+        let (input, queue) = mpsc::channel();
+        let (pasted, _reads) = mpsc::channel();
+        let _ = handle_key(&mut app, &input, &pasted, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(queue.try_recv(), Ok(Event::Stop { id: 2 }), "esc stops the agent it is watching");
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("esc stop · F4 back"), "the header offers the stop: {drawn}");
+        assert!(drawn.contains("stopping agent 2…"), "the key is acknowledged at once: {drawn}");
+        assert!(app.in_worker_view(), "the view stays open to show the stop land");
+        // The core reports it: the agent is stopped, so the next esc is the way out.
+        let stopped = AgentView { stopped: true, pending: 0, busy_for: None, ..working(2) };
+        app.apply(UiEvent::Agents(vec![stopped]));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_worker_view(), "esc leaves once there is nothing left to stop");
+    }
+
+    /// The root answers the user: no key may end it, since nothing in the program restarts it.
+    #[test]
+    fn escape_never_stops_the_overseer() {
+        let mut app = App::new("m");
+        let root = AgentView { parent: None, depth: 0, ..working(crate::swarm::Swarm::ROOT) };
+        app.apply(UiEvent::Agents(vec![root]));
+        press(&mut app, KeyCode::F(4));
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("esc back to agents"), "the overseer's view only offers the way out: {drawn}");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_worker_view(), "esc on the overseer leaves its view");
+        assert_eq!(app.stop_target(), None);
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
