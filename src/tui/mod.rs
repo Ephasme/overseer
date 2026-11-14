@@ -7,7 +7,7 @@ use app::App;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as Input,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use std::io::stdout;
@@ -48,6 +48,7 @@ fn event_loop(
                 Input::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.wheel(true),
                     MouseEventKind::ScrollDown => app.wheel(false),
+                    MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
                     _ => {}
                 },
                 Input::Resize(..) => app.resize(),
@@ -86,6 +87,7 @@ fn handle_key(app: &mut App, input: &Sender<Event>, key: KeyEvent) {
             app.drain();
         }
         KeyCode::Char('j') if ctrl => app.insert("\n"),
+        KeyCode::Char('v') if ctrl => app.paste(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
         KeyCode::Char('n') if ctrl => app.recall_next(),
         KeyCode::Enter if !alt && !shift => submit(app, input),
