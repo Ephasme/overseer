@@ -38,6 +38,7 @@
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop shared by overseer and workers |
 | `src/tools.rs` | worker tools `bash`, `read_file`, `write_file` |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks a worker resolves by `conflict://<N>` |
+| `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
 | `src/config.rs` | `config.toml`, roots, `home`, `resolve_dir`, state directory, `io_error` |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
@@ -54,6 +55,7 @@
 - An overseer order reaches a worker through `fleet::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused worker is not busy, so ctrl+D stops waiting on it.
 - A worker's `Policy` is checked on every tool call and rewritten into its system prompt each turn, so a restriction takes effect without a restart. `read_only` matches `bash` commands as text against a fixed list: a guard, not a sandbox.
 - A conflict id belongs to one worker's `conflict::Registry`, not the process: ids never collide across workers, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
+- A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
 - Quitting calls `tools::kill_running`: without it a worker's `cargo build` outlives the process, because the session never reaps a group that is still running.
 - A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.

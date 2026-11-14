@@ -5,6 +5,7 @@ use crate::fleet::{self, Event, Fleet};
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use crate::tools;
+use crate::url;
 use crate::version;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +60,10 @@ pub(crate) fn run(
                 let line = fleet.resume(&arg);
                 let _ = ui.send(UiEvent::Notice(line));
                 let _ = ui.send(UiEvent::Workers(fleet.snapshot()));
+                continue;
+            }
+            Event::Schemes => {
+                let _ = ui.send(UiEvent::Notice(url::report()));
                 continue;
             }
             Event::Progress { id, progress } => {

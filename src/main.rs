@@ -12,6 +12,7 @@ mod secrets;
 mod session;
 mod tools;
 mod tui;
+mod url;
 mod version;
 
 use anyhow::{Context, Result};

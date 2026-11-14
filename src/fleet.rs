@@ -256,6 +256,8 @@ pub(crate) enum Event {
     Eof,
     /// User typed `/resume <id>`: the argument, handled without a model call.
     Resume(String),
+    /// User typed `/schemes`: which internal URIs resolve, without a model call.
+    Schemes,
     Worker {
         id: usize,
         kind: WorkerEvent,
@@ -283,6 +285,9 @@ impl Event {
         }
         if line == "exit" {
             return Some(Event::Exit);
+        }
+        if line == "/schemes" {
+            return Some(Event::Schemes);
         }
         if let Some(arg) = line.strip_prefix("/resume") {
             return Some(Event::Resume(arg.to_string()));
@@ -918,6 +923,7 @@ mod tests {
         assert_eq!(Event::from_line(""), None);
         assert_eq!(Event::from_line("exit"), Some(Event::Exit));
         assert_eq!(Event::from_line("/resume 3"), Some(Event::Resume(" 3".into())));
+        assert_eq!(Event::from_line("/schemes"), Some(Event::Schemes));
         assert_eq!(Event::from_line("hello"), Some(Event::User("hello".into())));
     }
 
