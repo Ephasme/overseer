@@ -1,12 +1,11 @@
 # Local development installs. Releases go through CI on a v* tag; these keep the working tree out of Homebrew's copy.
 
-# Build the release binary and install it at ~/.local/bin/overseer, which precedes the Homebrew prefix in PATH.
-# The last line checks what a fresh shell resolves, because a shell that already hashed another `overseer` keeps
-# running that one, silently, whatever this installs.
+# Build the release binary and install it at ~/.local/bin/overseer.
 install:
     @cargo build --release --locked
     @mkdir -p "$HOME/.local/bin"
     @install -m 755 target/release/overseer "$HOME/.local/bin/overseer"
+    # Prove the install took: a shell that already hashed another `overseer` keeps running that one.
     @resolved=$(command -v overseer || echo nothing); \
     if [ "$resolved" = "$HOME/.local/bin/overseer" ]; then \
       echo "installed $resolved"; \
