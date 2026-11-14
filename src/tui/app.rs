@@ -1,3 +1,4 @@
+use crate::clipboard;
 use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
 use crate::tools;
@@ -8,7 +9,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tui_textarea::{TextArea, WrapMode};
 use unicode_width::UnicodeWidthChar;
@@ -34,8 +35,17 @@ const TICK: Duration = Duration::from_millis(120);
 /// Longest worker preview kept, in characters.
 const PREVIEW_CHARS: usize = 400;
 
+/// Said instead of attaching, when the clipboard has neither an image nor text.
+const NO_CLIPBOARD: &str = "the clipboard holds no image or text";
+
+/// The head of the attachment chip above the composer.
+const ATTACHMENT_LEAD: &str = " ▸ image ";
+
+/// Its remove affordance, kept visible whatever the path's length.
+const ATTACHMENT_HINT: &str = " · ctrl+x removes";
+
 /// Key hints on the right of the status line.
-const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v paste · ctrl+d quit";
+const HINT: &str = "F2 workers · F3 output · ctrl+j newline · ctrl+v image · ctrl+d quit";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const CYAN: Color = Color::Cyan;
@@ -318,6 +328,8 @@ pub(super) struct App {
     flattened: usize,
     dirty_from: usize,
     composer: TextArea<'static>,
+    /// A pasted image's file, sent with the prompt and shown above the composer.
+    attachment: Option<PathBuf>,
     model: String,
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
@@ -364,6 +376,7 @@ impl App {
             flattened: 0,
             dirty_from: 0,
             composer: composer(model),
+            attachment: None,
             model: model.to_string(),
             history: Vec::new(),
             recall: None,
@@ -618,8 +631,14 @@ impl App {
         let area = frame.area();
         let rows = self.composer.measure(area.width).preferred_rows;
         let rows = rows.clamp(3, area.height.saturating_sub(4).max(3));
-        let [body, input, status] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(rows), Constraint::Length(1)]).areas(area);
+        let chip = u16::from(self.attachment.is_some());
+        let [body, field, status] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(rows.saturating_add(chip)),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let [chip, input] = Layout::vertical([Constraint::Length(chip), Constraint::Length(rows)]).areas(field);
         let transcript = if self.worker_panel && body.width > WORKERS_WIDTH + 40 {
             let [left, right] =
                 Layout::horizontal([Constraint::Min(40), Constraint::Length(WORKERS_WIDTH)]).areas(body);
@@ -631,6 +650,16 @@ impl App {
             body
         };
         self.render_transcript(frame, transcript);
+        if let Some(path) = &self.attachment {
+            let fixed = ATTACHMENT_LEAD.len() + ATTACHMENT_HINT.len();
+            let room = usize::from(chip.width).saturating_sub(fixed).max(8);
+            let line = Line::from(vec![
+                Span::styled(ATTACHMENT_LEAD, Style::new().fg(MAGENTA)),
+                Span::styled(truncate(&path.display().to_string(), room), Style::new()),
+                Span::styled(ATTACHMENT_HINT, DIM),
+            ]);
+            frame.render_widget(Paragraph::new(line), chip);
+        }
         frame.render_widget(&self.composer, input);
         self.render_status(frame, status);
     }
@@ -736,13 +765,21 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// The prompt as submitted, trimmed; the composer keeps its settings but starts empty.
+    /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
-        let text = self.composer.lines().join("\n").trim().to_string();
+        let typed = self.composer.lines().join("\n").trim().to_string();
+        // The overseer has no file tools: the path travels in the message, for a worker to read; the
+        // file stays on disk for that worker, in the temp dir, so nothing deletes it under its feet.
+        let text = match self.attachment.take() {
+            Some(path) if typed.is_empty() => format!("[attached image: {}]", path.display()),
+            Some(path) => format!("{typed}\n\n[attached image: {}]", path.display()),
+            None => typed.clone(),
+        };
         self.composer = composer(&self.model);
         self.recall = None;
-        if !text.is_empty() {
-            self.history.push(text.clone());
+        // History holds what was typed: a recalled temp path would point at a file since dropped.
+        if !typed.is_empty() {
+            self.history.push(typed);
         }
         self.dirty = true;
         text
@@ -758,12 +795,38 @@ impl App {
         self.dirty = true;
     }
 
-    /// Ctrl+V: the system clipboard, which a terminal withholds from a TUI outside bracketed paste.
+    /// Ctrl+V: the system clipboard, which a terminal hands a TUI only as text, in bracketed paste.
+    ///
+    /// Text goes in first, the common case and the fast one; an image becomes an attachment, since a
+    /// PNG cannot be typed into a composer and the model only reads text.
     pub(super) fn paste(&mut self) {
-        if let Ok(mut clipboard) = arboard::Clipboard::new()
-            && let Ok(text) = clipboard.get_text()
-        {
+        if let Some(text) = clipboard::text() {
             self.insert(&text);
+            return;
+        }
+        self.attach(clipboard::image());
+    }
+
+    /// Takes what a paste found: an image to attach, or a notice saying why there is none.
+    pub(super) fn attach(&mut self, paste: clipboard::Paste) {
+        match paste {
+            clipboard::Paste::Image(path) => {
+                self.detach();
+                self.attachment = Some(path);
+            }
+            clipboard::Paste::Empty => self.push(Role::Notice, String::new(), NO_CLIPBOARD.into()),
+            clipboard::Paste::Failed(why) => {
+                self.push(Role::Error, String::new(), format!("cannot read the clipboard: {why}"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Drops the attachment and its temp file.
+    pub(super) fn detach(&mut self) {
+        if let Some(path) = self.attachment.take() {
+            clipboard::discard(&path);
+            self.dirty = true;
         }
     }
 
@@ -1245,5 +1308,91 @@ mod tests {
         app.click(1, top);
         assert_eq!(app.selected, None);
         assert!(app.entries.is_empty());
+    }
+
+    fn pasted(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"\x89PNG\r\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_pasted_image_rides_along_with_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path.clone()));
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("paste.png"), "the chip shows the path: {drawn}");
+        assert!(drawn.contains("ctrl+x removes"), "{drawn}");
+        app.insert("look at this");
+        let prompt = app.take_prompt();
+        assert_eq!(prompt, format!("look at this\n\n[attached image: {}]", path.display()));
+        assert!(app.attachment.is_none(), "the attachment belongs to the prompt it left with");
+        let after = screen(&mut app, 100, 24);
+        assert!(!after.contains("ctrl+x removes"), "the chip goes with the prompt: {after}");
+        app.recall_previous();
+        assert_eq!(app.composer.lines(), ["look at this"], "history keeps what was typed, not a temp path");
+    }
+
+    #[test]
+    fn an_image_alone_is_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path.clone()));
+        assert_eq!(app.take_prompt(), format!("[attached image: {}]", path.display()));
+    }
+
+    #[test]
+    fn a_second_paste_replaces_the_first_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (pasted(dir.path(), "one.png"), pasted(dir.path(), "two.png"));
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(first));
+        app.attach(clipboard::Paste::Image(second.clone()));
+        assert_eq!(app.attachment, Some(second));
+    }
+
+    #[test]
+    fn a_long_path_leaves_the_remove_hint_visible() {
+        let mut app = App::new("m");
+        let path = PathBuf::from(format!("/tmp/{}/paste.png", "d".repeat(120)));
+        app.attach(clipboard::Paste::Image(path));
+        let drawn = screen(&mut app, 40, 24);
+        assert!(drawn.contains("ctrl+x removes"), "the hint survives a cut path: {drawn}");
+        assert!(drawn.contains('…'), "a cut path is marked: {drawn}");
+    }
+
+    #[test]
+    fn a_clipboard_without_an_image_says_so_and_attaches_nothing() {
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Empty);
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains(NO_CLIPBOARD), "{drawn}");
+        assert!(app.attachment.is_none());
+        app.insert("hello");
+        assert_eq!(app.take_prompt(), "hello");
+    }
+
+    #[test]
+    fn an_unreadable_clipboard_reports_why_rather_than_doing_nothing() {
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Failed("osascript: no such file".into()));
+        let drawn = screen(&mut app, 100, 24);
+        assert!(drawn.contains("cannot read the clipboard: osascript: no such file"), "{drawn}");
+        assert!(app.attachment.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_drops_the_attachment_and_the_chip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pasted(dir.path(), "paste.png");
+        let mut app = App::new("m");
+        app.attach(clipboard::Paste::Image(path));
+        app.detach();
+        assert!(app.attachment.is_none());
+        app.insert("no image now");
+        assert_eq!(app.take_prompt(), "no image now");
     }
 }
