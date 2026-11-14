@@ -1,4 +1,5 @@
 mod agent;
+mod clipboard;
 mod config;
 mod event;
 mod fleet;
