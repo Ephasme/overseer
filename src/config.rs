@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +15,8 @@ struct RawConfig {
     model: String,
     /// Omitted means `auto`.
     theme: Option<String>,
+    max_depth: Option<usize>,
+    dir: Option<String>,
 }
 
 #[derive(Debug)]
@@ -24,9 +26,22 @@ pub(crate) struct Config {
     pub(crate) base_url: String,
     pub(crate) model: String,
     pub(crate) theme: Theme,
+    /// Delegations allowed below the root; `0` means the root may not spawn anyone.
+    #[allow(dead_code)] // read once the tree replaces the fleet
+    pub(crate) max_depth: usize,
+    /// The directory the root agent starts in; children get the path `spawn_agent` names.
+    #[allow(dead_code)] // read once the tree replaces the fleet
+    pub(crate) dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
 }
+
+/// Where an agent starts when nothing names a directory: the root's configured `dir`, or a child's
+/// `spawn_agent` path.
+pub(crate) const DEFAULT_WORKING_DIR: &str = "/tmp";
+
+/// Delegations allowed below the root when `config.toml` names no `max_depth`.
+pub(crate) const DEFAULT_MAX_DEPTH: usize = 3;
 
 /// Which palette the TUI draws with; `auto` is the one that reads `NO_COLOR`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -101,7 +116,16 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots.push(canonical);
     }
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
-    Ok(Config { roots, base_url: raw.base_url, model: raw.model, theme, home: home.to_path_buf() })
+    let dir = resolve_dir(raw.dir.as_deref().unwrap_or(DEFAULT_WORKING_DIR), home).map_err(anyhow::Error::msg)?;
+    Ok(Config {
+        roots,
+        base_url: raw.base_url,
+        model: raw.model,
+        theme,
+        max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
+        dir,
+        home: home.to_path_buf(),
+    })
 }
 
 fn expand_home(path: &str, home: &Path) -> PathBuf {
@@ -184,5 +208,37 @@ mod tests {
         assert_eq!(parse(&format!("{rest}\ntheme = \"light\""), home.path()).unwrap().theme, Theme::Light);
         let wrong = parse(&format!("{rest}\ntheme = \"solarized\""), home.path()).unwrap_err().to_string();
         assert!(wrong.contains("solarized"), "{wrong}");
+    }
+
+    #[test]
+    fn depth_and_root_directory_default_when_absent() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m""#;
+        let resolved = parse(text, Path::new("/Users/nobody")).unwrap();
+        assert_eq!(resolved.max_depth, DEFAULT_MAX_DEPTH);
+        assert_eq!(DEFAULT_MAX_DEPTH, 3);
+        assert_eq!(resolved.dir, fs::canonicalize(DEFAULT_WORKING_DIR).unwrap());
+    }
+
+    #[test]
+    fn depth_and_root_directory_are_read_when_present() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+max_depth = 1
+dir = "/tmp""#;
+        let resolved = parse(text, Path::new("/Users/nobody")).unwrap();
+        assert_eq!(resolved.max_depth, 1);
+    }
+
+    #[test]
+    fn a_root_directory_that_is_not_a_directory_is_refused() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+dir = "/nonexistent/x""#;
+        let error = parse(text, Path::new("/Users/nobody")).unwrap_err().to_string();
+        assert!(error.contains("/nonexistent/x"), "{error}");
     }
 }

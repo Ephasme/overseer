@@ -368,7 +368,7 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
     let line = match name {
         prompt::SPAWN_WORKER => {
             let path = field(args.path.as_ref());
-            let dir = if path.is_empty() { prompt::DEFAULT_WORKING_DIR } else { path };
+            let dir = if path.is_empty() { config::DEFAULT_WORKING_DIR } else { path };
             format!("{dir} · {}", field(args.task.as_ref()))
         }
         prompt::MESSAGE_WORKER => {
@@ -496,7 +496,7 @@ impl Fleet {
         let arguments = call.function.arguments.as_str();
         let result = match call.function.name.as_str() {
             prompt::SPAWN_WORKER => tools::parse_args::<SpawnArgs>(arguments).and_then(|args| {
-                let path = args.path.as_deref().unwrap_or(prompt::DEFAULT_WORKING_DIR);
+                let path = args.path.as_deref().unwrap_or(config::DEFAULT_WORKING_DIR);
                 self.start_worker(path, &args.task, args.policy()).map(|id| format!("worker {id} started"))
             }),
             prompt::MESSAGE_WORKER => tools::parse_args::<MessageArgs>(arguments)

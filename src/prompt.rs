@@ -1,3 +1,4 @@
+use crate::config;
 use crate::mcp;
 use crate::repos;
 use crate::skills;
@@ -17,9 +18,6 @@ pub(crate) const LIST_REPOS: &str = "list_repos";
 /// Name of the worker's progress-note tool.
 pub(crate) const REPLY: &str = "reply";
 
-/// Where a worker starts when `spawn_worker` names no directory.
-pub(crate) const DEFAULT_WORKING_DIR: &str = "/tmp";
-
 /// Longest repository list the prompt or the `list_repos` answer shows.
 pub(crate) const MAX_REPOS: usize = 300;
 
@@ -27,7 +25,7 @@ pub(crate) fn overseer_tool_definitions() -> Value {
     let spawn = with_policy(json!({
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": format!("Directory the worker works in; relative paths resolve there. Defaults to {DEFAULT_WORKING_DIR}.")},
+            "path": {"type": "string", "description": format!("Directory the worker works in; relative paths resolve there. Defaults to {}.", config::DEFAULT_WORKING_DIR)},
             "task": {"type": "string", "description": "Complete, self-contained instructions. The worker sees nothing else."}
         },
         "required": ["task"]
