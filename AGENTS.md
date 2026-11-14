@@ -30,6 +30,7 @@
 | `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
 | `src/tui/mod.rs` | terminal lifecycle, the event loop, key bindings |
 | `src/tui/app.rs` | transcript entries, composer, worker panel, status line, wrapping |
+| `src/tui/theme.rs` | the palette: neutral ramp, three hues, status colours |
 | `src/fleet.rs` | worker registry, worker threads, worker events, overseer tool dispatch |
 | `src/prompt.rs` | both system prompts, tool schemas, tool-name constants, `DEFAULT_WORKDIR` |
 | `src/repos.rs` | git-repository discovery under the configured roots |

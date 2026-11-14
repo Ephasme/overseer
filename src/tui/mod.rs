@@ -1,4 +1,5 @@
 mod app;
+mod theme;
 
 use crate::clipboard;
 use crate::event::UiEvent;

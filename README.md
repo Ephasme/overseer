@@ -44,7 +44,7 @@ On a terminal it opens a full-screen UI: the transcript, a worker panel on the r
 |F2|hide or show the worker panel|
 |F3|hide or show what tool calls returned, leaving one row per call|
 |F4|open the picked worker's view, or close it|
-|click a worker row|open that worker's view; click its `‹ fleet (esc)` line to come back|
+|click a worker row|open that worker's view; click its `esc back to fleet` line to come back|
 |↑ / ↓|inside a worker view: the previous or next worker|
 |PageUp / Home|inside a worker view: scroll its own stream|
 |esc|inside a worker view: back to the lead's stream; it never quits the app|

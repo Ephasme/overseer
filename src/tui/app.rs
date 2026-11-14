@@ -1,3 +1,4 @@
+use super::theme;
 use crate::clipboard;
 use crate::event::UiEvent;
 use crate::fleet::{Progress, WorkerEvent, WorkerView};
@@ -6,9 +7,10 @@ use crate::version;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tui_textarea::{TextArea, WrapMode};
@@ -23,8 +25,8 @@ const TIMED: f64 = 0.1;
 /// Rows the composer grows to before it scrolls.
 const COMPOSER_ROWS: u16 = 8;
 
-/// Width of the worker panel, borders included.
-const WORKERS_WIDTH: u16 = 38;
+/// Width of the worker panel, its rule included.
+const WORKERS_WIDTH: u16 = 34;
 
 /// Rows one wheel notch scrolls.
 const WHEEL_LINES: u16 = 3;
@@ -50,20 +52,35 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 /// What the chip says while the clipboard is being read.
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
-/// Key hints on the right of the status line.
-const HINT: &str =
-    "enter send · F2 workers · F3 output · F4 view · ctrl+v paste · ctrl+x drop image · ctrl+j newline · ctrl+d quit";
+/// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
+const HINTS: [&str; 6] = ["enter send", "ctrl+j newline", "F2 workers", "F3 output", "F4 view", "ctrl+d quit"];
 
-/// Key hints while a worker's view is open: leaving it comes first.
-const WORKER_HINT: &str = "esc back to fleet · F4 toggle · ctrl+d quit";
+/// Key hints while a worker's view is open: the way out is on its own header line.
+const WORKER_HINTS: [&str; 2] = ["F4 toggle", "ctrl+d quit"];
 
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const CYAN: Color = Color::Cyan;
-const MAGENTA: Color = Color::Magenta;
-const GREEN: Color = Color::Green;
-const RED: Color = Color::Red;
-const BLUE: Color = Color::Blue;
-const YELLOW: Color = Color::Yellow;
+/// The composer's frame: one bar down the left, closed by a half block.
+const PROMPT_FRAME: border::Set = border::Set {
+    top_left: " ",
+    top_right: " ",
+    bottom_left: "╹",
+    bottom_right: " ",
+    vertical_left: "┃",
+    vertical_right: " ",
+    horizontal_top: " ",
+    horizontal_bottom: " ",
+};
+
+/// A panel's edge: one quiet column, no corners, so the panel reads as a region, not a box.
+const SIDE_RULE: border::Set = border::Set {
+    top_left: " ",
+    top_right: " ",
+    bottom_left: " ",
+    bottom_right: " ",
+    vertical_left: "│",
+    vertical_right: " ",
+    horizontal_top: " ",
+    horizontal_bottom: " ",
+};
 
 /// What a transcript line is about; decides its gutter and colours.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,32 +138,35 @@ impl Entry {
     fn lines(&self, width: u16, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let width = usize::from(width).max(8);
         match self.role {
-            Role::You => block("› ", Style::new().fg(CYAN), &self.body, Style::new(), width),
-            Role::Overseer => block("● ", Style::new().fg(MAGENTA), &self.body, Style::new(), width),
+            Role::You => bar("▌ ", Style::new().fg(theme::PRIMARY), &self.body, Style::new().fg(theme::TEXT), width),
+            // The overseer reads as plain prose: the user's bar above it is the only mark it needs.
+            Role::Overseer => block("  ", Style::new(), &self.body, Style::new().fg(theme::TEXT), width),
             Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
-                    WorkerEvent::Reply => ("says", CYAN),
-                    WorkerEvent::Finished => ("done", GREEN),
-                    WorkerEvent::Failed => ("failed", RED),
+                    WorkerEvent::Reply => ("says", theme::INFO),
+                    WorkerEvent::Finished => ("done", theme::SUCCESS),
+                    WorkerEvent::Failed => ("failed", theme::ERROR),
                 };
                 let prefix = format!("[{}] {label} ", self.title);
-                block(&prefix, Style::new().fg(colour), &self.body, Style::new(), width)
+                block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::MUTED), width)
             }
-            Role::Notice => block("· ", Style::new().fg(BLUE), &self.body, DIM, width),
-            Role::Error => block("error ", Style::new().fg(RED), &self.body, Style::new().fg(RED), width),
-            Role::Debug => block("… ", DIM, &self.body, DIM, width),
+            Role::Notice => {
+                block("· ", Style::new().fg(theme::FAINT), &self.body, Style::new().fg(theme::MUTED), width)
+            }
+            Role::Error => block("! ", Style::new().fg(theme::ERROR), &self.body, Style::new().fg(theme::ERROR), width),
+            Role::Debug => block("… ", Style::new().fg(theme::FAINT), &self.body, Style::new().fg(theme::FAINT), width),
         }
     }
 
     /// A tool call: a header naming what it acts on, then the head of what it returned.
     fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let (glyph, colour) = if self.output.is_none() {
-            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), YELLOW)
+            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::WARNING)
         } else if self.failed {
-            ("✕", RED)
+            ("✕", theme::ERROR)
         } else {
-            ("✓", GREEN)
+            ("✓", theme::SUCCESS)
         };
         let mut chips: Vec<String> = Vec::new();
         if !self.status.is_empty() {
@@ -156,23 +176,24 @@ impl Entry {
             chips.push(format!("{secs:.1}s"));
         }
         let chips = if chips.is_empty() { String::new() } else { format!(" · {}", chips.join(" · ")) };
-        let action = if self.body.is_empty() {
-            verb(&self.title).to_string()
-        } else {
-            format!("{} {}", verb(&self.title), self.body)
-        };
+        let verb = verb(&self.title);
         let lead = 1 + text_width(glyph);
-        let room = width.saturating_sub(lead + text_width(&chips)).max(12);
-        let mut lines = vec![Line::from(vec![
+        let room = width.saturating_sub(lead + text_width(verb) + 1 + text_width(&chips)).max(12);
+        let mut spans = vec![
             Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-            Span::styled(truncate(&action, room), Style::new().fg(YELLOW)),
-            Span::styled(chips, DIM),
-        ])];
+            Span::styled(verb.to_string(), Style::new().fg(theme::MUTED)),
+        ];
+        if !self.body.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(truncate(&self.body, room), Style::new().fg(theme::TEXT)));
+        }
+        spans.push(Span::styled(chips, Style::new().fg(theme::FAINT)));
+        let mut lines = vec![Line::from(spans)];
         let Some(output) = &self.output else { return lines };
         if !expand {
             return lines;
         }
-        let style = if self.failed { Style::new().fg(RED) } else { DIM };
+        let style = if self.failed { Style::new().fg(theme::ERROR) } else { Style::new().fg(theme::MUTED) };
         let mut rows: Vec<String> = Vec::new();
         for source in output.trim_end().lines() {
             rows.extend(wrap(source, width.saturating_sub(4)));
@@ -182,11 +203,15 @@ impl Entry {
             rows.push("(no output)".into());
         }
         for row in rows.iter().take(tools::PREVIEW_LINES) {
-            lines.push(Line::from(vec![Span::styled("  │ ", DIM), Span::styled(row.clone(), style)]));
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::new().fg(theme::RULE)),
+                Span::styled(row.clone(), style),
+            ]));
         }
         if hidden > 0 {
             let plural = if hidden == 1 { "line" } else { "lines" };
-            lines.push(Line::from(Span::styled(format!("  │ … {hidden} more {plural}"), DIM)));
+            lines
+                .push(Line::from(Span::styled(format!("  │ … {hidden} more {plural}"), Style::new().fg(theme::FAINT))));
         }
         lines
     }
@@ -212,6 +237,19 @@ fn block(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width
             let lead = if line == 0 && row == 0 { prefix } else { pad.as_str() };
             let lead = Span::styled(lead.to_string(), prefix_style);
             lines.push(Line::from(vec![lead, Span::styled(text, body_style)]));
+        }
+    }
+    lines
+}
+
+/// A quoted block: every row carries the bar, so a message of several lines reads as one region.
+fn bar(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width: usize) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(text_width(prefix)).max(8);
+    let mut lines = Vec::new();
+    for source in body.split('\n') {
+        for text in wrap(source, room) {
+            lines
+                .push(Line::from(vec![Span::styled(prefix.to_string(), prefix_style), Span::styled(text, body_style)]));
         }
     }
     lines
@@ -308,7 +346,7 @@ const CHIP_ROOM: usize = 12;
 ///
 /// A narrow terminal drops the hint rather than the middle: the status line carries the same keys.
 fn tail(hint: &str, fixed: usize, width: usize) -> (Option<Span<'static>>, usize) {
-    let hint = Span::styled(hint.to_string(), DIM);
+    let hint = Span::styled(hint.to_string(), Style::new().fg(theme::FAINT));
     let columns = hint.width();
     if width >= fixed + columns + CHIP_ROOM {
         return (Some(hint), width - fixed - columns);
@@ -371,19 +409,21 @@ impl Stream {
     }
 
     /// Rebuilds the flattened transcript from the first dirty entry on, keeping what precedes it.
+    ///
+    /// `entry_rows` counts each entry's own rows plus the gap before it, so truncating at their sum
+    /// lands exactly on an entry boundary.
     fn reflatten(&mut self, spinning: usize, expand: bool) {
         let from = self.dirty_from.min(self.entries.len());
         let keep = from.min(self.flattened);
-        let rows = self.entry_rows.iter().take(keep).sum::<usize>() + keep.saturating_sub(1);
+        let rows = self.entry_rows.iter().take(keep).sum::<usize>();
         self.transcript.truncate(rows);
         for index in keep..self.entries.len() {
-            if !self.transcript.is_empty() {
-                self.transcript.push(Line::default());
-            }
+            let gap = self.gap_before(index);
+            self.transcript.extend(std::iter::repeat_n(Line::default(), gap));
             let lines =
                 self.entries.get(index).map_or_else(Vec::new, |entry| entry.lines(self.width, spinning, expand));
             if let Some(slot) = self.entry_rows.get_mut(index) {
-                *slot = lines.len();
+                *slot = gap + lines.len();
             }
             self.transcript.extend(lines);
         }
@@ -391,9 +431,17 @@ impl Stream {
         self.dirty_from = self.entries.len();
     }
 
+    /// Blank rows before an entry: a tool call hangs off the message or call above it, with no gap.
+    fn gap_before(&self, index: usize) -> usize {
+        let previous = self.entries.get(index.wrapping_sub(1)).map(|entry| &entry.role);
+        let current = self.entries.get(index).map(|entry| &entry.role);
+        let attached = matches!((previous, current), (Some(Role::You | Role::Overseer | Role::Tool), Some(Role::Tool)));
+        usize::from(index > 0 && !attached)
+    }
+
     /// Flattens what changed, then draws the stream where the reader left it.
     fn draw(&mut self, frame: &mut Frame, area: Rect, spinning: usize, expand: bool) {
-        let frame_block = Block::new().padding(Padding::horizontal(1));
+        let frame_block = Block::new().padding(Padding::new(2, 2, 1, 0));
         let inner = frame_block.inner(area);
         frame.render_widget(frame_block, area);
         let width = inner.width.max(1);
@@ -486,9 +534,16 @@ impl Attachment {
     }
 }
 
-fn composer(model: &str) -> TextArea<'static> {
+/// The composer: one bar on the left, room to breathe, and a half block closing the bar.
+fn composer() -> TextArea<'static> {
     let mut area = TextArea::default();
-    area.set_block(Block::bordered().border_style(DIM).title(format!(" message · {model} ")).title_style(DIM));
+    area.set_block(
+        Block::new()
+            .borders(Borders::LEFT | Borders::BOTTOM)
+            .border_set(PROMPT_FRAME)
+            .border_style(Style::new().fg(theme::EDGE))
+            .padding(Padding::new(1, 1, 1, 0)),
+    );
     area.set_placeholder_text("Ask the overseer, /resume <id>, or exit");
     area.set_wrap_mode(WrapMode::WordOrGlyph);
     area.set_max_rows(COMPOSER_ROWS);
@@ -546,7 +601,7 @@ impl App {
         Self {
             lead: Stream::new(),
             worker_streams: Vec::new(),
-            composer: composer(model),
+            composer: composer(),
             attachment: None,
             paste: 0,
             model: model.to_string(),
@@ -869,6 +924,7 @@ impl App {
             self.render_transcript(frame, transcript);
             self.render_attachment(frame, chip);
             frame.render_widget(&self.composer, input);
+            self.render_composer_meta(frame, input);
         }
         self.render_status(frame, status);
     }
@@ -878,61 +934,76 @@ impl App {
         self.lead.draw(frame, area, spinning, expand);
     }
 
+    /// The fleet's roster: one quiet rule, then a block per worker, the picked one banded.
     fn render_workers(&mut self, frame: &mut Frame, area: Rect) {
-        let panel = Block::bordered().border_style(DIM).title(" workers ");
-        let inner = panel.inner(area);
-        frame.render_widget(panel, area);
+        let rule = Block::new()
+            .borders(Borders::LEFT)
+            .border_set(SIDE_RULE)
+            .border_style(Style::new().fg(theme::RULE))
+            .padding(Padding::new(1, 0, 1, 0));
+        let inner = rule.inner(area);
+        frame.render_widget(rule, area);
         self.workers_area = inner;
         self.worker_rows.clear();
+        let mut head = vec![
+            Span::styled("workers", Style::new().fg(theme::MUTED)),
+            Span::styled(format!(" {}", self.workers.len()), Style::new().fg(theme::FAINT)),
+        ];
         if self.workers.is_empty() {
-            frame.render_widget(Paragraph::new(Span::styled("none yet", DIM)), inner);
+            head.push(Span::styled("  none yet", Style::new().fg(theme::FAINT)));
+            frame.render_widget(Paragraph::new(Line::from(head)), Rect { height: 1, ..inner });
             return;
         }
-        let width = usize::from(inner.width.saturating_sub(2));
-        let room = usize::from(inner.height);
-        let mut rows: Vec<Line<'static>> = Vec::new();
-        let mut ranges: Vec<(u16, u16, usize)> = Vec::new();
+        frame.render_widget(Paragraph::new(Line::from(head)), Rect { height: 1, ..inner });
+        let width = usize::from(inner.width);
+        let mut top = inner.y.saturating_add(1);
         let mut hidden = false;
         for worker in &self.workers {
             let (glyph, colour, state) = worker_state(worker);
             let preview = self.preview_of(worker.id).and_then(last_line);
-            let height = if preview.is_some() { 5u16 } else { 4u16 };
-            if rows.len() + usize::from(height) > room {
+            let height = if preview.is_some() { 5_u16 } else { 4 };
+            let used = top.saturating_sub(inner.y);
+            if used.saturating_add(height) > inner.height {
                 hidden = true;
                 break;
             }
-            let top = inner.y.saturating_add(u16::try_from(rows.len()).unwrap_or(u16::MAX));
-            ranges.push((top, top.saturating_add(height), worker.id));
-            let head = if self.selected == Some(worker.id) {
-                Style::new().fg(colour).add_modifier(Modifier::REVERSED)
-            } else {
-                Style::new().fg(colour)
-            };
             let unread = self.unread_of(worker.id);
-            rows.push(Line::from(vec![
-                Span::styled(format!("{} {glyph} ", worker.id), head),
-                Span::styled(state, head),
-                Span::styled(
-                    if unread == 0 { String::new() } else { format!(" · {unread} new") },
-                    Style::new().fg(YELLOW),
-                ),
-            ]));
-            rows.push(Line::from(Span::styled(format!("  {}", short_dir(&worker.dir)), DIM)));
-            let task = worker.task.lines().next().unwrap_or_default();
-            rows.push(Line::from(Span::styled(format!("  {}", truncate(task, width)), DIM)));
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+                    Span::styled(
+                        format!("w{}", worker.id),
+                        Style::new().fg(if self.selected == Some(worker.id) { theme::TEXT } else { theme::INFO }),
+                    ),
+                    Span::styled(format!(" {state}"), Style::new().fg(theme::MUTED)),
+                    Span::styled(
+                        if unread == 0 { String::new() } else { format!(" · {unread} new") },
+                        Style::new().fg(theme::WARNING),
+                    ),
+                ]),
+                Line::from(Span::styled(short_dir(&worker.dir), Style::new().fg(theme::FAINT))),
+            ];
+            let task = worker.task.lines().next().unwrap_or_default().trim();
+            lines.push(Line::from(Span::styled(truncate(task, width), Style::new().fg(theme::MUTED))));
             if let Some(preview) = preview {
-                rows.push(Line::from(Span::styled(
-                    format!("  ▸ {}", truncate(preview, width.saturating_sub(2))),
-                    Style::new().fg(Color::Gray),
+                lines.push(Line::from(Span::styled(
+                    format!("▸ {}", truncate(preview, width.saturating_sub(2))),
+                    Style::new().fg(theme::FAINT),
                 )));
             }
-            rows.push(Line::default());
+            lines.push(Line::default());
+            let band = if self.selected == Some(worker.id) { Style::new().bg(theme::BAND) } else { Style::new() };
+            let block = Rect { x: inner.x, y: top, width: inner.width, height };
+            frame.render_widget(Paragraph::new(lines).style(band), block);
+            self.worker_rows.push((top, top.saturating_add(height), worker.id));
+            top = top.saturating_add(height);
         }
         if hidden {
-            rows.push(Line::from(Span::styled("…", DIM)));
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled("…", Style::new().fg(theme::FAINT)))),
+                Rect { x: inner.x, y: top, width: inner.width, height: 1 },
+            );
         }
-        self.worker_rows = ranges;
-        frame.render_widget(Paragraph::new(rows), inner);
     }
 
     /// The pending image, one compact chip above the composer: what was pasted, what it weighs, and
@@ -940,57 +1011,88 @@ impl App {
     /// verdict or the way out being pushed off the line.
     fn render_attachment(&self, frame: &mut Frame, area: Rect) {
         let Some(attachment) = &self.attachment else { return };
-        let lead = Span::styled(ATTACHMENT_LEAD, Style::new().fg(MAGENTA));
+        let lead = Span::styled(ATTACHMENT_LEAD, Style::new().fg(theme::PRIMARY));
         // The chip pays for its padding before it places a single column of text.
-        let width = usize::from(area.width).saturating_sub(2);
+        let width = usize::from(area.width).saturating_sub(4);
         let line = match attachment {
             Attachment::Reading => {
                 let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
                 let room = width.saturating_sub(ATTACHMENT_LEAD.len());
                 let message = truncate(&format!("{glyph} {ATTACHMENT_READING}"), room);
-                Line::from(vec![lead, Span::styled(message, Style::new().fg(YELLOW))])
+                Line::from(vec![lead, Span::styled(message, Style::new().fg(theme::WARNING))])
             }
             Attachment::Ready { info, .. } => {
-                let status = Span::styled(" · ✓ attached", Style::new().fg(GREEN));
+                let status = Span::styled(" · ✓ attached", Style::new().fg(theme::SUCCESS));
                 let (hint, room) = tail(ATTACHMENT_HINT, ATTACHMENT_LEAD.len() + status.width(), width);
-                let mut spans = vec![lead, Span::styled(truncate(&info.chip(), room), Style::new()), status];
+                let mut spans =
+                    vec![lead, Span::styled(truncate(&info.chip(), room), Style::new().fg(theme::TEXT)), status];
                 spans.extend(hint);
                 Line::from(spans)
             }
             Attachment::Failed(why) => {
                 let (hint, room) = tail(ATTACHMENT_DISMISS, ATTACHMENT_LEAD.len() + 2, width);
-                let verdict = Span::styled(format!("✗ {}", truncate(why, room)), Style::new().fg(RED));
+                let verdict = Span::styled(format!("✗ {}", truncate(why, room)), Style::new().fg(theme::ERROR));
                 let mut spans = vec![lead, verdict];
                 spans.extend(hint);
                 Line::from(spans)
             }
         };
-        frame.render_widget(Paragraph::new(line).block(Block::new().padding(Padding::horizontal(1))), area);
+        frame.render_widget(Paragraph::new(line).block(Block::new().padding(Padding::horizontal(2))), area);
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = vec![Span::styled(version::VERSION, DIM), Span::styled(" │ ", DIM)];
+        let mut spans = vec![Span::raw("  ")];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(YELLOW)));
-            spans.push(Span::styled(format!("{:.0}s", self.busy_since.elapsed().as_secs_f32()), DIM));
+            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::ACCENT)));
+            let secs = self.busy_since.elapsed().as_secs_f32();
+            spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::MUTED)));
         } else if self.draining {
-            spans.push(Span::styled("draining, quits when workers idle", Style::new().fg(YELLOW)));
+            spans.push(Span::styled("draining, quits when workers idle", Style::new().fg(theme::WARNING)));
         } else {
-            spans.push(Span::styled("● idle", DIM));
+            spans.push(Span::styled("● idle", Style::new().fg(theme::MUTED)));
         }
         let working = self.workers.iter().filter(|w| w.pending > 0 && !w.finished).count();
         let idle = self.workers.len().saturating_sub(working);
-        spans.push(Span::styled(format!(" │ {working} working · {idle} idle"), DIM));
+        spans.push(Span::styled(format!(" · {working} working · {idle} idle"), Style::new().fg(theme::MUTED)));
         if let Some(scroll) = self.scrolled() {
-            spans.push(Span::styled(format!(" │ ↑{scroll} lines"), Style::new().fg(YELLOW)));
+            spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::WARNING)));
         }
-        let hint = if self.in_worker_view() { WORKER_HINT } else { HINT };
         let used = Line::from(spans.clone()).width();
-        let room = usize::from(area.width).saturating_sub(used + hint.len() + 1);
-        spans.push(Span::raw(" ".repeat(room.max(1))));
-        spans.push(Span::styled(hint, DIM));
+        let hints = if self.in_worker_view() { WORKER_HINTS.as_slice() } else { HINTS.as_slice() };
+        // Two columns of inset on each side, the same as everything else on screen.
+        let room = usize::from(area.width).saturating_sub(used + 2);
+        let hint = fit_hints(hints, room);
+        let filler = usize::from(area.width).saturating_sub(used + hint.len() + 2);
+        spans.push(Span::raw(" ".repeat(filler.max(1))));
+        if !hint.is_empty() {
+            spans.push(Span::styled(hint, Style::new().fg(theme::FAINT)));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The composer's cap says who answers and which build: the model, then the version.
+    fn render_composer_meta(&self, frame: &mut Frame, area: Rect) {
+        if area.height < 2 {
+            return;
+        }
+        let cap = Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(area.height.saturating_sub(1)),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        let model = truncate(&self.model, 32);
+        let build = version::VERSION;
+        let width = usize::from(cap.width);
+        let mut spans = vec![Span::styled(model.clone(), Style::new().fg(theme::MUTED))];
+        if width > model.len() + build.len() + 2 {
+            spans.push(Span::raw(" ".repeat(width - model.len() - build.len() - 2)));
+            spans.push(Span::styled(build, Style::new().fg(theme::FAINT)));
+            spans.push(Span::raw("  "));
+        }
+        let line = Line::from(spans);
+        frame.render_widget(Paragraph::new(line), cap);
     }
 
     /// Whether a worker view is open: the picked worker is still in the roster and the view is not closed.
@@ -1093,46 +1195,49 @@ impl App {
     /// One worker's view: a breadcrumb, its state, its task, then its own lines of the transcript.
     fn render_worker_view(&mut self, frame: &mut Frame, area: Rect) {
         let Some(worker) = self.focused().cloned() else { return };
-        let task = worker.task.lines().next().unwrap_or_default().trim();
-        let title = if task.is_empty() {
-            format!(" Fleet › worker {} ", worker.id)
-        } else {
-            format!(" Fleet › worker {} › {task} ", worker.id)
-        };
-        let pane = Block::bordered().border_style(MAGENTA).title(title);
-        let inner = pane.inner(area);
-        frame.render_widget(pane, area);
-        self.back_area = Rect { height: 1, ..inner };
+        let bar =
+            Block::new().borders(Borders::LEFT).border_set(SIDE_RULE).border_style(Style::new().fg(theme::ACCENT));
+        let inner = bar.inner(area);
+        frame.render_widget(bar, area);
+        // The stream indents itself by two columns; the header uses the same inset, one row down.
+        let top = Rect { y: inner.y.saturating_add(1), height: inner.height.saturating_sub(1), ..inner };
+        let width = usize::from(top.width.saturating_sub(4));
         let (glyph, colour, state) = worker_state(&worker);
-        let width = usize::from(inner.width.saturating_sub(2));
-        let mut head = vec![
-            Line::from(Span::styled("‹ fleet (esc)", Style::new().fg(CYAN))),
-            Line::from(vec![
-                Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-                Span::styled(state, Style::new().fg(colour)),
-                Span::styled(format!(" · {}", worker.dir.display()), DIM),
-            ]),
-            Line::default(),
+        let crumb = Line::from(vec![
+            Span::styled("Fleet ", Style::new().fg(theme::MUTED)),
+            Span::styled("› ", Style::new().fg(theme::FAINT)),
+            Span::styled(format!("worker {}", worker.id), Style::new().fg(theme::INFO)),
+        ]);
+        let mut line = vec![
+            Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+            Span::styled(state, Style::new().fg(theme::MUTED)),
+            Span::styled(format!(" · {}", worker.dir.display()), Style::new().fg(theme::FAINT)),
         ];
+        let hint = "esc back to fleet";
+        let used = Line::from(line.clone()).width();
+        line.push(Span::raw(" ".repeat(width.saturating_sub(used + hint.len()).max(1))));
+        line.push(Span::styled(hint, Style::new().fg(theme::FAINT)));
+        let mut head = vec![crumb, Line::from(line), Line::default()];
         for row in wrap(&worker.task, width) {
-            head.push(Line::from(Span::styled(format!("  {row}"), Style::new())));
+            head.push(Line::from(Span::styled(row, Style::new().fg(theme::TEXT))));
         }
         if let Some(preview) = self.preview_of(worker.id).map(str::trim).filter(|text| !text.is_empty()) {
             head.push(Line::default());
             for row in wrap(preview, width.saturating_sub(2)) {
-                head.push(Line::from(Span::styled(format!("  ▸ {row}"), Style::new().fg(Color::Gray))));
+                head.push(Line::from(vec![
+                    Span::styled("▸ ", Style::new().fg(theme::INFO)),
+                    Span::styled(row, Style::new().fg(theme::MUTED)),
+                ]));
             }
         }
         // The header stays put; the worker's own stream scrolls under it, with its own position.
-        let padded = Block::new().padding(Padding::horizontal(1)).inner(inner);
-        let head_height = u16::try_from(head.len()).unwrap_or(u16::MAX).min(padded.height);
-        let header = Rect { height: head_height, ..padded };
-        let rest = Rect {
-            y: padded.y.saturating_add(head_height),
-            height: padded.height.saturating_sub(head_height),
-            ..padded
-        };
+        let head_height = u16::try_from(head.len()).unwrap_or(u16::MAX).min(top.height);
+        let header =
+            Rect { x: top.x.saturating_add(2), width: top.width.saturating_sub(4), height: head_height, ..top };
+        // The way out is on the state line, which is the second one.
+        self.back_area = Rect { y: header.y.saturating_add(1), height: 1, ..header };
         frame.render_widget(Paragraph::new(head), header);
+        let rest = Rect { y: top.y.saturating_add(head_height), height: top.height.saturating_sub(head_height), ..top };
         let (spinning, expand) = (self.spinning, self.tool_output);
         self.worker_stream_mut(worker.id).draw(frame, rest, spinning, expand);
     }
@@ -1172,7 +1277,7 @@ impl App {
             text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
         }
         let typed = self.composer.lines().join("\n");
-        self.composer = composer(&self.model);
+        self.composer = composer();
         self.recall = None;
         // History holds what was typed: a recalled temp path would point at a file since dropped.
         if !typed.is_empty() {
@@ -1353,7 +1458,7 @@ impl App {
                 self.recall = Some(index + 1);
             }
         } else {
-            self.composer = composer(&self.model);
+            self.composer = composer();
             self.recall = None;
             self.dirty = true;
         }
@@ -1371,12 +1476,12 @@ impl App {
 fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
     if worker.pending > 0 && !worker.finished {
         let secs = worker.busy_for.unwrap_or_default().as_secs();
-        return ("●", YELLOW, format!("working {secs}s"));
+        return ("●", theme::WARNING, format!("working {secs}s"));
     }
     if worker.failed || worker.pending > 0 {
-        return ("✕", RED, "failed".into());
+        return ("✕", theme::ERROR, "failed".into());
     }
-    ("○", Color::DarkGray, "idle".into())
+    ("○", theme::FAINT, "idle".into())
 }
 
 /// The last non-empty line of a streamed preview.
@@ -1387,6 +1492,19 @@ fn last_line(text: &str) -> Option<&str> {
 /// The last component of the worker's directory, so a narrow panel stays readable.
 fn short_dir(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// The longest prefix of `hints` that fits `room` columns, joined the way the status line shows them.
+fn fit_hints(hints: &[&str], room: usize) -> String {
+    let mut fitted = String::new();
+    for hint in hints {
+        let next = if fitted.is_empty() { (*hint).to_string() } else { format!("{fitted} · {hint}") };
+        if next.len() > room {
+            break;
+        }
+        fitted = next;
+    }
+    fitted
 }
 
 #[cfg(test)]
@@ -1729,7 +1847,9 @@ mod tests {
         assert!(screen.contains("worker 1 finished: tests pass"), "{screen}");
         assert!(screen.contains("overseer"), "{screen}");
         assert!(screen.contains("idle"), "{screen}");
-        assert!(screen.contains("message · test-model"), "{screen}");
+        assert!(screen.contains("┃"), "the composer keeps its bar: {screen}");
+        assert!(screen.contains("Ask the overseer"), "{screen}");
+        assert!(screen.contains("test-model"), "the status line names the model: {screen}");
         assert!(screen.contains(version::VERSION), "{screen}");
     }
 
@@ -1854,16 +1974,17 @@ mod tests {
         click_first_worker(&mut app);
         assert!(app.in_worker_view());
         let view = screen(&mut app, 100, 24);
-        assert!(view.contains("Fleet › worker 3 › fix the nav"), "{view}");
-        assert!(view.contains("esc back to fleet"), "the way out is in the footer: {view}");
+        assert!(view.contains("Fleet › worker 3"), "{view}");
+        assert!(view.contains("fix the nav"), "the view shows the task handed to the worker: {view}");
+        assert!(view.contains("esc back to fleet"), "the way out is on the header: {view}");
         assert!(view.contains("[worker 3] done done"), "the view shows the worker's own lines: {view}");
-        assert!(!view.contains("message · m"), "the overseer's prompt is out of the way: {view}");
+        assert!(!view.contains("Ask the overseer"), "the overseer's prompt is out of the way: {view}");
         app.worker_key(KeyEvent::from(KeyCode::Esc));
         assert!(!app.in_worker_view(), "esc returns to the fleet");
         assert!(!app.quit, "esc never quits the app");
         assert_eq!(app.selected, Some(3), "the fleet keeps the worker picked");
         let list = screen(&mut app, 100, 24);
-        assert!(list.contains("message · m"), "{list}");
+        assert!(list.contains("Ask the overseer"), "{list}");
         assert!(list.contains("worker 3"), "the transcript still names the worker it kept picked: {list}");
     }
 
@@ -2063,5 +2184,22 @@ mod tests {
         assert!(app.draining);
         app.apply(UiEvent::Busy(true));
         assert!(!app.draining);
+    }
+
+    #[test]
+    fn a_tool_call_hangs_off_its_message_and_the_next_entry_starts_a_paragraph() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Answer("on it".into()));
+        app.apply(UiEvent::ToolStarted { id: 0, tool: tools::BASH.into(), summary: "ls".into() });
+        screen(&mut app, 60, 16);
+        let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
+        assert_eq!(rows.len(), 2, "the call sits under its message, no blank row between: {rows:?}");
+        assert!(rows[0].contains("on it"), "{rows:?}");
+        assert!(rows[1].contains("$ ls"), "{rows:?}");
+        app.apply(UiEvent::Notice("worker 1 is idle".into()));
+        screen(&mut app, 60, 16);
+        let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
+        assert_eq!(rows.len(), 4, "a notice opens a new paragraph: {rows:?}");
+        assert!(rows[2].is_empty(), "{rows:?}");
     }
 }
