@@ -1,4 +1,6 @@
+use crate::mcp;
 use crate::repos;
+use crate::skills;
 use crate::tools;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -98,7 +100,11 @@ fn with_policy(mut parameters: Value) -> Value {
     parameters
 }
 
-pub(crate) fn worker_tool_definitions() -> Value {
+/// Every tool a worker may call: the built-ins, `reply`, and the MCP servers' tools.
+///
+/// A read-only worker is offered none of the MCP tools: their side effects are the server's, not
+/// something the policy can predict.
+pub(crate) fn worker_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy) -> Value {
     let mut defs = tools::definitions();
     if let Some(functions) = defs.as_array_mut() {
         functions.push(json!({"type": "function", "function": {
@@ -106,11 +112,14 @@ pub(crate) fn worker_tool_definitions() -> Value {
             "description": "Send a short progress note to Overseer without ending your turn.",
             "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
         }}));
+        if !policy.read_only {
+            functions.extend(mcp.tool_defs());
+        }
     }
     defs
 }
 
-pub(crate) fn overseer_prompt(roots: &[PathBuf]) -> String {
+pub(crate) fn overseer_prompt(roots: &[PathBuf], skills: &skills::Catalogue, mcp: &mcp::Registry) -> String {
     let listed: Vec<String> = roots.iter().map(|root| format!("- {}", root.display())).collect();
     let mut repos = repos::find(roots);
     let total = repos.len();
@@ -123,10 +132,24 @@ pub(crate) fn overseer_prompt(roots: &[PathBuf]) -> String {
     if total > MAX_REPOS {
         let _ = write!(known, "\n[{} more repositories not listed]", total - MAX_REPOS);
     }
+    let catalogue = skills.catalogue();
+    let mut reachable = String::new();
+    if !catalogue.is_empty() {
+        let _ = write!(
+            reachable,
+            "Skills you and your workers can read (a worker reads one with `read_file skill://<name>`; name it in a task when it fits):\n{catalogue}\n"
+        );
+    }
+    let servers = mcp.tool_counts();
+    if !servers.is_empty() {
+        let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
+        let _ = writeln!(reachable, "MCP servers your workers have: {}", names.join(", "));
+    }
     format!(
         "You are Overseer: you coordinate a fleet of worker agents and never do the work yourself.\n{}\n\
 Roots you know about:\n{}\n\
 Repositories that exist right now:\n{}\n\
+{}\
 Delegate every request to a worker, one worker per independent task, and give each worker complete instructions: it sees nothing else.\n\
 Never ask the user for a path, a command output or any other fact a worker could find.\n\
 Reuse an idle worker for follow-ups in the same directory instead of starting another. Put a task in the repository listed above when one matches; start a repository hunt only when none does.\n\
@@ -136,20 +159,54 @@ Messages that start with [worker N ...] come from workers, not the user: \"says\
 Answer a worker question yourself when you can; otherwise ask the user. Orchestration is not done when workers report: integrate their branches into the main repository one at a time, in dependency order, with a PR where the repository has a remote and a review flow and with a rebase (or rebase-then-fast-forward) where it is local only, so history stays linear and never merge-commit soup. Workers never merge or rebase each other's branches: a worker pushes its branch and opens a PR against the agreed base branch when it finishes, or leaves a local branch and says so when the repository has no remote. The orchestrator owns integration: merge in dependency order, ask the next worker to rebase onto the updated base between merges when the branches touch the same code, and verify build and tests green on the integrated result before announcing completion. If branches conflict, rebase the offending branch onto the updated base and re-run build and tests instead of hand-resolving in the shared checkout. Remove integrated worktrees with `git worktree remove` and report the final branch state to the user. Verify the reconciliation yourself before declaring the job done: build and tests green on the integrated result, and the deployed artifact rebuilt from the integrated branch if the user runs an installed binary.",
         tool_section(&overseer_tool_definitions()),
         listed.join("\n"),
-        known
+        known,
+        reachable
     )
 }
 
-pub(crate) fn worker_prompt(dir: &Path, policy: &tools::Policy) -> String {
-    format!(
-        "You are a worker agent working in the directory {}; relative paths resolve there. Overseer, a coordinator, sends you instructions.\n{}\
-{}\nDo the work yourself and keep Overseer informed as you go. When you stop calling tools, your final answer is delivered to Overseer, so make it a complete report. \
+pub(crate) fn worker_prompt(
+    dir: &Path,
+    policy: &tools::Policy,
+    skills: &skills::Catalogue,
+    mcp: &mcp::Registry,
+) -> String {
+    let defs = worker_tool_definitions(mcp, policy);
+    let mut sections: Vec<String> = vec![format!(
+        "You are a worker agent working in the directory {}; relative paths resolve there. Overseer, a coordinator, sends you instructions.",
+        dir.display()
+    )];
+    let restrictions = policy.describe();
+    if !restrictions.trim().is_empty() {
+        sections.push(restrictions.trim_end().to_string());
+    }
+    let catalogue = skills.catalogue();
+    if !catalogue.is_empty() {
+        sections.push(format!(
+            "Skills: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>"
+        ));
+    }
+    for (server, notes) in mcp.instructions() {
+        sections.push(format!("MCP server notes ({server}):\n{notes}"));
+    }
+    sections.push(tool_section(&defs));
+    // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
+    let counts = mcp.tool_counts();
+    if !policy.read_only && !counts.is_empty() {
+        let lines: Vec<String> = counts
+            .iter()
+            .map(|(server, count)| {
+                format!("MCP tools on {server}: {count} (mcp__<server>_<tool>; schemas are in the tools array)")
+            })
+            .collect();
+        sections.push(lines.join("\n"));
+    }
+    sections.push(
+        "Do the work yourself and keep Overseer informed as you go. When you stop calling tools, your final answer is delivered to Overseer, so make it a complete report. \
 Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes. \
-If you need a decision to continue, end your turn with the question as your final answer.",
-        dir.display(),
-        policy.describe(),
-        tool_section(&worker_tool_definitions())
-    )
+If you need a decision to continue, end your turn with the question as your final answer."
+            .to_string(),
+    );
+    sections.join("\n")
 }
 
 /// Renders tool names and descriptions into prompt lines; the `tools` array carries the schemas.
@@ -161,6 +218,10 @@ fn tool_section(defs: &Value) -> String {
         .filter_map(|tool| {
             let function = tool.get("function")?;
             let name = function.get("name")?.as_str()?;
+            // MCP tools are summarised per server by the caller: one line each would drown the prompt.
+            if name.starts_with(mcp::PREFIX) {
+                return None;
+            }
             let description = function.get("description").and_then(Value::as_str).unwrap_or_default();
             Some(format!("- {name}: {description}"))
         })

@@ -5,12 +5,15 @@
 //! nobody ever wrote, so a model cannot learn about a capability this build does not have.
 
 use crate::conflict;
+use crate::skills;
 use std::fmt::Write as _;
 
 /// What a handler is given besides its own path: the state of the caller that asked.
 pub(crate) struct Ctx<'a> {
     /// The caller's conflict registry; `None` for the orchestrator, which owns no files.
     pub(crate) conflicts: Option<&'a mut conflict::Registry>,
+    /// The skills the caller may read; `None` for a caller that has no catalogue, such as a write.
+    pub(crate) skills: Option<&'a skills::Catalogue>,
 }
 
 /// A handler answers one `scheme://…` path: `(caller, rest of the URI)` or `(caller, rest, content)`.
@@ -35,7 +38,7 @@ struct Scheme {
     status: Status,
 }
 
-/// Every scheme of the toolkit this port follows, in its order. `conflict` is the one with handlers.
+/// Every scheme of the toolkit this port follows, in its order. `conflict` and `skill` answer.
 ///
 /// The reserved names are the roadmap, not documentation: nothing reads them into a prompt.
 const SCHEMES: &[Scheme] = &[
@@ -63,7 +66,14 @@ const SCHEMES: &[Scheme] = &[
     Scheme { name: "proc", status: Status::Reserved },
     Scheme { name: "rule", status: Status::Reserved },
     Scheme { name: "security", status: Status::Reserved },
-    Scheme { name: "skill", status: Status::Reserved },
+    Scheme {
+        name: "skill",
+        status: Status::Active(Active {
+            summary: "a skill by name: read `skill://<name>` for its `SKILL.md`, `skill://<name>/<path>` for another file of it",
+            read: Some(skill_read),
+            write: None,
+        }),
+    },
     Scheme { name: "ssh", status: Status::Reserved },
     Scheme { name: "vault", status: Status::Reserved },
     Scheme { name: "xd", status: Status::Reserved },
@@ -163,6 +173,13 @@ fn conflict_write(ctx: &mut Ctx, rest: &str, content: &str) -> Result<String, St
     conflicts.write(rest, content)
 }
 
+fn skill_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
+    let Some(skills) = ctx.skills else {
+        return Err("skills belong to the worker that read the file".to_string());
+    };
+    skills.read(rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,7 +211,7 @@ mod tests {
     ];
 
     fn context(registry: &mut conflict::Registry) -> Ctx<'_> {
-        Ctx { conflicts: Some(registry) }
+        Ctx { conflicts: Some(registry), skills: None }
     }
 
     #[test]
@@ -205,9 +222,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_scheme_with_handlers_is_advertised() {
+    fn only_the_schemes_with_handlers_are_advertised() {
         let summary = summary().unwrap();
         assert!(summary.contains("`conflict://`"), "{summary}");
+        assert!(summary.contains("`skill://`"), "{summary}");
         assert!(!summary.contains("mcp"), "{summary}");
         assert!(!summary.contains("ssh"), "{summary}");
     }
@@ -217,7 +235,10 @@ mod tests {
         for scheme in ["mcp", "pr", "ssh", "nobody-wrote-this"] {
             let mut registry = conflict::Registry::default();
             let error = read(&mut context(&mut registry), &format!("{scheme}://x")).unwrap_err();
-            assert_eq!(error, format!("`{scheme}://` is not an available scheme: this build resolves `conflict://`"));
+            assert_eq!(
+                error,
+                format!("`{scheme}://` is not an available scheme: this build resolves `conflict://`, `skill://`")
+            );
         }
     }
 
@@ -246,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_caller_without_a_registry_cannot_use_conflict_ids() {
-        let mut ctx = Ctx { conflicts: None };
+        let mut ctx = Ctx { conflicts: None, skills: None };
         assert_eq!(read(&mut ctx, "conflict://1").unwrap_err(), "conflict ids belong to the worker that read the file");
         assert!(write(&mut ctx, "conflict://1", "@ours").is_err());
     }

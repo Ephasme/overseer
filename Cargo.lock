@@ -1431,11 +1431,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "dotenvy",
  "ratatui",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "tui-textarea-2",

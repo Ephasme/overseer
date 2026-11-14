@@ -1,5 +1,7 @@
 use crate::config;
 use crate::conflict;
+use crate::mcp;
+use crate::skills;
 use crate::url;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -151,6 +153,11 @@ impl Policy {
         }
         if name == WRITE_FILE && self.read_only {
             return Some("this worker is read-only: write_file is refused".into());
+        }
+        // The tool list already hides these from a read-only worker, but a policy is re-read on
+        // every call and a model may still call a tool it was shown in an earlier turn.
+        if self.read_only && name.starts_with(mcp::PREFIX) {
+            return Some(format!("this worker is read-only: {name} is an MCP tool with unknown side effects"));
         }
         if name != BASH {
             return None;
@@ -313,6 +320,12 @@ pub(crate) fn outcome(result: Result<String, String>) -> String {
     truncate(result.unwrap_or_else(|e| format!("error: {e}")))
 }
 
+/// What a worker's tool call may reach beyond its working directory: its skills and the servers.
+pub(crate) struct Context<'a> {
+    pub(crate) skills: &'a skills::Catalogue,
+    pub(crate) mcp: &'a mcp::Registry,
+}
+
 /// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
 pub(crate) fn execute_guarded(
     working_dir: &Path,
@@ -321,10 +334,11 @@ pub(crate) fn execute_guarded(
     policy: &Policy,
     cancel: Option<&AtomicBool>,
     conflicts: &mut conflict::Registry,
+    context: &Context<'_>,
 ) -> String {
     match policy.refuse(name, arguments) {
         Some(refusal) => outcome(Err(refusal)),
-        None => outcome(run(working_dir, name, arguments, conflicts, BASH_TIMEOUT, cancel)),
+        None => outcome(run(working_dir, name, arguments, conflicts, BASH_TIMEOUT, cancel, context)),
     }
 }
 
@@ -335,11 +349,16 @@ fn run(
     conflicts: &mut conflict::Registry,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
+    context: &Context<'_>,
 ) -> Result<String, String> {
     match name {
         BASH => parse_args::<BashArgs>(arguments).and_then(|args| bash(working_dir, &args, timeout, cancel)),
-        READ_FILE => parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts)),
+        READ_FILE => {
+            parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts, context))
+        }
         WRITE_FILE => parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts)),
+        // An MCP server reports its own failures as text, which is what the model reads.
+        _ if name.starts_with(mcp::PREFIX) => Ok(context.mcp.call(name, arguments)),
         _ => Err(format!("unknown tool {name}")),
     }
 }
@@ -473,37 +492,23 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
 /// Reads a UTF-8 file, keeping the head of a file larger than the read budget.
 ///
 /// Every conflict block the read shows is registered, so a later write can address it by id.
-fn read_file(working_dir: &Path, args: &ReadArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
+fn read_file(
+    working_dir: &Path,
+    args: &ReadArgs,
+    conflicts: &mut conflict::Registry,
+    context: &Context<'_>,
+) -> Result<String, String> {
     if url::is_url(&args.path) {
-        return url::read(&mut url::Ctx { conflicts: Some(conflicts) }, &args.path);
+        return url::read(&mut url::Ctx { conflicts: Some(conflicts), skills: Some(context.skills) }, &args.path);
     }
     if let Some(display) = args.path.strip_suffix(conflict::LIST_SUFFIX) {
         return list_conflicts(working_dir, display, conflicts);
     }
     let full = working_dir.join(&args.path);
-    let file = fs::File::open(&full).map_err(|e| config::io_error(&args.path, &e))?;
-    let limit = u64::try_from(MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
-    let mut bytes = Vec::with_capacity(8 * 1024);
-    file.take(limit).read_to_end(&mut bytes).map_err(|e| config::io_error(&args.path, &e))?;
-    let cut = bytes.len() > MAX_READ_BYTES;
-    if cut {
-        // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
-        let end = bytes
-            .get(..MAX_READ_BYTES)
-            .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
-        bytes.truncate(end);
-    }
-    let text = String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", args.path))?;
+    let (text, cut) = read_limited(&full, &args.path)?;
     let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(&args.path, &e))?;
     conflicts.reconcile(&absolute, &args.path, &text);
-    let mut out = if cut {
-        let shown = text.len();
-        format!(
-            "{text}\n[truncated: first {shown} bytes shown; {MAX_READ_BYTES} is the read budget, not the file size]"
-        )
-    } else {
-        text
-    };
+    let mut out = with_note(text, cut);
     let summary = conflicts.summary(&absolute);
     if !summary.is_empty() {
         out.push('\n');
@@ -517,6 +522,37 @@ fn read_file(working_dir: &Path, args: &ReadArgs, conflicts: &mut conflict::Regi
         }
     }
     Ok(out)
+}
+
+/// Reads a UTF-8 file, keeping the head of a file larger than the read budget, and says whether it
+/// stopped early.
+///
+/// `label` is what the model sees in an error: a skill path is not the working directory's path,
+/// and naming it as one would send the model to the wrong place.
+pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), String> {
+    let file = fs::File::open(path).map_err(|e| config::io_error(label, &e))?;
+    let limit = u64::try_from(MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take(limit).read_to_end(&mut bytes).map_err(|e| config::io_error(label, &e))?;
+    let cut = bytes.len() > MAX_READ_BYTES;
+    if cut {
+        // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
+        let end = bytes
+            .get(..MAX_READ_BYTES)
+            .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
+        bytes.truncate(end);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{label}: not valid UTF-8"))?;
+    Ok((text, cut))
+}
+
+/// The text as the model reads it, with the truncation note when the read stopped early.
+pub(crate) fn with_note(text: String, cut: bool) -> String {
+    if !cut {
+        return text;
+    }
+    let shown = text.len();
+    format!("{text}\n[truncated: first {shown} bytes shown; {MAX_READ_BYTES} is the read budget, not the file size]")
 }
 
 /// Registers every block of a file, past the read budget, and lists them.
@@ -538,7 +574,7 @@ fn list_conflicts(working_dir: &Path, display: &str, conflicts: &mut conflict::R
 
 fn write_file(working_dir: &Path, args: &WriteArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
     if url::is_url(&args.path) {
-        return url::write(&mut url::Ctx { conflicts: Some(conflicts) }, &args.path, &args.content);
+        return url::write(&mut url::Ctx { conflicts: Some(conflicts), skills: None }, &args.path, &args.content);
     }
     let full = working_dir.join(&args.path);
     if let Some(parent) = full.parent() {
@@ -592,12 +628,27 @@ mod tests {
 
     /// A tool call with no policy, no cancellation and a fresh registry: each test sees its own ids.
     fn execute(dir: &Path, name: &str, arguments: &str) -> String {
-        execute_guarded(dir, name, arguments, &Policy::default(), None, &mut registry())
+        guarded(dir, name, arguments, &Policy::default(), None, &mut registry())
     }
 
     /// One tool call against a registry the caller keeps, for a read that a later write resolves.
     fn with_registry(dir: &Path, name: &str, arguments: &str, conflicts: &mut conflict::Registry) -> String {
-        execute_guarded(dir, name, arguments, &Policy::default(), None, conflicts)
+        guarded(dir, name, arguments, &Policy::default(), None, conflicts)
+    }
+
+    /// The same call, with the empty skills and servers a plain tool test has.
+    fn guarded(
+        dir: &Path,
+        name: &str,
+        arguments: &str,
+        policy: &Policy,
+        cancel: Option<&AtomicBool>,
+        conflicts: &mut conflict::Registry,
+    ) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        execute_guarded(dir, name, arguments, policy, cancel, conflicts, &Context { skills: &skills, mcp: &mcp })
     }
 
     #[test]
@@ -616,7 +667,11 @@ mod tests {
         let started = Instant::now();
         let command = r#"{"command":"echo before; sleep 30"}"#;
         let mut conflicts = conflict::Registry::default();
-        let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None));
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let context = Context { skills: &skills, mcp: &mcp };
+        let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None, &context));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -769,17 +824,17 @@ mod tests {
         let policy = Policy { read_only: true, ..Policy::default() };
         let write = json!({"path": "x", "content": "y"}).to_string();
         assert!(
-            execute_guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
+            guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
                 .starts_with("error: this worker is read-only"),
             "write_file ran in a read-only worker"
         );
         for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
             let args = json!({"command": command}).to_string();
-            let out = execute_guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
             assert!(out.starts_with("error: this worker is read-only"), "`{command}` ran: {out}");
         }
         let read = json!({"command": "ls | head -5"}).to_string();
-        let out = execute_guarded(dir.path(), BASH, &read, &policy, None, &mut registry());
+        let out = guarded(dir.path(), BASH, &read, &policy, None, &mut registry());
         assert!(!out.starts_with("error:"), "a read-only pipeline was refused: {out}");
     }
 
@@ -794,21 +849,39 @@ mod tests {
         };
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
+            guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
             "error: tool read_file is banned for this worker"
         );
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
+            guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
             "error: this worker may not run commands starting with `echo secret`"
         );
         let outside = json!({"command": "pwd"}).to_string();
         assert_eq!(
-            execute_guarded(dir.path(), BASH, &outside, &policy, None, &mut registry()),
+            guarded(dir.path(), BASH, &outside, &policy, None, &mut registry()),
             "error: this worker runs only: ls · echo"
         );
         let allowed = json!({"command": "ls"}).to_string();
-        assert!(!execute_guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
+        assert!(!guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
+    }
+
+    #[test]
+    fn a_skill_uri_reads_through_the_catalogue() {
+        let home = tempfile::tempdir().unwrap();
+        let skill = home.path().join(".agents/skills/caveman");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\ndescription: be brief\n---\nbody\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let context = Context { skills: &skills, mcp: &mcp };
+        let read = json!({"path": "skill://caveman"}).to_string();
+        let out = execute_guarded(dir.path(), READ_FILE, &read, &Policy::default(), None, &mut registry(), &context);
+        assert!(out.contains("body"), "{out}");
+        let missing = json!({"path": "skill://nope"}).to_string();
+        let out = execute_guarded(dir.path(), READ_FILE, &missing, &Policy::default(), None, &mut registry(), &context);
+        assert!(out.starts_with("error: unknown skill nope"), "{out}");
     }
 
     #[test]
@@ -816,14 +889,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
-        let out = execute_guarded(
-            dir.path(),
-            BASH,
-            r#"{"command":"sleep 30"}"#,
-            &Policy::default(),
-            Some(&cancel),
-            &mut registry(),
-        );
+        let out =
+            guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &Policy::default(), Some(&cancel), &mut registry());
         assert!(out.contains("interrupted by overseer"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
