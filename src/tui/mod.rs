@@ -132,12 +132,25 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::F(5) => mouse(app)?,
         // A worker view owns the keys while it is open: esc returns to the fleet from there.
         _ if app.in_worker_view() => app.worker_key(key),
+        // The completion popup owns these keys while it is open, above the composer's own bindings:
+        // a menu in front of the caret takes the arrows, and Enter picks from it rather than sending.
+        KeyCode::Up if app.completing() => app.step_completion(false),
+        KeyCode::Down if app.completing() => app.step_completion(true),
+        KeyCode::Tab if app.completing() => {
+            app.accept_completion();
+        }
+        KeyCode::Esc if app.completing() => app.close_completion(),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
         KeyCode::Char('v') if ctrl => copy(app, pasted),
         KeyCode::Char('x') if ctrl => app.detach(),
         KeyCode::Char('p') if ctrl => app.recall_previous(),
         KeyCode::Char('n') if ctrl => app.recall_next(),
-        KeyCode::Enter if !alt && !shift => submit(app, input),
+        // Enter accepts the highlighted row; with no popup open it submits, exactly as before.
+        KeyCode::Enter if !alt && !shift => {
+            if !app.accept_completion() {
+                submit(app, input);
+            }
+        }
         KeyCode::Backspace => app.backspace(key),
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
@@ -291,5 +304,64 @@ mod tests {
         let opened = screen(&mut app, 100, 24);
         assert!(opened.contains("tail"), "ctrl+o shows the whole task: {opened}");
         assert!(!opened.contains("more lines"), "nothing is hidden once expanded: {opened}");
+    }
+
+    /// Enter with the popup open takes the highlighted row: it never submits what is in the prompt.
+    #[test]
+    fn enter_accepts_the_popup_instead_of_submitting() {
+        let mut app = App::new("m");
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Enter);
+        // The composer keeps the space the argument follows in; `take_prompt` trims it.
+        assert_eq!(app.take_prompt(), "/resume", "enter took the first row and reached no core");
+        assert!(!app.completing(), "the popup closed on the row it accepted");
+    }
+
+    /// Down moves the highlight without touching the caret, and tab takes what it landed on.
+    #[test]
+    fn down_moves_the_highlight_and_tab_accepts_it() {
+        let mut app = App::new("m");
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.take_prompt(), "/schemes", "down picked the second row and tab took it");
+    }
+
+    /// The popup only takes the keys it lists: ctrl+o, the tool-card toggle, keeps working while the
+    /// menu is open, and its `o` never reaches the composer.
+    #[test]
+    fn ctrl_o_still_toggles_expansion_while_the_popup_is_open() {
+        let mut app = App::new("m");
+        let before = app.tool_output;
+        press(&mut app, KeyCode::Char('/'));
+        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_ne!(app.tool_output, before, "ctrl+o is not the popup's key");
+        assert!(app.completing(), "and it leaves the menu open");
+        assert_eq!(app.take_prompt(), "/", "the o never reached the composer");
+    }
+
+    /// F3 is the other half of the verbosity flag, and the popup's arms match neither it nor ctrl+o:
+    /// with the popup closed, both still flip expansion.
+    #[test]
+    fn f3_still_toggles_expansion_with_the_popup_closed() {
+        let mut app = App::new("m");
+        let before = app.tool_output;
+        assert!(!app.completing(), "nothing is being completed in an empty composer");
+        press(&mut app, KeyCode::F(3));
+        assert_ne!(app.tool_output, before, "F3 expands or collapses every tool card");
+        press(&mut app, KeyCode::F(3));
+        assert_eq!(app.tool_output, before, "and the same key toggles it back");
+    }
+
+    /// Esc closes the popup and leaves the typed keys in the composer; it never quits the app.
+    #[test]
+    fn escape_closes_the_popup_and_keeps_the_typed_text() {
+        let mut app = App::new("m");
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.completing(), "esc closes the popup");
+        assert!(!app.quit, "esc with the popup open never quits");
+        assert_eq!(app.take_prompt(), "/s", "what was typed stays where it was");
     }
 }

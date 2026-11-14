@@ -1,6 +1,7 @@
 use super::theme;
 use crate::clipboard;
 use crate::event::UiEvent;
+use crate::slash::{self, RESUME};
 use crate::swarm::{AgentEvent, AgentView, Progress, Swarm};
 use crate::tools;
 use crate::version;
@@ -10,7 +11,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tui_textarea::{TextArea, WrapMode};
@@ -587,6 +588,90 @@ struct AgentStream {
     unread: usize,
 }
 
+/// One row of the completion popup: what accepting it writes, and how it reads.
+enum Candidate {
+    /// A slash command, straight from the one table in `slash`.
+    Command(&'static slash::Command),
+    /// An agent `/resume` can retask.
+    Agent { id: usize, state: String, colour: Color, dir: String },
+}
+
+impl Candidate {
+    /// What accepting the row leaves in the composer, caret at its end.
+    fn insertion(&self) -> String {
+        match self {
+            Self::Command(command) => command.insertion(),
+            Self::Agent { id, .. } => format!("{RESUME} {id}"),
+        }
+    }
+
+    /// The row as the popup draws it: the command and what it does, or the agent and where it sits.
+    fn line(&self) -> Line<'static> {
+        match self {
+            Self::Command(command) => Line::from(vec![
+                Span::styled(command.label(), Style::new().fg(theme::text())),
+                Span::styled(format!("  {}", command.about), Style::new().fg(theme::muted())),
+            ]),
+            Self::Agent { id, state, colour, dir } => Line::from(vec![
+                Span::styled(id.to_string(), Style::new().fg(theme::info())),
+                Span::styled(format!("  {state}"), Style::new().fg(*colour)),
+                Span::styled(format!("  {dir}"), Style::new().fg(theme::faint())),
+            ]),
+        }
+    }
+}
+
+/// The completion popup: its rows and the one the keys move through.
+struct Menu {
+    candidates: Vec<Candidate>,
+    selected: usize,
+}
+
+impl Menu {
+    /// The commands `token` names, in the table's order.
+    fn commands(token: &str) -> Option<Self> {
+        Self::of(slash::matching(token).into_iter().map(Candidate::Command).collect())
+    }
+
+    /// The agents an id starting with `partial` names, in the panel's order.
+    ///
+    /// The list is the live one the panel draws, so an id that no longer exists is never offered.
+    fn agents(agents: &[AgentView], partial: &str) -> Option<Self> {
+        let candidates = agents.iter().filter(|agent| agent.id.to_string().starts_with(partial)).map(|agent| {
+            let (_, colour, state) = worker_state(agent);
+            // The state word alone: the panel's own row carries the seconds and the glyph.
+            let state = state.split_whitespace().next().unwrap_or_default().to_string();
+            Candidate::Agent { id: agent.id, state, colour, dir: shown_dir(&agent.dir) }
+        });
+        Self::of(candidates.collect())
+    }
+
+    /// A menu holding `candidates`, or nothing at all: a token that matches nothing shows no popup.
+    fn of(candidates: Vec<Candidate>) -> Option<Self> {
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(Self { candidates, selected: 0 })
+    }
+
+    /// The highlighted row.
+    fn picked(&self) -> Option<&Candidate> {
+        self.candidates.get(self.selected)
+    }
+
+    /// Moves the highlight, wrapping at both ends so a held key never sticks.
+    fn step(&mut self, forward: bool) {
+        let last = self.candidates.len().saturating_sub(1);
+        self.selected = if forward {
+            if self.selected >= last { 0 } else { self.selected.saturating_add(1) }
+        } else if self.selected == 0 {
+            last
+        } else {
+            self.selected.saturating_sub(1)
+        };
+    }
+}
+
 /// The image the composer carries into the next message, as the chip above it shows it.
 enum Attachment {
     /// Ctrl+V landed and the clipboard is being read: the chip says so before the read starts.
@@ -640,6 +725,8 @@ pub(super) struct App {
     history: Vec<String>,
     /// Index into `history` while recalling with ctrl+p and ctrl+n.
     recall: Option<usize>,
+    /// The completion popup, while the composer is mid-word on a slash command or an id.
+    completion: Option<Menu>,
     /// Where each agent tool call's entry landed: (agent, its call number, entry index).
     calls: Vec<(usize, usize, usize)>,
     /// The entry each agent's streamed output is filling: (agent, entry index in its own stream).
@@ -682,6 +769,7 @@ impl App {
             model: model.to_string(),
             history: Vec::new(),
             recall: None,
+            completion: None,
             calls: Vec::new(),
             live: Vec::new(),
             workers: Vec::new(),
@@ -1053,6 +1141,7 @@ impl App {
             self.render_attachment(frame, chip);
             frame.render_widget(&self.composer, input);
             self.render_composer_meta(frame, input);
+            self.render_completion(frame, input);
         }
         self.render_status(frame, status);
     }
@@ -1219,6 +1308,34 @@ impl App {
         }
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), cap);
+    }
+
+    /// The completion menu, hanging off the composer: its rows sit just above it and its text
+    /// starts in the column the composer's own text does. The highlighted row wears the band the
+    /// panels mark a picked row with, so it reads as picked in all three palettes.
+    fn render_completion(&self, frame: &mut Frame, composer: Rect) {
+        let Some(menu) = &self.completion else { return };
+        // Rows the space above the composer cannot hold are simply not drawn: the frame keeps its
+        // shape on a terminal too short for the whole menu.
+        let height = u16::try_from(menu.candidates.len()).unwrap_or(u16::MAX).min(composer.y);
+        if height == 0 {
+            return;
+        }
+        let area = Rect {
+            x: composer.x,
+            y: composer.y.saturating_sub(height),
+            width: composer.width.saturating_sub(2),
+            height,
+        };
+        // The transcript runs underneath: the popup's rows are its own, not the entry behind it.
+        frame.render_widget(Clear, area);
+        for (index, candidate) in menu.candidates.iter().enumerate() {
+            let Ok(offset) = u16::try_from(index) else { return };
+            let band = if index == menu.selected { theme::band() } else { Style::new() };
+            let row = Rect { y: area.y.saturating_add(offset), height: 1, ..area };
+            let line = Paragraph::new(candidate.line()).style(band).block(Block::new().padding(Padding::horizontal(2)));
+            frame.render_widget(line, row);
+        }
     }
 
     /// Whether a worker view is open: the picked worker is still in the roster and the view is not closed.
@@ -1394,6 +1511,7 @@ impl App {
         let typed = self.composer.lines().join("\n");
         self.composer = composer();
         self.recall = None;
+        self.completion = None;
         // History holds what was typed: a recalled temp path would point at a file since dropped.
         if !typed.is_empty() {
             self.history.push(typed);
@@ -1410,6 +1528,7 @@ impl App {
     pub(super) fn insert(&mut self, text: &str) {
         self.composer.insert_str(text);
         self.dirty = true;
+        self.refresh_completion();
     }
 
     /// A bracketed paste: the composer takes it, unless a worker's view owns the keys.
@@ -1507,6 +1626,7 @@ impl App {
     pub(super) fn input(&mut self, key: KeyEvent) {
         self.composer.input(key);
         self.dirty = true;
+        self.refresh_completion();
     }
 
     pub(super) fn toggle_workers(&mut self) {
@@ -1601,6 +1721,7 @@ impl App {
             }
         } else {
             self.composer = composer();
+            self.completion = None;
             self.recall = None;
             self.dirty = true;
         }
@@ -1608,10 +1729,75 @@ impl App {
 
     /// Replaces the composer's text with a recalled prompt, caret at its end.
     fn refill(&mut self, text: &str) {
+        self.fill(text);
+        self.refresh_completion();
+    }
+
+    /// Puts `text` in the composer, one line per newline, caret at the end.
+    fn fill(&mut self, text: &str) {
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let cursor = (lines.len().saturating_sub(1), lines.last().map_or(0, |line| line.chars().count()));
         self.composer.set_lines(lines, cursor);
         self.dirty = true;
+    }
+
+    /// Whether the completion popup is open: it owns Up, Down, Tab, Enter and Esc while it is.
+    pub(super) fn completing(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    /// Up and Down move the popup's highlight; with it closed the key reaches the composer as before.
+    pub(super) fn step_completion(&mut self, forward: bool) {
+        if let Some(menu) = &mut self.completion {
+            menu.step(forward);
+            self.dirty = true;
+        }
+    }
+
+    /// Esc closes the popup and leaves what was typed where it is: the keys the user chose stay.
+    pub(super) fn close_completion(&mut self) {
+        if self.completion.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Tab and Enter while the popup is open: the highlighted row lands in the composer, caret at
+    /// its end, and the popup closes. Returns whether there was a row to accept.
+    pub(super) fn accept_completion(&mut self) -> bool {
+        let Some(insertion) = self.completion.as_ref().and_then(Menu::picked).map(Candidate::insertion) else {
+            return false;
+        };
+        self.fill(&insertion);
+        // The row is spent: the next Enter submits what it left behind, and the popup does not
+        // reopen on the row that just came from it.
+        self.completion = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Rebuilds the popup from the composer's text and caret, after a key changed either.
+    fn refresh_completion(&mut self) {
+        // The keystroke changed the list, so the highlight starts again on its first row.
+        self.completion = self.menu();
+    }
+
+    /// The popup the composer asks for, if any: the first token while it still starts with `/`, or
+    /// the ids `/resume` takes once its space has been typed.
+    fn menu(&self) -> Option<Menu> {
+        let [line] = self.composer.lines() else { return None };
+        // What lies behind the caret: a space is what ends the command being typed.
+        let (_, column) = self.composer.cursor();
+        let typed: String = line.chars().take(column).collect();
+        if let Some(rest) = typed.strip_prefix(RESUME).and_then(|rest| rest.strip_prefix(' '))
+            && !rest.contains(' ')
+        {
+            return Menu::agents(&self.workers, rest);
+        }
+        let token = typed.rsplit(' ').next().unwrap_or_default();
+        if token.starts_with('/') && typed == token {
+            return Menu::commands(token);
+        }
+        None
     }
 }
 
@@ -1637,6 +1823,17 @@ fn worker_state(worker: &AgentView) -> (&'static str, Color, String) {
 /// The last component of the worker's directory, so a narrow panel stays readable.
 fn short_dir(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// An agent's directory with the home prefix written `~`, so a completion row stays short and still
+/// says where the agent sits. A home the run cannot name leaves the path as it is.
+fn shown_dir(dir: &Path) -> String {
+    let Ok(home) = crate::config::home() else { return dir.display().to_string() };
+    match dir.strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    }
 }
 
 /// The longest prefix of `hints` that fits `room` columns, joined the way the status line shows them.
@@ -2551,5 +2748,129 @@ mod tests {
         app.leave_worker();
         app.paste("a pasted sentence");
         assert_eq!(app.take_prompt(), "a pasted sentence", "the prompt takes a paste once the view is closed");
+    }
+
+    /// Types one key the way the loop does: through the composer's own input path.
+    fn type_key(app: &mut App, code: KeyCode) {
+        app.input(KeyEvent::from(code));
+    }
+
+    /// The rows the popup would draw, as the text each one reads as.
+    fn menu_rows(app: &App) -> Vec<String> {
+        app.completion.as_ref().map_or_else(Vec::new, |menu| {
+            menu.candidates.iter().map(|candidate| row_text(&[candidate.line()])).collect()
+        })
+    }
+
+    #[test]
+    fn the_popup_narrows_to_the_token_and_a_space_ends_it() {
+        let mut app = App::new("m");
+        assert!(!app.completing(), "an empty composer offers nothing");
+        type_key(&mut app, KeyCode::Char('/'));
+        let rows = menu_rows(&app);
+        assert_eq!(rows.len(), slash::COMMANDS.len(), "/ offers every command: {rows:?}");
+        assert!(rows[0].starts_with("/resume <id>"), "{rows:?}");
+        assert!(rows[3].starts_with("/login <server>"), "the table's order is the popup's: {rows:?}");
+        type_key(&mut app, KeyCode::Char('m'));
+        assert_eq!(menu_rows(&app), ["/mcp  show the MCP servers"], "only what was typed is offered");
+        type_key(&mut app, KeyCode::Char(' '));
+        assert!(!app.completing(), "a space ends the command: there is nothing left to complete");
+        assert_eq!(app.composer.cursor(), (0, 3), "and it reached the composer");
+        type_key(&mut app, KeyCode::Char('x'));
+        assert!(!app.completing(), "an argument is no command name");
+    }
+
+    #[test]
+    fn accepting_a_command_leaves_the_name_its_argument_follows_and_the_caret_at_the_end() {
+        let mut app = App::new("m");
+        for key in [KeyCode::Char('/'), KeyCode::Char('s'), KeyCode::Char('c')] {
+            type_key(&mut app, key);
+        }
+        assert!(app.accept_completion(), "the popup has a row to accept");
+        assert!(!app.completing(), "the popup closes on the row it accepted");
+        assert_eq!(app.composer.cursor(), (0, 8), "the caret sits at the end of the command");
+        assert_eq!(app.take_prompt(), "/schemes", "a command with no argument lands bare");
+
+        let mut app = App::new("m");
+        for key in [KeyCode::Char('/'), KeyCode::Char('r'), KeyCode::Char('e')] {
+            type_key(&mut app, key);
+        }
+        assert!(app.accept_completion());
+        assert_eq!(app.composer.cursor(), (0, 8), "the caret waits where the argument goes");
+        assert_eq!(
+            app.composer.lines().join("\n"),
+            "/resume ",
+            "a command with an argument leaves the space its argument follows in"
+        );
+    }
+
+    #[test]
+    fn closing_the_popup_keeps_what_was_typed() {
+        let mut app = App::new("m");
+        type_key(&mut app, KeyCode::Char('/'));
+        type_key(&mut app, KeyCode::Char('s'));
+        assert!(app.completing());
+        app.close_completion();
+        assert!(!app.completing(), "esc closes the popup");
+        assert_eq!(app.take_prompt(), "/s", "and leaves the keys the user typed where they are");
+    }
+
+    #[test]
+    fn resume_completes_the_agent_ids_the_panel_shows() {
+        let mut app = App::new("m");
+        let mut stopped = agent_view(4, "gone quiet");
+        stopped.stopped = true;
+        stopped.dir = PathBuf::from("/tmp/other");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(3, "fix the nav"), stopped]));
+        app.paste("/resume ");
+        let rows = menu_rows(&app);
+        assert_eq!(
+            rows,
+            ["1  idle  /tmp/repo", "3  idle  /tmp/repo", "4  stopped  /tmp/other"],
+            "every agent the panel draws is offered, with its state and where it sits"
+        );
+        app.step_completion(true);
+        assert_eq!(app.completion.as_ref().map(|menu| menu.selected), Some(1), "down moves the highlight");
+        app.step_completion(false);
+        assert_eq!(app.completion.as_ref().map(|menu| menu.selected), Some(0), "up moves it back");
+        assert_eq!(app.composer.cursor(), (0, 8), "and neither moves the caret");
+        app.paste("3");
+        assert_eq!(menu_rows(&app), ["3  idle  /tmp/repo"], "a partial id narrows the list");
+        assert!(app.accept_completion());
+        assert_eq!(app.take_prompt(), "/resume 3", "accepting an id writes the command and the id");
+    }
+
+    #[test]
+    fn typing_a_slash_lists_the_commands_above_the_composer_and_the_popup_goes_on_esc() {
+        let mut app = App::new("m");
+        type_key(&mut app, KeyCode::Char('/'));
+        let open = screen(&mut app, 100, 24);
+        assert!(open.contains("/resume <id>"), "{open}");
+        assert!(open.contains("retask an agent without a model call"), "{open}");
+        assert!(open.contains("/login <server>"), "{open}");
+        app.close_completion();
+        let closed = screen(&mut app, 100, 24);
+        assert!(!closed.contains("/resume <id>"), "the rows are gone: {closed}");
+        assert!(!closed.contains("/schemes"), "{closed}");
+        assert!(closed.contains("┃"), "the composer is still there: {closed}");
+    }
+
+    /// The picked row is the one wearing the band: a menu whose highlight you cannot see is a menu
+    /// you cannot steer.
+    #[test]
+    fn the_highlighted_row_is_the_only_one_wearing_the_band() {
+        let mut app = App::new("m");
+        type_key(&mut app, KeyCode::Char('/'));
+        let buffer = drawn(&mut app, 100, 24);
+        let band = theme::band().bg;
+        let mut banded = Vec::new();
+        for y in 0..24 {
+            let row: String = (0..100).filter_map(|x| buffer.cell((x, y))).map(ratatui::buffer::Cell::symbol).collect();
+            if row.contains("/resume <id>") || row.contains("/schemes") {
+                let cell = buffer.cell((2, y)).expect("the popup's first text column");
+                banded.push(Some(cell.bg) == band);
+            }
+        }
+        assert_eq!(banded, [true, false], "the first row is picked and the one under it is not");
     }
 }

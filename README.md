@@ -36,10 +36,14 @@ overseer
 ```
 
 On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Every model call reaches its view one way: entries appended in the order the call produced them, so a thought, the answer and the tool call it asks for read top to bottom, and a worker's stream opens with the instruction that started it. The transcript is the lead's own stream: a worker's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`, `interrupted`). Every worker has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the worker panel counts the lines a closed view missed and shows each worker as working, paused, stopped, idle or failed, with `read-only` when restricted. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
+Typing `/` at the start of the prompt opens a completion popup of the commands overseer knows, narrowed by what you type; `/resume ` follows with the agent ids that exist right now, each with its state and its directory, so an id that is gone is never offered.
 
 |Key|Effect|
 |---|---|
-|enter|send the prompt|
+|enter|send the prompt; with the completion popup open, take the highlighted command instead|
+|tab|with the completion popup open: take the highlighted command|
+|↑ / ↓|with the completion popup open: the previous or next completion, leaving the caret alone|
+|esc|with the completion popup open: close it and keep what you typed|
 |ctrl+j|new line in the prompt|
 |ctrl+v|attach the image on the clipboard to the prompt; the message carries its path|
 |ctrl+x|drop the attached image|

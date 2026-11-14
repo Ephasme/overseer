@@ -11,6 +11,7 @@ mod repos;
 mod secrets;
 mod session;
 mod skills;
+mod slash;
 mod swarm;
 mod tools;
 mod tui;
