@@ -2,7 +2,7 @@ use crate::agent;
 use crate::config;
 use crate::event::UiEvent;
 use crate::fleet::{self, Event, Fleet};
-use crate::llm::{Llm, Message, StreamLlm, ToolCall};
+use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,8 +30,12 @@ pub(crate) fn run(
     let stream_ui = ui.clone();
     let overseer: Arc<dyn Llm> = Arc::new(StreamLlm::new(
         Arc::clone(&llm),
-        Arc::new(move |delta: &str| {
-            let _ = stream_ui.send(UiEvent::Delta(delta.to_string()));
+        Arc::new(move |step| {
+            let event = match step {
+                StreamStep::Start => UiEvent::TurnBoundary,
+                StreamStep::Text(delta) => UiEvent::Delta(delta.to_string()),
+            };
+            let _ = stream_ui.send(event);
         }),
     ));
     let mut history = vec![Message::system(prompt::overseer_prompt(&cfg.roots))];

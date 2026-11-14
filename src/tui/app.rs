@@ -160,14 +160,17 @@ fn wrap(source: &str, width: usize) -> Vec<String> {
         return vec![source.to_string()];
     }
     let trimmed = source.trim_start();
-    let lead: String = source.chars().take(source.len() - trimmed.len()).collect();
+    // `trimmed` is a suffix of `source`, so the byte offset is a character boundary.
+    let lead = source.get(..source.len() - trimmed.len()).unwrap_or_default();
+    let lead_width = text_width(lead);
     let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut used = text_width(&lead);
+    let mut row = lead.to_string();
+    let mut used = lead_width;
     for word in trimmed.split_whitespace() {
         let mut rest = word;
         loop {
-            let space = usize::from(!row.is_empty());
+            let spaced = used > lead_width;
+            let space = usize::from(spaced);
             let needed = text_width(rest);
             if used + space + needed <= width {
                 if space == 1 {
@@ -178,21 +181,25 @@ fn wrap(source: &str, width: usize) -> Vec<String> {
                 used += needed;
                 break;
             }
-            if !row.is_empty() {
+            if spaced {
                 rows.push(std::mem::take(&mut row));
-                used = 0;
+                row = lead.to_string();
+                used = lead_width;
                 continue;
             }
-            let (head, tail) = split_at_width(rest, width.saturating_sub(used).max(1));
+            // The word alone is wider than its line: cut it, keeping the indentation.
+            let room = width.saturating_sub(lead_width).max(1);
+            let (head, tail) = split_at_width(rest, room);
             rows.push(format!("{lead}{head}"));
             rest = tail;
-            used = 0;
             if rest.is_empty() {
                 break;
             }
         }
     }
-    rows.push(format!("{lead}{row}"));
+    if used > lead_width || rows.is_empty() {
+        rows.push(row);
+    }
     rows
 }
 
@@ -304,13 +311,17 @@ impl App {
 
     pub(super) fn apply(&mut self, event: UiEvent) {
         self.dirty = true;
-        self.transcript_dirty = true;
+        // The transcript is only rebuilt when entries change; worker deltas touch the panel alone.
+        if !matches!(event, UiEvent::WorkerDelta { .. } | UiEvent::Workers(_) | UiEvent::Busy(_)) {
+            self.transcript_dirty = true;
+        }
         match event {
             UiEvent::Notice(text) => self.push(Role::Notice, String::new(), text),
+            UiEvent::Answer(text) => self.answer(text),
             UiEvent::Error(text) => self.push(Role::Error, String::new(), text),
             UiEvent::Debug(text) => self.push(Role::Debug, String::new(), text),
             UiEvent::Delta(text) => self.stream(&text),
-            UiEvent::Answer(text) => self.answer(text),
+            UiEvent::TurnBoundary => self.boundary(),
             UiEvent::ToolStarted { id, tool, summary } => {
                 let index = self.entries.len();
                 self.entries.push(Entry::new(Role::Tool, tool, summary));
@@ -351,19 +362,17 @@ impl App {
         }
     }
 
-    /// Appends streamed overseer text, starting an entry on the first delta.
-    ///
-    /// The core sends `"\n"` between model calls of one turn, which becomes a blank line.
-    fn stream(&mut self, text: &str) {
-        if text == "\n" {
-            if let Some(entry) = self.live.and_then(|index| self.entries.get_mut(index))
-                && !entry.body.is_empty()
-                && !entry.body.ends_with("\n\n")
-            {
-                entry.body.push_str("\n\n");
-            }
-            return;
+    /// Separates the model calls of one turn with a blank line.
+    fn boundary(&mut self) {
+        if let Some(entry) = self.live.and_then(|index| self.entries.get_mut(index))
+            && !entry.body.is_empty()
+            && !entry.body.ends_with("\n\n")
+        {
+            entry.body.push_str("\n\n");
         }
+    }
+
+    fn stream(&mut self, text: &str) {
         if self.live.is_none() {
             let index = self.entries.len();
             self.push(Role::Overseer, String::new(), String::new());
@@ -467,8 +476,13 @@ impl App {
             self.transcript_dirty = false;
         }
         let total = u16::try_from(self.transcript.len()).unwrap_or(u16::MAX);
+        // Reading older lines while new ones arrive: keep the same rows under the cursor.
+        if !self.follow && total > self.view.1 {
+            self.scroll = self.scroll.saturating_add(total - self.view.1);
+        }
         let bottom = total.saturating_sub(inner.height);
-        let offset = if self.follow { bottom } else { bottom.saturating_sub(self.scroll.min(bottom)) };
+        self.scroll = self.scroll.min(bottom);
+        let offset = if self.follow { bottom } else { bottom - self.scroll };
         self.view = (inner.height, total);
         let paragraph = Paragraph::new(self.transcript.as_slice()).scroll((offset, 0));
         frame.render_widget(paragraph, inner);
@@ -485,11 +499,13 @@ impl App {
         let width = usize::from(inner.width.saturating_sub(2));
         let room = usize::from(inner.height);
         let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut hidden = false;
         for worker in &self.workers {
             let (glyph, colour, state) = worker_state(worker);
             let preview = self.preview_of(worker.id).and_then(last_line);
             let height = if preview.is_some() { 5 } else { 4 };
             if rows.len() + height > room {
+                hidden = true;
                 break;
             }
             rows.push(Line::from(vec![
@@ -507,7 +523,7 @@ impl App {
             }
             rows.push(Line::default());
         }
-        if rows.len() < self.workers.len() * 4 {
+        if hidden {
             rows.push(Line::from(Span::styled("…", DIM)));
         }
         frame.render_widget(Paragraph::new(rows), inner);
@@ -524,7 +540,7 @@ impl App {
         } else {
             spans.push(Span::styled("● idle", DIM));
         }
-        let working = self.workers.iter().filter(|w| w.pending > 0).count();
+        let working = self.workers.iter().filter(|w| w.pending > 0 && !w.finished).count();
         let idle = self.workers.len().saturating_sub(working);
         spans.push(Span::styled(format!(" │ {working} working · {idle} idle"), DIM));
         if !self.follow {
@@ -678,11 +694,11 @@ fn flatten(entries: &[Entry], width: u16) -> Vec<Line<'static>> {
 }
 
 fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
-    if worker.pending > 0 {
+    if worker.pending > 0 && !worker.finished {
         let secs = worker.busy_for.unwrap_or_default().as_secs();
         return ("●", YELLOW, format!("working {secs}s"));
     }
-    if worker.failed {
+    if worker.failed || worker.pending > 0 {
         return ("✕", RED, "failed".into());
     }
     ("○", Color::DarkGray, "idle".into())
@@ -758,9 +774,9 @@ mod tests {
     #[test]
     fn model_call_boundary_becomes_a_blank_line() {
         let mut app = App::new("m");
-        for delta in ["first call", "\n", "second call"] {
-            app.apply(UiEvent::Delta(delta.into()));
-        }
+        app.apply(UiEvent::Delta("first call".into()));
+        app.apply(UiEvent::TurnBoundary);
+        app.apply(UiEvent::Delta("second call".into()));
         assert_eq!(app.entries[0].body, "first call\n\nsecond call");
         assert_eq!(app.entries[0].lines(40).len(), 3);
     }
@@ -768,8 +784,17 @@ mod tests {
     #[test]
     fn a_boundary_before_any_text_opens_no_entry() {
         let mut app = App::new("m");
-        app.apply(UiEvent::Delta("\n".into()));
+        app.apply(UiEvent::TurnBoundary);
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn a_literal_newline_delta_stays_text() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Delta("a".into()));
+        app.apply(UiEvent::Delta("\n".into()));
+        app.apply(UiEvent::Delta("b".into()));
+        assert_eq!(app.entries[0].body, "a\nb");
     }
 
     #[test]
@@ -834,6 +859,23 @@ mod tests {
         app.apply(UiEvent::Worker { id: 1, kind: WorkerEvent::Finished, text: "done".into() });
         let rendered = screen(&mut app, 100, 24);
         assert!(!rendered.contains("reading the config"), "{rendered}");
+    }
+
+    #[test]
+    fn a_dead_worker_shows_as_failed() {
+        let mut app = App::new("m");
+        app.workers = vec![WorkerView {
+            id: 1,
+            dir: PathBuf::from("/tmp/repo"),
+            task: "long job".into(),
+            pending: 1,
+            failed: false,
+            finished: true,
+            busy_for: Some(Duration::from_secs(3)),
+        }];
+        let screen = screen(&mut app, 100, 24);
+        assert!(screen.contains("failed"), "{screen}");
+        assert!(!screen.contains("working 3s"), "{screen}");
     }
 
     #[test]

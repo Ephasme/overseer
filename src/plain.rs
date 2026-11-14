@@ -20,6 +20,7 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
             UiEvent::ToolFinished { .. }
             | UiEvent::Worker { .. }
             | UiEvent::Delta(_)
+            | UiEvent::TurnBoundary
             | UiEvent::WorkerDelta { .. }
             | UiEvent::Workers(_)
             | UiEvent::Busy(_) => {}
@@ -40,7 +41,7 @@ fn spawn_stdin_reader(input: Sender<Event>) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else { break };
-            let Some(event) = parse_line(line.trim()) else { continue };
+            let Some(event) = Event::from_line(line.trim()) else { continue };
             let exit = event == Event::Exit;
             if input.send(event).is_err() || exit {
                 return;
@@ -48,31 +49,4 @@ fn spawn_stdin_reader(input: Sender<Event>) {
         }
         let _ = input.send(Event::Eof);
     });
-}
-
-/// Maps one trimmed stdin line to an event; `None` for a blank line.
-fn parse_line(line: &str) -> Option<Event> {
-    if line.is_empty() {
-        return None;
-    }
-    if line == "exit" {
-        return Some(Event::Exit);
-    }
-    if let Some(arg) = line.strip_prefix("/resume") {
-        return Some(Event::Resume(arg.to_string()));
-    }
-    Some(Event::User(line.to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_line_classifies_commands() {
-        assert_eq!(parse_line(""), None);
-        assert_eq!(parse_line("exit"), Some(Event::Exit));
-        assert_eq!(parse_line("/resume 3"), Some(Event::Resume(" 3".into())));
-        assert_eq!(parse_line("hello"), Some(Event::User("hello".into())));
-    }
 }

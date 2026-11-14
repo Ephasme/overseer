@@ -9,6 +9,8 @@ pub(crate) enum UiEvent {
     Error(String),
     /// `OVERSEER_DEBUG` output.
     Debug(String),
+    /// A new model call began: the transcript starts a new paragraph.
+    TurnBoundary,
     /// The overseer's answer, as it streams.
     Delta(String),
     /// The overseer's final answer for one turn.

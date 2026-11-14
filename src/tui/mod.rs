@@ -66,6 +66,10 @@ fn event_loop(
         }
         app.tick();
         if app.quit {
+            // The events that ended the session are already applied: show them once before leaving.
+            if app.take_dirty() {
+                terminal.draw(|frame| app.render(frame))?;
+            }
             return Ok(());
         }
     }
@@ -105,16 +109,11 @@ fn submit(app: &mut App, input: &Sender<Event>) {
         return;
     }
     app.echo(&prompt);
-    if prompt == "exit" {
-        quit(app, input);
-        return;
-    }
-    match prompt.strip_prefix("/resume") {
-        Some(arg) => {
-            let _ = input.send(Event::Resume(arg.to_string()));
+    match Event::from_line(&prompt) {
+        Some(Event::Exit) => quit(app, input),
+        Some(event) => {
+            let _ = input.send(event);
         }
-        None => {
-            let _ = input.send(Event::User(prompt));
-        }
+        None => {}
     }
 }

@@ -1,6 +1,6 @@
 use crate::agent::Turn;
 use crate::config;
-use crate::llm::{Llm, Message, StreamLlm, ToolCall};
+use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use crate::repos;
 use crate::tools;
@@ -98,6 +98,24 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
+}
+
+impl Event {
+    /// Maps one trimmed input line to an event; `None` for a blank line.
+    ///
+    /// Both frontends parse prompts through this, so `exit` and `/resume` cannot drift apart.
+    pub(crate) fn from_line(line: &str) -> Option<Self> {
+        if line.is_empty() {
+            return None;
+        }
+        if line == "exit" {
+            return Some(Event::Exit);
+        }
+        if let Some(arg) = line.strip_prefix("/resume") {
+            return Some(Event::Resume(arg.to_string()));
+        }
+        Some(Event::User(line.to_string()))
+    }
 }
 
 /// One worker as the panels show it.
@@ -272,8 +290,10 @@ impl Fleet {
         let stream_sender = sender.clone();
         let streamed = Arc::new(StreamLlm::new(
             llm,
-            Arc::new(move |delta: &str| {
-                let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
+            Arc::new(move |step| {
+                if let StreamStep::Text(delta) = step {
+                    let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
+                }
             }),
         ));
         let worker_dir = working_dir.clone();
@@ -301,8 +321,10 @@ impl Fleet {
             return Err(format!("worker {id} is gone"));
         }
         worker.inbox.send(text.to_string()).map_err(|_| format!("worker {id} is gone"))?;
+        if worker.pending == 0 {
+            worker.busy_since = Some(Instant::now());
+        }
         worker.pending += 1;
-        worker.busy_since = Some(Instant::now());
         if clear_failure {
             worker.failed = false;
         }
@@ -475,6 +497,14 @@ mod tests {
     }
 
     #[test]
+    fn from_line_classifies_prompts() {
+        assert_eq!(Event::from_line(""), None);
+        assert_eq!(Event::from_line("exit"), Some(Event::Exit));
+        assert_eq!(Event::from_line("/resume 3"), Some(Event::Resume(" 3".into())));
+        assert_eq!(Event::from_line("hello"), Some(Event::User("hello".into())));
+    }
+
+    #[test]
     fn every_overseer_tool_is_dispatched() {
         let mut h = harness(vec![]);
         for tool in prompt::overseer_tool_definitions().as_array().unwrap() {
@@ -495,6 +525,21 @@ mod tests {
         fs::create_dir(h.root.path().join("plain")).unwrap();
         fs::create_dir_all(h.repo.join("nested/.git")).unwrap();
         assert_eq!(repos(&mut h.fleet), fs::canonicalize(&h.repo).unwrap().display().to_string());
+    }
+
+    #[test]
+    fn describe_names_what_a_tool_call_acts_on() {
+        assert_eq!(describe(prompt::SPAWN_WORKER, &json!({"task": "x"}).to_string()), "/tmp · x");
+        let nested = json!({"path": "/repo", "task": "a\nb"}).to_string();
+        assert_eq!(describe(prompt::SPAWN_WORKER, &nested), "/repo · a");
+        let command = json!({"command": "cargo test\nls"}).to_string();
+        assert_eq!(describe(tools::BASH, &command), "cargo test");
+        assert_eq!(describe(prompt::LIST_REPOS, "{}"), "");
+        assert_eq!(describe(tools::BASH, "not json"), "");
+        let long = json!({"command": "x".repeat(200)}).to_string();
+        let summary = describe(tools::BASH, &long);
+        assert_eq!(summary.chars().count(), 101);
+        assert!(summary.ends_with('…'));
     }
 
     #[test]

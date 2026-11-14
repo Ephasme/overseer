@@ -160,12 +160,15 @@ fn parse_response(body: &str) -> Result<Message> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// A provider reports a mid-stream failure here, with no choices.
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct StreamChoice {
     #[serde(default)]
     delta: Delta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -192,6 +195,7 @@ struct FragmentFunction {
 fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
+    let mut complete = false;
     for line in reader.lines() {
         let line = line.context("reading model stream failed")?;
         let Some(data) = line.trim().strip_prefix("data:") else {
@@ -202,27 +206,43 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
             continue;
         }
         if data == "[DONE]" {
+            complete = true;
             break;
         }
         let chunk: StreamChunk =
             serde_json::from_str(data).with_context(|| format!("unexpected stream chunk: {data}"))?;
+        if let Some(error) = chunk.error {
+            bail!("model stream failed: {error}");
+        }
         for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                complete = true;
+            }
             if let Some(text) = choice.delta.content {
                 content.push_str(&text);
                 on_delta(&text);
             }
             for fragment in choice.delta.tool_calls.unwrap_or_default() {
-                merge_fragment(&mut calls, fragment);
+                merge_fragment(&mut calls, fragment)?;
             }
         }
+    }
+    if !complete {
+        bail!("model stream ended before it finished");
+    }
+    if calls.is_empty() && content.is_empty() {
+        bail!("model returned an empty answer");
     }
     let tool_calls = (!calls.is_empty()).then_some(calls);
     let content = (!content.is_empty()).then_some(content);
     Ok(Message { role: "assistant".into(), content, tool_calls, tool_call_id: None })
 }
 
-fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) {
-    while calls.len() <= fragment.index {
+fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
+    if fragment.index > calls.len() {
+        bail!("tool call {} arrived before tool call {}", fragment.index, calls.len());
+    }
+    if fragment.index == calls.len() {
         calls.push(ToolCall {
             id: String::new(),
             kind: FUNCTION_KIND.into(),
@@ -230,7 +250,7 @@ fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) {
         });
     }
     let Some(call) = calls.get_mut(fragment.index) else {
-        return;
+        bail!("tool call index {} is out of range", fragment.index);
     };
     if let Some(id) = fragment.id {
         call.id = id;
@@ -243,16 +263,26 @@ fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) {
             call.function.arguments.push_str(&arguments);
         }
     }
+    Ok(())
 }
 
-/// Forwards the model's streaming text to a sink while `Turn` keeps its blocking interface.
+/// One step of a stream: a new model call, or text from the current one.
+pub(crate) enum StreamStep<'a> {
+    Start,
+    Text(&'a str),
+}
+
+/// Forwards the model's streaming output to a sink while `Turn` keeps its blocking interface.
 pub(crate) struct StreamLlm {
     inner: std::sync::Arc<dyn Llm>,
-    sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    sink: std::sync::Arc<dyn Fn(StreamStep<'_>) + Send + Sync>,
 }
 
 impl StreamLlm {
-    pub(crate) fn new(inner: std::sync::Arc<dyn Llm>, sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn Llm>,
+        sink: std::sync::Arc<dyn Fn(StreamStep<'_>) + Send + Sync>,
+    ) -> Self {
         Self { inner, sink }
     }
 }
@@ -260,8 +290,8 @@ impl StreamLlm {
 impl Llm for StreamLlm {
     fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
-        (self.sink)("\n");
-        self.inner.chat_stream(messages, tools, &mut |delta| (self.sink)(delta))
+        (self.sink)(StreamStep::Start);
+        self.inner.chat_stream(messages, tools, &mut |delta| (self.sink)(StreamStep::Text(delta)))
     }
 }
 
@@ -337,23 +367,43 @@ mod tests {
     }
 
     #[test]
-    fn stream_ignores_usage_chunks_and_blank_lines() {
+    fn stream_without_text_or_tools_is_an_error() {
         let sse = "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
-        let message = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap();
-        assert_eq!(message.content, None);
-        assert_eq!(message.tool_calls, None);
+        assert!(read_stream(std::io::Cursor::new(sse), &mut |_| ()).is_err());
     }
+    #[test]
+    fn stream_reports_a_provider_error_chunk() {
+        let sse = "data: {\"error\":{\"message\":\"overloaded\"}}\n\n";
+        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        assert!(err.to_string().contains("overloaded"), "{err}");
+    }
+
+    #[test]
+    fn stream_truncated_before_finish_is_an_error() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n";
+        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        assert!(err.to_string().contains("before it finished"), "{err}");
+    }
+
     #[test]
     fn stream_wrapper_marks_each_model_call() {
         let inner: std::sync::Arc<dyn Llm> = std::sync::Arc::new(testing::Scripted::new(vec![testing::text("hi")]));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = {
-            let seen = std::sync::Arc::clone(&seen);
-            std::sync::Arc::new(move |delta: &str| seen.lock().unwrap().push_str(delta))
-        };
-        let llm = StreamLlm::new(inner, sink);
+        let llm = StreamLlm::new(
+            inner,
+            std::sync::Arc::new({
+                let seen = std::sync::Arc::clone(&seen);
+                move |step: StreamStep<'_>| {
+                    let text = match step {
+                        StreamStep::Text(text) => text,
+                        StreamStep::Start => "|",
+                    };
+                    seen.lock().unwrap().push_str(text);
+                }
+            }),
+        );
         llm.chat(&[], &json!([])).unwrap();
-        assert_eq!(*seen.lock().unwrap(), "\nhi");
+        assert_eq!(*seen.lock().unwrap(), "|hi");
     }
 
     #[test]
