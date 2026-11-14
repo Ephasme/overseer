@@ -596,6 +596,8 @@ impl Attachment {
 /// The composer: one bar on the left, room to breathe, and a half block closing the bar.
 fn composer() -> TextArea<'static> {
     let mut area = TextArea::default();
+    // The crate underlines the line holding the caret; this UI does not want underlines.
+    area.set_cursor_line_style(Style::new());
     area.set_block(
         Block::new()
             .borders(Borders::LEFT | Borders::BOTTOM)
@@ -1809,12 +1811,18 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
     use std::path::PathBuf;
 
-    fn screen(app: &mut App, width: u16, height: u16) -> String {
+    /// One frame drawn into a real backend, for the tests that read cells rather than text.
+    fn drawn(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = drawn(app, width, height);
         let mut out = String::new();
         for y in 0..height {
             for x in 0..width {
@@ -2058,6 +2066,38 @@ mod tests {
         assert!(screen.contains("Ask agent 1"), "{screen}");
         assert!(screen.contains("test-model"), "the status line names the model: {screen}");
         assert!(screen.contains(version::VERSION), "{screen}");
+    }
+
+    #[test]
+    fn no_cell_of_the_composer_is_underlined() {
+        let mut app = App::new("m");
+        app.insert("nothing underlined here");
+        let buffer = drawn(&mut app, 60, 24);
+        let underlined: Vec<(u16, u16)> = (0..24_u16)
+            .flat_map(|y| (0..60_u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer.cell((x, y)).is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)))
+            .collect();
+        assert!(underlined.is_empty(), "the composer draws no underline, found {underlined:?}");
+    }
+
+    #[test]
+    fn the_caret_is_the_one_reversed_cell() {
+        let mut app = App::new("m");
+        app.composer.set_lines(vec!["hello".to_string()], (0, 2));
+        let buffer = drawn(&mut app, 60, 24);
+        let reversed: Vec<(u16, u16, String)> = (0..24_u16)
+            .flat_map(|y| (0..60_u16).map(move |x| (x, y)))
+            .filter_map(|(x, y)| {
+                let cell = buffer.cell((x, y)).filter(|cell| cell.modifier.contains(Modifier::REVERSED))?;
+                Some((x, y, cell.symbol().to_string()))
+            })
+            .collect();
+        assert_eq!(reversed.len(), 1, "one cell is the caret: {reversed:?}");
+        assert_eq!(
+            reversed.first().map(|(_, _, symbol)| symbol.as_str()),
+            Some("l"),
+            "the caret sits on the character under it: {reversed:?}"
+        );
     }
 
     #[test]
