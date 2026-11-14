@@ -1,6 +1,6 @@
 use crate::agent::Turn;
 use crate::config;
-use crate::llm::{Llm, Message, ToolCall};
+use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::prompt;
 use crate::repos;
 use crate::tools;
@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// First line of a tool's arguments, short enough for one terminal line.
+/// Longest one-line summary of a tool call.
 const PROGRESS_WIDTH: usize = 100;
 
 /// Longest task preview in `list_workers`.
@@ -47,6 +47,15 @@ struct ReplyArgs {
     text: String,
 }
 
+/// One worker tool call, as the user sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Progress {
+    /// A tool call started; `summary` is one line of its arguments.
+    Started { tool: String, summary: String },
+    /// The same call returned after `secs`.
+    Finished { tool: String, secs: f64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WorkerEvent {
     Reply,
@@ -70,7 +79,7 @@ pub(crate) enum Event {
     User(String),
     /// User typed `exit`: quit now.
     Exit,
-    /// Stdin closed: quit once no worker is busy.
+    /// Input closed: quit once no worker is busy.
     Eof,
     /// User typed `/resume <id>`: the argument, handled without a model call.
     Resume(String),
@@ -82,23 +91,78 @@ pub(crate) enum Event {
     /// Worker tool activity: shown to the user, never fed to the overseer model.
     Progress {
         id: usize,
+        progress: Progress,
+    },
+    /// Worker model output as it streams: shown to the user, never fed to the overseer model.
+    Delta {
+        id: usize,
         text: String,
     },
 }
 
-/// Sends a progress line the user sees, without waking the overseer model.
-fn progress(sender: &Sender<Event>, id: usize, text: &str) {
-    let _ = sender.send(Event::Progress { id, text: text.to_string() });
+impl Event {
+    /// Maps one trimmed input line to an event; `None` for a blank line.
+    ///
+    /// Both frontends parse prompts through this, so `exit` and `/resume` cannot drift apart.
+    pub(crate) fn from_line(line: &str) -> Option<Self> {
+        if line.is_empty() {
+            return None;
+        }
+        if line == "exit" {
+            return Some(Event::Exit);
+        }
+        if let Some(arg) = line.strip_prefix("/resume") {
+            return Some(Event::Resume(arg.to_string()));
+        }
+        Some(Event::User(line.to_string()))
+    }
 }
 
-/// First line of a tool's arguments, short enough for one terminal line.
-fn summarise(arguments: &str) -> String {
-    let line = arguments.lines().next().unwrap_or_default();
-    let mut text: String = line.chars().take(PROGRESS_WIDTH).collect();
+/// One worker as the panels show it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorkerView {
+    pub(crate) id: usize,
+    pub(crate) dir: PathBuf,
+    /// The instruction the worker was started with.
+    pub(crate) task: String,
+    /// Instructions sent but not yet finished.
+    pub(crate) pending: usize,
+    pub(crate) failed: bool,
+    pub(crate) finished: bool,
+    /// How long the current instruction has been running.
+    pub(crate) busy_for: Option<Duration>,
+}
+
+/// Sends a progress line the user sees, without waking the overseer model.
+fn progress(sender: &Sender<Event>, id: usize, progress: Progress) {
+    let _ = sender.send(Event::Progress { id, progress });
+}
+
+/// One line naming what a tool call acts on: the transcript header and the worker panel both show it.
+pub(crate) fn describe(name: &str, arguments: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let first = |key: &str| text(key).lines().next().unwrap_or_default().to_string();
+    let line = match name {
+        prompt::SPAWN_WORKER => {
+            let path = text("path");
+            let dir = if path.is_empty() { prompt::DEFAULT_WORKING_DIR } else { path };
+            format!("{dir} · {}", first("task"))
+        }
+        prompt::MESSAGE_WORKER => {
+            let id = args.get("id").and_then(serde_json::Value::as_u64).unwrap_or_default();
+            format!("#{id} · {}", first("text"))
+        }
+        prompt::REPLY => first("text"),
+        tools::BASH => first("command"),
+        tools::READ_FILE | tools::WRITE_FILE => text("path").to_string(),
+        _ => String::new(),
+    };
+    let mut short: String = line.chars().take(PROGRESS_WIDTH).collect();
     if line.chars().count() > PROGRESS_WIDTH {
-        text.push('…');
+        short.push('…');
     }
-    text
+    short
 }
 
 struct Worker {
@@ -110,6 +174,8 @@ struct Worker {
     pending: usize,
     failed: bool,
     inbox: Sender<String>,
+    /// When the current instruction started; `None` once the worker is idle.
+    busy_since: Option<Instant>,
     /// The worker thread. Its exit is the authoritative liveness signal.
     handle: JoinHandle<()>,
 }
@@ -140,6 +206,22 @@ impl Fleet {
         Self { llm, roots, home, log_dir, sender, workers: Vec::new() }
     }
 
+    /// The roster as the frontends draw it.
+    pub(crate) fn snapshot(&self) -> Vec<WorkerView> {
+        self.workers
+            .iter()
+            .map(|w| WorkerView {
+                id: w.id,
+                dir: w.working_dir.clone(),
+                task: w.initial_task.clone(),
+                pending: w.pending,
+                failed: w.failed,
+                finished: w.finished(),
+                busy_for: w.busy_since.map(|since| since.elapsed()),
+            })
+            .collect()
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.workers.iter().any(|w| w.pending > 0 && !w.finished())
     }
@@ -149,6 +231,9 @@ impl Fleet {
         let Some(worker) = self.worker_mut(id) else { return };
         if kind != WorkerEvent::Reply {
             worker.pending = worker.pending.saturating_sub(1);
+            if worker.pending == 0 {
+                worker.busy_since = None;
+            }
             worker.failed = kind == WorkerEvent::Failed;
         }
     }
@@ -202,11 +287,20 @@ impl Fleet {
         let (inbox, instructions) = mpsc::channel();
         inbox.send(task.to_string()).expect("the receiver lives in this scope");
         let (llm, sender) = (Arc::clone(&self.llm), self.sender.clone());
+        let stream_sender = sender.clone();
+        let streamed = Arc::new(StreamLlm::new(
+            llm,
+            Arc::new(move |step| {
+                if let StreamStep::Text(delta) = step {
+                    let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
+                }
+            }),
+        ));
         let worker_dir = working_dir.clone();
         let handle = thread::spawn(move || {
             let mut log = log;
             let mut run = WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log };
-            run.run(llm.as_ref(), instructions);
+            run.run(streamed.as_ref(), instructions);
         });
         self.workers.push(Worker {
             id,
@@ -214,6 +308,7 @@ impl Fleet {
             initial_task: task.to_string(),
             pending: 1,
             failed: false,
+            busy_since: Some(Instant::now()),
             inbox,
             handle,
         });
@@ -226,6 +321,9 @@ impl Fleet {
             return Err(format!("worker {id} is gone"));
         }
         worker.inbox.send(text.to_string()).map_err(|_| format!("worker {id} is gone"))?;
+        if worker.pending == 0 {
+            worker.busy_since = Some(Instant::now());
+        }
         worker.pending += 1;
         if clear_failure {
             worker.failed = false;
@@ -321,7 +419,8 @@ impl WorkerRun<'_> {
         let started = Instant::now();
         let tracked = call.function.name != prompt::REPLY;
         if tracked {
-            progress(self.sender, self.id, &format!("{} {}", call.function.name, summarise(&call.function.arguments)));
+            let summary = describe(&call.function.name, &call.function.arguments);
+            progress(self.sender, self.id, Progress::Started { tool: call.function.name.clone(), summary });
         }
         let output = if call.function.name == prompt::REPLY {
             match tools::parse_args::<ReplyArgs>(&call.function.arguments).map(|args| args.text) {
@@ -337,12 +436,11 @@ impl WorkerRun<'_> {
         let _ = writeln!(self.log, "{output}");
         if tracked {
             let secs = started.elapsed().as_secs_f64();
-            progress(self.sender, self.id, &format!("{} done in {secs:.1}s", call.function.name));
+            progress(self.sender, self.id, Progress::Finished { tool: call.function.name.clone(), secs });
         }
         output
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +457,16 @@ mod tests {
         repo: PathBuf,
         logs: tempfile::TempDir,
         root: tempfile::TempDir,
+    }
+
+    /// The next event that is not streamed model output: these tests assert worker outcomes.
+    fn next_event(queue: &Receiver<Event>) -> Event {
+        loop {
+            match queue.recv_timeout(WAIT).unwrap() {
+                Event::Delta { .. } => {}
+                event => return event,
+            }
+        }
     }
 
     fn harness(replies: Vec<Message>) -> Harness {
@@ -389,6 +497,14 @@ mod tests {
     }
 
     #[test]
+    fn from_line_classifies_prompts() {
+        assert_eq!(Event::from_line(""), None);
+        assert_eq!(Event::from_line("exit"), Some(Event::Exit));
+        assert_eq!(Event::from_line("/resume 3"), Some(Event::Resume(" 3".into())));
+        assert_eq!(Event::from_line("hello"), Some(Event::User("hello".into())));
+    }
+
+    #[test]
     fn every_overseer_tool_is_dispatched() {
         let mut h = harness(vec![]);
         for tool in prompt::overseer_tool_definitions().as_array().unwrap() {
@@ -409,6 +525,21 @@ mod tests {
         fs::create_dir(h.root.path().join("plain")).unwrap();
         fs::create_dir_all(h.repo.join("nested/.git")).unwrap();
         assert_eq!(repos(&mut h.fleet), fs::canonicalize(&h.repo).unwrap().display().to_string());
+    }
+
+    #[test]
+    fn describe_names_what_a_tool_call_acts_on() {
+        assert_eq!(describe(prompt::SPAWN_WORKER, &json!({"task": "x"}).to_string()), "/tmp · x");
+        let nested = json!({"path": "/repo", "task": "a\nb"}).to_string();
+        assert_eq!(describe(prompt::SPAWN_WORKER, &nested), "/repo · a");
+        let command = json!({"command": "cargo test\nls"}).to_string();
+        assert_eq!(describe(tools::BASH, &command), "cargo test");
+        assert_eq!(describe(prompt::LIST_REPOS, "{}"), "");
+        assert_eq!(describe(tools::BASH, "not json"), "");
+        let long = json!({"command": "x".repeat(200)}).to_string();
+        let summary = describe(tools::BASH, &long);
+        assert_eq!(summary.chars().count(), 101);
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
@@ -440,9 +571,9 @@ mod tests {
         assert_eq!(spawn(&mut h.fleet, &h.repo), "worker 1 started");
         assert!(h.fleet.busy());
         let reply = Event::Worker { id: 1, kind: WorkerEvent::Reply, text: "halfway".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), reply);
+        assert_eq!(next_event(&h.queue), reply);
         let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "done".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), finished);
+        assert_eq!(next_event(&h.queue), finished);
         h.fleet.record(1, WorkerEvent::Finished);
         assert!(!h.fleet.busy());
         assert!(list(&mut h.fleet).starts_with("worker 1 [idle]"));
@@ -454,12 +585,12 @@ mod tests {
     fn message_reaches_existing_worker_history() {
         let mut h = harness(vec![text("first"), text("second")]);
         spawn(&mut h.fleet, &h.repo);
-        h.queue.recv_timeout(WAIT).unwrap();
+        next_event(&h.queue);
         h.fleet.record(1, WorkerEvent::Finished);
         let sent = h.fleet.execute(&tool_call("m", prompt::MESSAGE_WORKER, &json!({"id": 1, "text": "more"})));
         assert_eq!(sent, "sent to worker 1");
         let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "second".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), finished);
+        assert_eq!(next_event(&h.queue), finished);
     }
 
     #[test]
@@ -467,7 +598,7 @@ mod tests {
         let mut h = harness(vec![]);
         spawn(&mut h.fleet, &h.repo);
         let failed = Event::Worker { id: 1, kind: WorkerEvent::Failed, text: "script exhausted".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), failed);
+        assert_eq!(next_event(&h.queue), failed);
         h.fleet.record(1, WorkerEvent::Failed);
         assert!(list(&mut h.fleet).starts_with("worker 1 [failed]"));
     }
@@ -520,24 +651,24 @@ mod tests {
     fn resume_retasks_an_idle_worker() {
         let mut h = harness(vec![text("first"), text("second")]);
         spawn(&mut h.fleet, &h.repo);
-        h.queue.recv_timeout(WAIT).unwrap();
+        next_event(&h.queue);
         h.fleet.record(1, WorkerEvent::Finished);
         assert_eq!(h.fleet.resume("1"), "worker 1 resumed");
         assert!(list(&mut h.fleet).starts_with("worker 1 [working]"));
         let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "second".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), finished);
+        assert_eq!(next_event(&h.queue), finished);
     }
 
     #[test]
     fn resume_clears_a_failed_worker() {
         let mut h = harness(vec![text("first"), text("second")]);
         spawn(&mut h.fleet, &h.repo);
-        h.queue.recv_timeout(WAIT).unwrap();
+        next_event(&h.queue);
         h.fleet.record(1, WorkerEvent::Failed);
         assert!(list(&mut h.fleet).starts_with("worker 1 [failed]"));
         assert_eq!(h.fleet.resume("1"), "worker 1 resumed");
         let finished = Event::Worker { id: 1, kind: WorkerEvent::Finished, text: "second".into() };
-        assert_eq!(h.queue.recv_timeout(WAIT).unwrap(), finished);
+        assert_eq!(next_event(&h.queue), finished);
         h.fleet.record(1, WorkerEvent::Finished);
         assert!(list(&mut h.fleet).starts_with("worker 1 [idle]"));
     }
@@ -547,13 +678,14 @@ mod tests {
         let mut h = harness(vec![text("first")]);
         assert_eq!(h.fleet.resume("1"), "error: no worker 1; worker ids: none");
         spawn(&mut h.fleet, &h.repo);
-        h.queue.recv_timeout(WAIT).unwrap();
+        next_event(&h.queue);
         h.fleet.record(1, WorkerEvent::Finished);
         assert_eq!(h.fleet.resume(""), "error: usage: /resume <id>; worker ids: 1");
         assert_eq!(h.fleet.resume("x"), "error: not a worker id: x; worker ids: 1");
         assert_eq!(h.fleet.resume("1 2"), "error: expected one worker id, got: 1 2; worker ids: 1");
         assert_eq!(h.fleet.resume("9"), "error: no worker 9; worker ids: 1");
         assert!(!h.fleet.busy());
+        while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
         assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
@@ -561,7 +693,7 @@ mod tests {
     fn resume_tolerates_surrounding_whitespace() {
         let mut h = harness(vec![text("first"), text("second")]);
         spawn(&mut h.fleet, &h.repo);
-        h.queue.recv_timeout(WAIT).unwrap();
+        next_event(&h.queue);
         h.fleet.record(1, WorkerEvent::Finished);
         assert_eq!(h.fleet.resume(" 1 "), "worker 1 resumed");
         assert_eq!(resume_id("\t1\n"), Ok(1));

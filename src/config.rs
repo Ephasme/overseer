@@ -46,6 +46,9 @@ pub(crate) fn io_error(path: impl std::fmt::Display, e: &std::io::Error) -> Stri
 /// Environment variable that echoes model requests and tool results to stderr.
 pub(crate) const DEBUG: &str = "OVERSEER_DEBUG";
 
+/// Environment variable that forces line mode even on a terminal.
+pub(crate) const PLAIN: &str = "OVERSEER_PLAIN";
+
 fn xdg(var: &str, fallback: &str, home: &Path) -> PathBuf {
     env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(fallback), PathBuf::from)
 }
