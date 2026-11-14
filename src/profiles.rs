@@ -5,6 +5,7 @@ use crate::tools;
 use gray_matter::{Matter, engine::YAML};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -126,7 +127,7 @@ impl Catalogue {
             .map(|profile| {
                 let mut line = format!("- {}: {}", profile.name, fold(&profile.description));
                 if !profile.keywords.is_empty() {
-                    line.push_str(&format!(" (keywords: {})", profile.keywords.join(", ")));
+                    let _ = write!(line, " (keywords: {})", profile.keywords.join(", "));
                 }
                 let mut rights: Vec<&str> = Vec::new();
                 if profile.policy.read_only {
@@ -136,7 +137,7 @@ impl Catalogue {
                     rights.push("bans tools");
                 }
                 if !rights.is_empty() {
-                    line.push_str(&format!(" [{}]", rights.join(", ")));
+                    let _ = write!(line, " [{}]", rights.join(", "));
                 }
                 line
             })
@@ -229,7 +230,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let catalogue = Catalogue::load(home.path());
         let orchestrator = catalogue.get(ORCHESTRATOR).expect("the root always has a profile");
-        assert!(!orchestrator.body.is_empty());
+        assert!(orchestrator.body.starts_with("You coordinate."), "{:?}", orchestrator.body);
         assert_eq!(orchestrator.policy, tools::Policy::default());
         assert!(orchestrator.model.is_none());
         assert!(catalogue.catalogue().starts_with(&format!("- {ORCHESTRATOR}: ")));

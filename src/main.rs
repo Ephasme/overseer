@@ -48,7 +48,9 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let llm: Arc<dyn llm::Llm> = Arc::new(llm::OpenAiClient::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
+    let http = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(600)).build()?;
+    let llm: Arc<dyn llm::Llm> =
+        Arc::new(llm::OpenAiClient::new(http, &cfg.base_url, api_key, cfg.model.clone(), None, sink));
 
     // Started before the core loop: a server that is slow to connect must not delay startup.
     let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
