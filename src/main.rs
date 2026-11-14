@@ -1,4 +1,5 @@
 mod agent;
+mod config;
 mod llm;
 mod tools;
 
