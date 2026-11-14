@@ -1,27 +1,38 @@
 # overseer
 
-A single supervising agent that runs other coding agents. Workers are Oh My Pi (`omp`) sessions in herdr workspaces. They coordinate through an MCP Agent Mail server.
-
-Overseer never clones a repository into its own directory. It works only on repositories that already exist under the directories you list at install time, and it opens each task in a herdr worktree of that repository.
+A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it only spawns, messages and lists workers. Each worker starts in one existing repository under the directories you configure, with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
 
 ## Install
 
 ```sh
-./install.sh
+brew install ephasme/tap/overseer
 ```
 
-The script is safe to re-run. It:
+Prebuilt for macOS (Apple silicon and Intel) and Linux (x86_64). From source: `cargo install --git https://github.com/Ephasme/overseer`.
 
-1. Checks for `git`, `curl`, `jq`, and an authenticated `gh`.
-2. Installs herdr and `omp` if they are missing, then the herdr `omp` integration that reports each pane's state.
-3. Asks for an Agent Mail server URL and bearer token. If you leave the URL empty, it installs a local server on `127.0.0.1:8765`.
-4. Registers that server in the user-level `omp` config (`~/.omp/agent/mcp.json`), after asking and after backing the file up.
-5. Asks which directories hold your repositories.
+## Configure
 
-Settings are written to `~/.config/overseer/`:
+`~/.config/overseer/config.toml`:
 
-| File | Content |
-|------|---------|
-| `roots` | Absolute repository directories, one per line |
-| `agent-mail.env` | `OVERSEER_AGENT_MAIL_URL` |
-| `agent-mail.token` | Bearer token, mode `0600`, read by `omp` when it connects |
+```toml
+roots = ["~/code"]                    # each worker starts in an existing repository under one of these
+base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions endpoint
+model = "gpt-4.1"
+```
+
+All three keys are required. The API key comes from `OVERSEER_API_KEY`.
+
+## Run
+
+```sh
+OVERSEER_API_KEY=... overseer
+```
+
+Talk to the overseer on stdin. Worker reports wake it on their own. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it. `exit` quits at once; Ctrl-D quits once no worker is busy.
+
+## Release
+
+1. Bump `version` in `Cargo.toml` and merge it.
+2. Push the tag `v<version>` on `main`.
+
+CI checks that the tag matches the crate, builds the three binaries, publishes the GitHub release, then updates `Formula/overseer.rb` in `Ephasme/homebrew-tap`. That last step uses the secret `HOMEBREW_TAP_TOKEN`, a fine-grained token with Contents read-write on the tap only; when it expires, releases stop reaching Homebrew until it is replaced.

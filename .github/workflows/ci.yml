@@ -1,0 +1,112 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A release run is never cancelled half-published.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  # Every release target is checked on every PR, so a macOS-only break does not wait for a tag to show up. The
+  # toolchain is rust-toolchain.toml's: rustup on the runner installs it on the first cargo call.
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest,cargo-shear
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo nextest run --locked --profile ci
+      - run: cargo shear
+
+  # Not per OS: advisories, licences and spelling do not depend on the platform.
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+
+  # A v* tag builds one binary per target, then a single job publishes them; the homebrew job points the tap at them.
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          # Static binary: runs on any Linux, whatever its glibc.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the crate version
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" = "$GITHUB_REF_NAME"
+      # The pinned toolchain (rust-toolchain.toml), plus the release target.
+      - run: rustup target add ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - run: tar -czf overseer-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release overseer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: overseer-${{ matrix.target }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: sha256sum overseer-*.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          files: |
+            overseer-*.tar.gz
+            SHA256SUMS
+
+  # Points Ephasme/homebrew-tap's formula at this release, so `brew upgrade` picks it up. GITHUB_TOKEN cannot push
+  # to another repository: HOMEBREW_TAP_TOKEN is a token with write access to the tap (contents: write).
+  homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Ephasme/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Update the formula
+        run: .github/scripts/update-formula.sh "$GITHUB_REF_NAME" tap/Formula/overseer.rb
+      - name: Push it
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "overseer ${GITHUB_REF_NAME#v}"
+          git push
