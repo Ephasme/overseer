@@ -45,8 +45,8 @@ On a terminal it opens a full-screen UI: the transcript, a worker panel on the r
 |ctrl+x|drop the attached image|
 |PageUp / PageDown|scroll the view you are in; End follows new output again|
 |F2|hide or show the worker panel|
-|F3|hide or show what tool calls returned, leaving one row per call; a collapsed card keeps its first two rows of the call and one `… N more lines` row|
-|ctrl+o|the same toggle as F3, for a keyboard without function keys|
+|F3|expand every tool card, or collapse it back: what the call returned, and the whole body of a long call, which starts at two rows plus a `… N more lines` row|
+|ctrl+o|the same toggle as F3, for a keyboard without function keys: press it to open a card|
 |F4|open the picked worker's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
 |click a worker row|open that worker's view; click its `esc back to fleet` line to come back|

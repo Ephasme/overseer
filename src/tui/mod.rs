@@ -201,7 +201,7 @@ fn submit(app: &mut App, input: &Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::swarm::AgentView;
+    use crate::swarm::{AgentView, Progress};
     use std::path::PathBuf;
 
     /// A key with modifiers, for the bindings that carry one.
@@ -258,5 +258,38 @@ mod tests {
         assert!(!app.quit, "esc never quits the app");
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.take_prompt(), "x", "the prompt takes keys again once the view is closed");
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("a frame");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push_str(buffer.cell((x, y)).map_or(" ", ratatui::buffer::Cell::symbol));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The user's request end to end: a fresh app shows a long spawn card collapsed, and ctrl+o opens it.
+    #[test]
+    fn a_spawn_card_starts_collapsed_and_ctrl_o_opens_it() {
+        let mut app = App::new("m");
+        let task = format!("first line\n{}tail", "word ".repeat(40));
+        let summary = format!("/tmp · {task}");
+        let started = Progress::Started { call: 0, tool: "spawn_agent".into(), summary };
+        app.apply(UiEvent::Progress { id: crate::swarm::Swarm::ROOT, progress: started });
+        let launched = screen(&mut app, 100, 24);
+        assert!(launched.contains("spawn_agent /tmp · first line"), "{launched}");
+        assert!(launched.contains("more lines"), "the card counts what it hides at launch: {launched}");
+        assert!(!launched.contains("tail"), "the whole task waits for the key: {launched}");
+        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let opened = screen(&mut app, 100, 24);
+        assert!(opened.contains("tail"), "ctrl+o shows the whole task: {opened}");
+        assert!(!opened.contains("more lines"), "nothing is hidden once expanded: {opened}");
     }
 }

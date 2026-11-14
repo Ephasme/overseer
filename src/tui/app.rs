@@ -57,7 +57,7 @@ const ATTACHMENT_READING: &str = "reading the clipboard…";
 
 /// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
 const HINTS: [&str; 8] =
-    ["enter send", "ctrl+j newline", "F2 workers", "F3 output", "ctrl+o expand", "F4 view", "F5 mouse", "ctrl+d quit"];
+    ["enter send", "ctrl+j newline", "F2 workers", "F3 expand", "ctrl+o expand", "F4 view", "F5 mouse", "ctrl+d quit"];
 
 /// Key hints while a worker's view is open: the way out is on its own header line.
 const WORKER_HINTS: [&str; 3] = ["F4 toggle", "F5 mouse", "ctrl+d quit"];
@@ -632,7 +632,7 @@ pub(super) struct App {
     /// Last streamed text per worker, for the panel.
     previews: Vec<(usize, String)>,
     worker_panel: bool,
-    /// Show what each tool call returned, and every row of what it acts on; off collapses both.
+    /// Expanded: every row of what a call acts on, and what it returned. Off is the launch state.
     pub(super) tool_output: bool,
     /// The worker panel's inner area, so a click can tell the panel from the transcript.
     workers_area: Rect,
@@ -671,7 +671,7 @@ impl App {
             workers: Vec::new(),
             previews: Vec::new(),
             worker_panel: true,
-            tool_output: true,
+            tool_output: false,
             workers_area: Rect::ZERO,
             worker_rows: Vec::new(),
             selected: None,
@@ -1848,6 +1848,7 @@ mod tests {
         assert!(joined.contains("first line"), "{joined}");
         assert!(joined.contains("tail"), "the end of the message is not cut: {joined}");
         assert!(!joined.contains("…"), "nothing is elided: {joined}");
+        app.toggle_tool_output();
         let rendered = screen(&mut app, 100, 24);
         assert!(rendered.contains("first line"), "{rendered}");
         assert!(rendered.contains("tail"), "the rendered screen shows the end: {rendered}");
@@ -1867,10 +1868,9 @@ mod tests {
         assert!(!joined.contains("tail"), "the end of the task waits for ctrl+o: {joined}");
         assert!(joined.contains(&format!("… {hidden} more lines")), "{joined}");
         assert_eq!(collapsed[2].spans[0].style.fg, Some(theme::faint()), "the count is faint");
-        app.toggle_tool_output();
         let rendered = screen(&mut app, 100, 24);
         assert!(!rendered.contains("tail"), "the rendered card stops at its first rows: {rendered}");
-        assert!(rendered.contains("more lines"), "{rendered}");
+        assert!(rendered.contains("more lines"), "the launch render counts what it hides: {rendered}");
     }
 
     #[test]
@@ -2129,6 +2129,7 @@ mod tests {
         app.apply(UiEvent::Answer("after".into()));
         screen(&mut app, 60, 16);
         tool_result(&mut app, 0, "bash", "done", 1.0);
+        app.toggle_tool_output();
         assert_eq!(app.lead.dirty_from, 0);
         let rendered = screen(&mut app, 60, 16);
         assert!(rendered.contains("done"), "{rendered}");
