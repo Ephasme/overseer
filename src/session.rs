@@ -101,19 +101,82 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
             }
-            Event::User(text) => match lock(&swarm).tell_root(&text) {
-                Ok(_) => {
-                    let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
-                    let _ = ui.send(UiEvent::Busy(true));
+            Event::User(text) => {
+                // The guard must not outlive `tell_root`: a `match` scrutinee's temporary lives for
+                // the whole match, and the snapshot below takes the same lock again.
+                let told = lock(&swarm).tell_root(&text);
+                match told {
+                    Ok(_) => {
+                        let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
+                        let _ = ui.send(UiEvent::Busy(true));
+                    }
+                    Err(e) => {
+                        let _ = ui.send(UiEvent::Error(e));
+                    }
                 }
-                Err(e) => {
-                    let _ = ui.send(UiEvent::Error(e));
-                }
-            },
+            }
         }
     }
     // Quitting must not leave an agent's `cargo build` running without its owner, nor an MCP server.
     tools::kill_running();
     mcp.kill_all();
     let _ = ui.send(UiEvent::Done);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{self, Theme};
+    use crate::llm::testing::{Scripted, text};
+    use std::sync::mpsc::{Receiver, channel};
+    use std::thread;
+    use std::time::Duration;
+
+    /// The whole wire: a user line reaches the root, its answer comes back, and the frontend quits.
+    #[test]
+    fn a_users_line_reaches_the_root_and_its_answer_comes_back() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let frontend = input.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(Scripted::new(vec![text("hello back")])),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+            );
+        });
+        frontend.send(Event::User("hello".into())).unwrap();
+        let answer = next_answer(&ui_rx);
+        assert_eq!(answer, "hello back");
+        frontend.send(Event::Exit).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// The first answer the frontend prints; on a timeout it names everything else that arrived.
+    fn next_answer(ui: &Receiver<UiEvent>) -> String {
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match ui.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::Answer(text)) => return text,
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("no answer reached the frontend ({e}); it saw {seen:?}"),
+            }
+        }
+    }
 }
