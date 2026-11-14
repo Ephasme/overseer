@@ -37,6 +37,9 @@ const TICK: Duration = Duration::from_millis(120);
 /// Longest worker preview kept, in characters.
 const PREVIEW_CHARS: usize = 400;
 
+/// Body rows a collapsed tool card keeps, before the row that counts what it hid.
+const BODY_ROWS: usize = 2;
+
 /// Said instead of attaching, when the clipboard has neither an image nor text.
 const NO_CLIPBOARD: &str = "the clipboard holds no image or text";
 
@@ -53,8 +56,8 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
 /// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
-const HINTS: [&str; 7] =
-    ["enter send", "ctrl+j newline", "F2 workers", "F3 output", "F4 view", "F5 mouse", "ctrl+d quit"];
+const HINTS: [&str; 8] =
+    ["enter send", "ctrl+j newline", "F2 workers", "F3 expand", "ctrl+o expand", "F4 view", "F5 mouse", "ctrl+d quit"];
 
 /// Key hints while a worker's view is open: the way out is on its own header line.
 const WORKER_HINTS: [&str; 3] = ["F4 toggle", "F5 mouse", "ctrl+d quit"];
@@ -187,11 +190,13 @@ impl Entry {
         let verb = verb(&self.title);
         let lead = 1 + text_width(glyph);
         let room = width.saturating_sub(lead + text_width(verb) + 1 + text_width(&chips)).max(12);
-        // The whole body, wrapped: an instruction sent to a worker is shown as written, not cut.
+        // The body, wrapped: a collapsed card keeps its first rows, an expanded one shows it whole.
         let mut rows: Vec<String> = Vec::new();
         for source in self.body.split('\n') {
             rows.extend(wrap(source, room));
         }
+        let hidden = if expand { 0 } else { rows.len().saturating_sub(BODY_ROWS) };
+        rows.truncate(rows.len() - hidden);
         let pad = " ".repeat(lead + text_width(verb) + 1);
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (index, row) in rows.into_iter().enumerate() {
@@ -212,6 +217,13 @@ impl Entry {
             }
             spans.push(Span::styled(chips.clone(), Style::new().fg(theme::faint())));
             lines.push(Line::from(spans));
+        }
+        if hidden > 0 {
+            let plural = if hidden == 1 { "line" } else { "lines" };
+            lines.push(Line::from(Span::styled(
+                format!("{pad}… {hidden} more {plural}"),
+                Style::new().fg(theme::faint()),
+            )));
         }
         let Some(output) = &self.output else { return lines };
         if !expand {
@@ -620,8 +632,8 @@ pub(super) struct App {
     /// Last streamed text per worker, for the panel.
     previews: Vec<(usize, String)>,
     worker_panel: bool,
-    /// Show what each tool call returned; off shows one row per call.
-    tool_output: bool,
+    /// Expanded: every row of what a call acts on, and what it returned. Off is the launch state.
+    pub(super) tool_output: bool,
     /// The worker panel's inner area, so a click can tell the panel from the transcript.
     workers_area: Rect,
     /// The rows each worker's block takes in the panel, with that worker's id.
@@ -659,7 +671,7 @@ impl App {
             workers: Vec::new(),
             previews: Vec::new(),
             worker_panel: true,
-            tool_output: true,
+            tool_output: false,
             workers_area: Rect::ZERO,
             worker_rows: Vec::new(),
             selected: None,
@@ -1510,7 +1522,8 @@ impl App {
         self.mouse
     }
 
-    /// Hides or shows what tool calls returned; every entry changes height, so the cache is dropped.
+    /// Hides or shows what tool calls returned, and collapses the body of a long card; every entry
+    /// changes height, so the cache is dropped.
     pub(super) fn toggle_tool_output(&mut self) {
         self.tool_output = !self.tool_output;
         self.lead.resize();
@@ -1825,19 +1838,59 @@ mod tests {
     }
 
     #[test]
-    fn an_instruction_to_a_worker_is_shown_whole_across_rows() {
+    fn an_expanded_instruction_to_a_worker_is_shown_whole_across_rows() {
         let mut app = App::new("m");
         let text = format!("first line\n{}tail", "word ".repeat(40));
         tool_call(&mut app, 0, "message_agent", &format!("#2 · {text}"));
-        let lines = app.lead.entries[0].lines(40, 0, false);
+        let lines = app.lead.entries[0].lines(40, 0, true);
         assert!(lines.len() > 2, "a long instruction wraps: {}", lines.len());
         let joined = row_text(&lines);
         assert!(joined.contains("first line"), "{joined}");
         assert!(joined.contains("tail"), "the end of the message is not cut: {joined}");
-        assert!(!joined.contains('…'), "nothing is elided: {joined}");
+        assert!(!joined.contains("…"), "nothing is elided: {joined}");
+        app.toggle_tool_output();
         let rendered = screen(&mut app, 100, 24);
         assert!(rendered.contains("first line"), "{rendered}");
         assert!(rendered.contains("tail"), "the rendered screen shows the end: {rendered}");
+    }
+
+    #[test]
+    fn a_collapsed_tool_card_keeps_two_rows_and_counts_the_rest() {
+        let mut app = App::new("m");
+        let text = format!("first line\n{}tail", "word ".repeat(40));
+        tool_call(&mut app, 0, "spawn_agent", &format!("/tmp · {text}"));
+        let whole = app.lead.entries[0].lines(40, 0, true);
+        let hidden = whole.len() - 2;
+        let collapsed = app.lead.entries[0].lines(40, 0, false);
+        assert_eq!(collapsed.len(), 3, "two body rows and the row that counts the rest: {collapsed:?}");
+        let joined = row_text(&collapsed);
+        assert!(joined.contains("first line"), "{joined}");
+        assert!(!joined.contains("tail"), "the end of the task waits for ctrl+o: {joined}");
+        assert!(joined.contains(&format!("… {hidden} more lines")), "{joined}");
+        assert_eq!(collapsed[2].spans[0].style.fg, Some(theme::faint()), "the count is faint");
+        let rendered = screen(&mut app, 100, 24);
+        assert!(!rendered.contains("tail"), "the rendered card stops at its first rows: {rendered}");
+        assert!(rendered.contains("more lines"), "the launch render counts what it hides: {rendered}");
+    }
+
+    #[test]
+    fn a_card_body_that_fits_two_rows_gets_no_hint_row() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, "spawn_agent", "/tmp · one\ntwo");
+        let lines = app.lead.entries[0].lines(80, 0, false);
+        assert_eq!(lines.len(), 2, "both rows fit, so nothing is hidden: {lines:?}");
+        assert!(!row_text(&lines).contains("more"), "no count without something hidden");
+    }
+
+    #[test]
+    fn a_card_that_hides_one_row_says_line_and_not_lines() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, "spawn_agent", "/tmp · one\ntwo\nthree");
+        let lines = app.lead.entries[0].lines(80, 0, false);
+        let joined = row_text(&lines);
+        assert_eq!(lines.len(), 3, "two rows and the count: {lines:?}");
+        assert!(joined.contains("… 1 more line"), "{joined}");
+        assert!(!joined.contains("more lines"), "one hidden row is a line: {joined}");
     }
 
     #[test]
@@ -2076,6 +2129,7 @@ mod tests {
         app.apply(UiEvent::Answer("after".into()));
         screen(&mut app, 60, 16);
         tool_result(&mut app, 0, "bash", "done", 1.0);
+        app.toggle_tool_output();
         assert_eq!(app.lead.dirty_from, 0);
         let rendered = screen(&mut app, 60, 16);
         assert!(rendered.contains("done"), "{rendered}");
