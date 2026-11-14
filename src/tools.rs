@@ -118,6 +118,35 @@ impl Policy {
         }
     }
 
+    /// The policy a spawned agent is born with: this one, tightened by `given` and never loosened.
+    ///
+    /// `read_only` sticks, deny lists are unioned, and two allow lists intersect — a child of a
+    /// restricted agent cannot be handed back a capability the owner refused. Called once, on the
+    /// spawn path: an agent's policy never changes after that.
+    #[allow(dead_code)] // called by the spawn path once the tree replaces the fleet
+    pub(crate) fn inherit(&self, given: &Self) -> Self {
+        let mut deny_tools = self.deny_tools.clone();
+        for tool in &given.deny_tools {
+            if !deny_tools.contains(tool) {
+                deny_tools.push(tool.clone());
+            }
+        }
+        let allow_commands = if self.allow_commands.is_empty() {
+            given.allow_commands.clone()
+        } else if given.allow_commands.is_empty() {
+            self.allow_commands.clone()
+        } else {
+            self.allow_commands.iter().filter(|allowed| given.allow_commands.contains(allowed)).cloned().collect()
+        };
+        let mut deny_commands = self.deny_commands.clone();
+        for command in &given.deny_commands {
+            if !deny_commands.contains(command) {
+                deny_commands.push(command.clone());
+            }
+        }
+        Self { read_only: self.read_only || given.read_only, deny_tools, allow_commands, deny_commands }
+    }
+
     /// The restriction lines a worker reads in its prompt; empty when nothing is restricted.
     pub(crate) fn describe(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
@@ -141,7 +170,7 @@ impl Policy {
             return String::new();
         }
         format!(
-            "Restrictions Overseer set on you; a call that breaks one comes back as an error:\n{}\n",
+            "Rights your owner gave you when it started you; they are fixed for your lifetime and a call that breaks one comes back as an error:\n{}\n",
             lines.join("\n")
         )
     }
@@ -149,15 +178,15 @@ impl Policy {
     /// Why this call may not run, or `None` when it may.
     pub(crate) fn refuse(&self, name: &str, arguments: &str) -> Option<String> {
         if self.deny_tools.iter().any(|tool| tool == name) {
-            return Some(format!("tool {name} is banned for this worker"));
+            return Some(format!("tool {name} is banned for this agent"));
         }
         if name == WRITE_FILE && self.read_only {
-            return Some("this worker is read-only: write_file is refused".into());
+            return Some("this agent is read-only: write_file is refused".into());
         }
         // The tool list already hides these from a read-only worker, but a policy is re-read on
         // every call and a model may still call a tool it was shown in an earlier turn.
         if self.read_only && name.starts_with(mcp::PREFIX) {
-            return Some(format!("this worker is read-only: {name} is an MCP tool with unknown side effects"));
+            return Some(format!("this agent is read-only: {name} is an MCP tool with unknown side effects"));
         }
         if name != BASH {
             return None;
@@ -166,11 +195,11 @@ impl Policy {
         let Ok(args) = serde_json::from_str::<BashArgs>(arguments) else { return None };
         let command = args.command.trim();
         if let Some(rule) = self.deny_commands.iter().find(|rule| command.starts_with(rule.as_str())) {
-            return Some(format!("this worker may not run commands starting with `{rule}`"));
+            return Some(format!("this agent may not run commands starting with `{rule}`"));
         }
         if !self.allow_commands.is_empty() && !self.allow_commands.iter().any(|rule| command.starts_with(rule.as_str()))
         {
-            return Some(format!("this worker runs only: {}", self.allow_commands.join(" · ")));
+            return Some(format!("this agent runs only: {}", self.allow_commands.join(" · ")));
         }
         self.read_only.then(|| read_only_refusal(command)).flatten()
     }
@@ -179,21 +208,21 @@ impl Policy {
 /// Why this command is not read-only, or `None` when every pipeline segment is.
 fn read_only_refusal(command: &str) -> Option<String> {
     if let Some(token) = WRITING_SHELL.iter().find(|token| command.contains(*token)) {
-        return Some(format!("this worker is read-only: shell syntax `{token}` is not allowed"));
+        return Some(format!("this agent is read-only: shell syntax `{token}` is not allowed"));
     }
     for segment in command.split('|') {
         let words: Vec<&str> = segment.split_whitespace().collect();
         let Some(program) = words.first() else { continue };
         if !READ_ONLY_PROGRAMS.contains(program) {
             return Some(format!(
-                "this worker is read-only: `{program}` is not on its list ({})",
+                "this agent is read-only: `{program}` is not on its list ({})",
                 READ_ONLY_PROGRAMS.join(" ")
             ));
         }
         if *program == "git" {
             let sub = words.get(1).copied().unwrap_or_default();
             if !READ_ONLY_GIT.contains(&sub) {
-                return Some(format!("this worker is read-only: `git {sub}` writes ({})", READ_ONLY_GIT.join(" ")));
+                return Some(format!("this agent is read-only: `git {sub}` writes ({})", READ_ONLY_GIT.join(" ")));
             }
         }
     }
@@ -652,6 +681,46 @@ mod tests {
     }
 
     #[test]
+    fn a_child_cannot_be_looser_than_its_owner() {
+        let owner = Policy { read_only: true, deny_tools: vec!["bash".into()], ..Policy::default() };
+        let asked = Policy::default();
+        let inherited = owner.inherit(&asked);
+        assert!(inherited.read_only, "a read-only owner born a writing agent");
+        assert_eq!(inherited.deny_tools, ["bash"]);
+    }
+
+    #[test]
+    fn a_child_may_be_tighter_than_its_owner() {
+        let owner = Policy::default();
+        let asked = Policy { read_only: true, deny_tools: vec!["bash".into()], ..Policy::default() };
+        assert_eq!(owner.inherit(&asked), asked);
+    }
+
+    #[test]
+    fn deny_lists_are_unioned_and_allow_lists_intersected() {
+        let owner = Policy {
+            deny_commands: vec!["rm".into()],
+            allow_commands: vec!["git".into(), "cargo".into()],
+            ..Policy::default()
+        };
+        let asked = Policy {
+            deny_commands: vec!["curl".into(), "rm".into()],
+            allow_commands: vec!["cargo".into()],
+            ..Policy::default()
+        };
+        let inherited = owner.inherit(&asked);
+        assert_eq!(inherited.deny_commands, ["rm", "curl"]);
+        assert_eq!(inherited.allow_commands, ["cargo"]);
+    }
+
+    #[test]
+    fn a_denied_spawn_agent_survives_inheritance() {
+        let owner = Policy { deny_tools: vec!["spawn_agent".into()], ..Policy::default() };
+        let inherited = owner.inherit(&Policy::default());
+        assert_eq!(inherited.deny_tools, ["spawn_agent"]);
+    }
+
+    #[test]
     fn bash_runs_in_cwd_and_reports_exit_code_and_streams() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("marker"), "").unwrap();
@@ -825,13 +894,13 @@ mod tests {
         let write = json!({"path": "x", "content": "y"}).to_string();
         assert!(
             guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
-                .starts_with("error: this worker is read-only"),
+                .starts_with("error: this agent is read-only"),
             "write_file ran in a read-only worker"
         );
         for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
             let args = json!({"command": command}).to_string();
             let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
-            assert!(out.starts_with("error: this worker is read-only"), "`{command}` ran: {out}");
+            assert!(out.starts_with("error: this agent is read-only"), "`{command}` ran: {out}");
         }
         let read = json!({"command": "ls | head -5"}).to_string();
         let out = guarded(dir.path(), BASH, &read, &policy, None, &mut registry());
@@ -850,17 +919,17 @@ mod tests {
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
             guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
-            "error: tool read_file is banned for this worker"
+            "error: tool read_file is banned for this agent"
         );
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
             guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
-            "error: this worker may not run commands starting with `echo secret`"
+            "error: this agent may not run commands starting with `echo secret`"
         );
         let outside = json!({"command": "pwd"}).to_string();
         assert_eq!(
             guarded(dir.path(), BASH, &outside, &policy, None, &mut registry()),
-            "error: this worker runs only: ls · echo"
+            "error: this agent runs only: ls · echo"
         );
         let allowed = json!({"command": "ls"}).to_string();
         assert!(!guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
