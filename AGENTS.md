@@ -28,9 +28,9 @@
 | `src/session.rs` | the blocking core loop: one overseer turn per event, reported as `UiEvent`s |
 | `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
 | `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
-| `src/tui/mod.rs` | terminal lifecycle, the event loop, key bindings |
+| `src/tui/mod.rs` | terminal lifecycle and its panic hook, the event loop, key bindings, the mouse capture F5 hands back |
 | `src/tui/app.rs` | transcript entries, composer, worker panel, status line, wrapping |
-| `src/tui/theme.rs` | the palette: neutral ramp, three hues, status colours |
+| `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
 | `src/fleet.rs` | worker registry, worker threads, worker events, overseer tool dispatch |
 | `src/prompt.rs` | both system prompts, tool schemas, tool-name constants, `DEFAULT_WORKDIR` |
 | `src/repos.rs` | git-repository discovery under the configured roots |

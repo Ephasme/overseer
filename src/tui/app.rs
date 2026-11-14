@@ -53,10 +53,11 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
 /// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
-const HINTS: [&str; 6] = ["enter send", "ctrl+j newline", "F2 workers", "F3 output", "F4 view", "ctrl+d quit"];
+const HINTS: [&str; 7] =
+    ["enter send", "ctrl+j newline", "F2 workers", "F3 output", "F4 view", "F5 mouse", "ctrl+d quit"];
 
 /// Key hints while a worker's view is open: the way out is on its own header line.
-const WORKER_HINTS: [&str; 2] = ["F4 toggle", "ctrl+d quit"];
+const WORKER_HINTS: [&str; 3] = ["F4 toggle", "F5 mouse", "ctrl+d quit"];
 
 /// The composer's frame: one bar down the left, closed by a half block.
 const PROMPT_FRAME: border::Set = border::Set {
@@ -138,36 +139,42 @@ impl Entry {
     fn lines(&self, width: u16, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let width = usize::from(width).max(8);
         match self.role {
-            Role::You => bar("▌ ", Style::new().fg(theme::PRIMARY), &self.body, Style::new().fg(theme::TEXT), width),
+            Role::You => {
+                bar("▌ ", Style::new().fg(theme::primary()), &self.body, Style::new().fg(theme::text()), width)
+            }
             // The overseer reads as plain prose: the user's bar above it is the only mark it needs.
-            Role::Overseer => block("  ", Style::new(), &self.body, Style::new().fg(theme::TEXT), width),
+            Role::Overseer => block("  ", Style::new(), &self.body, Style::new().fg(theme::text()), width),
             Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
-                    WorkerEvent::Reply => ("says", theme::INFO),
-                    WorkerEvent::Finished => ("done", theme::SUCCESS),
-                    WorkerEvent::Failed => ("failed", theme::ERROR),
-                    WorkerEvent::Interrupted => ("interrupted", theme::WARNING),
+                    WorkerEvent::Reply => ("says", theme::info()),
+                    WorkerEvent::Finished => ("done", theme::success()),
+                    WorkerEvent::Failed => ("failed", theme::error()),
+                    WorkerEvent::Interrupted => ("interrupted", theme::warning()),
                 };
                 let prefix = format!("[{}] {label} ", self.title);
-                block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::MUTED), width)
+                block(&prefix, Style::new().fg(colour), &self.body, Style::new().fg(theme::muted()), width)
             }
             Role::Notice => {
-                block("· ", Style::new().fg(theme::FAINT), &self.body, Style::new().fg(theme::MUTED), width)
+                block("· ", Style::new().fg(theme::faint()), &self.body, Style::new().fg(theme::muted()), width)
             }
-            Role::Error => block("! ", Style::new().fg(theme::ERROR), &self.body, Style::new().fg(theme::ERROR), width),
-            Role::Debug => block("… ", Style::new().fg(theme::FAINT), &self.body, Style::new().fg(theme::FAINT), width),
+            Role::Error => {
+                block("! ", Style::new().fg(theme::error()), &self.body, Style::new().fg(theme::error()), width)
+            }
+            Role::Debug => {
+                block("… ", Style::new().fg(theme::faint()), &self.body, Style::new().fg(theme::faint()), width)
+            }
         }
     }
 
     /// A tool call: a header naming what it acts on, then the head of what it returned.
     fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let (glyph, colour) = if self.output.is_none() {
-            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::WARNING)
+            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::warning())
         } else if self.failed {
-            ("✕", theme::ERROR)
+            ("✕", theme::error())
         } else {
-            ("✓", theme::SUCCESS)
+            ("✓", theme::success())
         };
         let mut chips: Vec<String> = Vec::new();
         if !self.status.is_empty() {
@@ -191,26 +198,26 @@ impl Entry {
             if index > 0 {
                 lines.push(Line::from(vec![
                     Span::styled(pad.clone(), Style::new()),
-                    Span::styled(row, Style::new().fg(theme::TEXT)),
+                    Span::styled(row, Style::new().fg(theme::text())),
                 ]));
                 continue;
             }
             let mut spans = vec![
                 Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-                Span::styled(verb.to_string(), Style::new().fg(theme::MUTED)),
+                Span::styled(verb.to_string(), Style::new().fg(theme::muted())),
             ];
             if !row.is_empty() {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(row, Style::new().fg(theme::TEXT)));
+                spans.push(Span::styled(row, Style::new().fg(theme::text())));
             }
-            spans.push(Span::styled(chips.clone(), Style::new().fg(theme::FAINT)));
+            spans.push(Span::styled(chips.clone(), Style::new().fg(theme::faint())));
             lines.push(Line::from(spans));
         }
         let Some(output) = &self.output else { return lines };
         if !expand {
             return lines;
         }
-        let style = if self.failed { Style::new().fg(theme::ERROR) } else { Style::new().fg(theme::MUTED) };
+        let style = if self.failed { Style::new().fg(theme::error()) } else { Style::new().fg(theme::muted()) };
         let mut rows: Vec<String> = Vec::new();
         for source in output.trim_end().lines() {
             rows.extend(wrap(source, width.saturating_sub(4)));
@@ -221,14 +228,16 @@ impl Entry {
         }
         for row in rows.iter().take(tools::PREVIEW_LINES) {
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::new().fg(theme::RULE)),
+                Span::styled("  │ ", Style::new().fg(theme::rule())),
                 Span::styled(row.clone(), style),
             ]));
         }
         if hidden > 0 {
             let plural = if hidden == 1 { "line" } else { "lines" };
-            lines
-                .push(Line::from(Span::styled(format!("  │ … {hidden} more {plural}"), Style::new().fg(theme::FAINT))));
+            lines.push(Line::from(Span::styled(
+                format!("  │ … {hidden} more {plural}"),
+                Style::new().fg(theme::faint()),
+            )));
         }
         lines
     }
@@ -363,7 +372,7 @@ const CHIP_ROOM: usize = 12;
 ///
 /// A narrow terminal drops the hint rather than the middle: the status line carries the same keys.
 fn tail(hint: &str, fixed: usize, width: usize) -> (Option<Span<'static>>, usize) {
-    let hint = Span::styled(hint.to_string(), Style::new().fg(theme::FAINT));
+    let hint = Span::styled(hint.to_string(), Style::new().fg(theme::faint()));
     let columns = hint.width();
     if width >= fixed + columns + CHIP_ROOM {
         return (Some(hint), width - fixed - columns);
@@ -558,7 +567,7 @@ fn composer() -> TextArea<'static> {
         Block::new()
             .borders(Borders::LEFT | Borders::BOTTOM)
             .border_set(PROMPT_FRAME)
-            .border_style(Style::new().fg(theme::EDGE))
+            .border_style(Style::new().fg(theme::edge()))
             .padding(Padding::new(1, 1, 1, 0)),
     );
     area.set_placeholder_text("Ask the overseer, /resume <id>, /schemes, or exit");
@@ -609,6 +618,8 @@ pub(super) struct App {
     last_tick: Instant,
     spinning: usize,
     draining: bool,
+    /// Whether the mouse is captured for clicks and the wheel, or handed to the terminal.
+    mouse: bool,
     dirty: bool,
     pub(super) quit: bool,
 }
@@ -641,6 +652,7 @@ impl App {
             last_tick: Instant::now(),
             spinning: 0,
             draining: false,
+            mouse: true,
             dirty: true,
             quit: false,
         }
@@ -956,18 +968,18 @@ impl App {
         let rule = Block::new()
             .borders(Borders::LEFT)
             .border_set(SIDE_RULE)
-            .border_style(Style::new().fg(theme::RULE))
+            .border_style(Style::new().fg(theme::rule()))
             .padding(Padding::new(1, 0, 1, 0));
         let inner = rule.inner(area);
         frame.render_widget(rule, area);
         self.workers_area = inner;
         self.worker_rows.clear();
         let mut head = vec![
-            Span::styled("workers", Style::new().fg(theme::MUTED)),
-            Span::styled(format!(" {}", self.workers.len()), Style::new().fg(theme::FAINT)),
+            Span::styled("workers", Style::new().fg(theme::muted())),
+            Span::styled(format!(" {}", self.workers.len()), Style::new().fg(theme::faint())),
         ];
         if self.workers.is_empty() {
-            head.push(Span::styled("  none yet", Style::new().fg(theme::FAINT)));
+            head.push(Span::styled("  none yet", Style::new().fg(theme::faint())));
             frame.render_widget(Paragraph::new(Line::from(head)), Rect { height: 1, ..inner });
             return;
         }
@@ -990,26 +1002,26 @@ impl App {
                     Span::styled(format!("{glyph} "), Style::new().fg(colour)),
                     Span::styled(
                         format!("w{}", worker.id),
-                        Style::new().fg(if self.selected == Some(worker.id) { theme::TEXT } else { theme::INFO }),
+                        Style::new().fg(if self.selected == Some(worker.id) { theme::text() } else { theme::info() }),
                     ),
-                    Span::styled(format!(" {state}"), Style::new().fg(theme::MUTED)),
+                    Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
                     Span::styled(
                         if unread == 0 { String::new() } else { format!(" · {unread} new") },
-                        Style::new().fg(theme::WARNING),
+                        Style::new().fg(theme::warning()),
                     ),
                 ]),
-                Line::from(Span::styled(short_dir(&worker.dir), Style::new().fg(theme::FAINT))),
+                Line::from(Span::styled(short_dir(&worker.dir), Style::new().fg(theme::faint()))),
             ];
             let task = worker.task.lines().next().unwrap_or_default().trim();
-            lines.push(Line::from(Span::styled(truncate(task, width), Style::new().fg(theme::MUTED))));
+            lines.push(Line::from(Span::styled(truncate(task, width), Style::new().fg(theme::muted()))));
             if let Some(preview) = preview {
                 lines.push(Line::from(Span::styled(
                     format!("▸ {}", truncate(preview, width.saturating_sub(2))),
-                    Style::new().fg(theme::FAINT),
+                    Style::new().fg(theme::faint()),
                 )));
             }
             lines.push(Line::default());
-            let band = if self.selected == Some(worker.id) { Style::new().bg(theme::BAND) } else { Style::new() };
+            let band = if self.selected == Some(worker.id) { theme::band() } else { Style::new() };
             let block = Rect { x: inner.x, y: top, width: inner.width, height };
             frame.render_widget(Paragraph::new(lines).style(band), block);
             self.worker_rows.push((top, top.saturating_add(height), worker.id));
@@ -1017,7 +1029,7 @@ impl App {
         }
         if hidden {
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled("…", Style::new().fg(theme::FAINT)))),
+                Paragraph::new(Line::from(Span::styled("…", Style::new().fg(theme::faint())))),
                 Rect { x: inner.x, y: top, width: inner.width, height: 1 },
             );
         }
@@ -1028,27 +1040,29 @@ impl App {
     /// verdict or the way out being pushed off the line.
     fn render_attachment(&self, frame: &mut Frame, area: Rect) {
         let Some(attachment) = &self.attachment else { return };
-        let lead = Span::styled(ATTACHMENT_LEAD, Style::new().fg(theme::PRIMARY));
+        let lead = Span::styled(ATTACHMENT_LEAD, Style::new().fg(theme::primary()));
+        // The arrow is three bytes and one column: the chip's arithmetic is in columns.
+        let lead_width = text_width(ATTACHMENT_LEAD);
         // The chip pays for its padding before it places a single column of text.
         let width = usize::from(area.width).saturating_sub(4);
         let line = match attachment {
             Attachment::Reading => {
                 let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-                let room = width.saturating_sub(ATTACHMENT_LEAD.len());
+                let room = width.saturating_sub(lead_width);
                 let message = truncate(&format!("{glyph} {ATTACHMENT_READING}"), room);
-                Line::from(vec![lead, Span::styled(message, Style::new().fg(theme::WARNING))])
+                Line::from(vec![lead, Span::styled(message, Style::new().fg(theme::warning()))])
             }
             Attachment::Ready { info, .. } => {
-                let status = Span::styled(" · ✓ attached", Style::new().fg(theme::SUCCESS));
-                let (hint, room) = tail(ATTACHMENT_HINT, ATTACHMENT_LEAD.len() + status.width(), width);
+                let status = Span::styled(" · ✓ attached", Style::new().fg(theme::success()));
+                let (hint, room) = tail(ATTACHMENT_HINT, lead_width + status.width(), width);
                 let mut spans =
-                    vec![lead, Span::styled(truncate(&info.chip(), room), Style::new().fg(theme::TEXT)), status];
+                    vec![lead, Span::styled(truncate(&info.chip(), room), Style::new().fg(theme::text())), status];
                 spans.extend(hint);
                 Line::from(spans)
             }
             Attachment::Failed(why) => {
-                let (hint, room) = tail(ATTACHMENT_DISMISS, ATTACHMENT_LEAD.len() + 2, width);
-                let verdict = Span::styled(format!("✗ {}", truncate(why, room)), Style::new().fg(theme::ERROR));
+                let (hint, room) = tail(ATTACHMENT_DISMISS, lead_width + 2, width);
+                let verdict = Span::styled(format!("✗ {}", truncate(why, room)), Style::new().fg(theme::error()));
                 let mut spans = vec![lead, verdict];
                 spans.extend(hint);
                 Line::from(spans)
@@ -1061,31 +1075,32 @@ impl App {
         let mut spans = vec![Span::raw("  ")];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::ACCENT)));
+            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::accent())));
             let secs = self.busy_since.elapsed().as_secs_f32();
-            spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::MUTED)));
+            spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::muted())));
         } else if self.draining {
-            spans.push(Span::styled("draining, quits when workers idle", Style::new().fg(theme::WARNING)));
+            spans.push(Span::styled("draining, quits when workers idle", Style::new().fg(theme::warning())));
         } else {
-            spans.push(Span::styled("● idle", Style::new().fg(theme::MUTED)));
+            spans.push(Span::styled("● idle", Style::new().fg(theme::muted())));
         }
         let working = self.workers.iter().filter(|w| w.pending > 0 && !w.finished).count();
         let paused = self.workers.iter().filter(|w| w.paused).count();
         let idle = self.workers.len().saturating_sub(working + paused);
         let paused = if paused == 0 { String::new() } else { format!("{paused} paused · ") };
-        spans.push(Span::styled(format!(" · {working} working · {paused}{idle} idle"), Style::new().fg(theme::MUTED)));
+        spans
+            .push(Span::styled(format!(" · {working} working · {paused}{idle} idle"), Style::new().fg(theme::muted())));
         if let Some(scroll) = self.scrolled() {
-            spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::WARNING)));
+            spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::warning())));
         }
         let used = Line::from(spans.clone()).width();
         let hints = if self.in_worker_view() { WORKER_HINTS.as_slice() } else { HINTS.as_slice() };
         // Two columns of inset on each side, the same as everything else on screen.
         let room = usize::from(area.width).saturating_sub(used + 2);
         let hint = fit_hints(hints, room);
-        let filler = usize::from(area.width).saturating_sub(used + hint.len() + 2);
+        let filler = usize::from(area.width).saturating_sub(used + text_width(&hint) + 2);
         spans.push(Span::raw(" ".repeat(filler.max(1))));
         if !hint.is_empty() {
-            spans.push(Span::styled(hint, Style::new().fg(theme::FAINT)));
+            spans.push(Span::styled(hint, Style::new().fg(theme::faint())));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -1104,10 +1119,12 @@ impl App {
         let model = truncate(&self.model, 32);
         let build = version::VERSION;
         let width = usize::from(cap.width);
-        let mut spans = vec![Span::styled(model.clone(), Style::new().fg(theme::MUTED))];
-        if width > model.len() + build.len() + 2 {
-            spans.push(Span::raw(" ".repeat(width - model.len() - build.len() - 2)));
-            spans.push(Span::styled(build, Style::new().fg(theme::FAINT)));
+        let mut spans = vec![Span::styled(model.clone(), Style::new().fg(theme::muted()))];
+        // Two trailing columns keep the version off the right edge; the rest is filler.
+        let used = text_width(&model) + text_width(build) + 2;
+        if width > used {
+            spans.push(Span::raw(" ".repeat(width - used)));
+            spans.push(Span::styled(build, Style::new().fg(theme::faint())));
             spans.push(Span::raw("  "));
         }
         let line = Line::from(spans);
@@ -1215,7 +1232,7 @@ impl App {
     fn render_worker_view(&mut self, frame: &mut Frame, area: Rect) {
         let Some(worker) = self.focused().cloned() else { return };
         let bar =
-            Block::new().borders(Borders::LEFT).border_set(SIDE_RULE).border_style(Style::new().fg(theme::ACCENT));
+            Block::new().borders(Borders::LEFT).border_set(SIDE_RULE).border_style(Style::new().fg(theme::accent()));
         let inner = bar.inner(area);
         frame.render_widget(bar, area);
         // The stream indents itself by two columns; the header uses the same inset, one row down.
@@ -1223,29 +1240,29 @@ impl App {
         let width = usize::from(top.width.saturating_sub(4));
         let (glyph, colour, state) = worker_state(&worker);
         let crumb = Line::from(vec![
-            Span::styled("Fleet ", Style::new().fg(theme::MUTED)),
-            Span::styled("› ", Style::new().fg(theme::FAINT)),
-            Span::styled(format!("worker {}", worker.id), Style::new().fg(theme::INFO)),
+            Span::styled("Fleet ", Style::new().fg(theme::muted())),
+            Span::styled("› ", Style::new().fg(theme::faint())),
+            Span::styled(format!("worker {}", worker.id), Style::new().fg(theme::info())),
         ]);
         let mut line = vec![
             Span::styled(format!("{glyph} "), Style::new().fg(colour)),
-            Span::styled(state, Style::new().fg(theme::MUTED)),
-            Span::styled(format!(" · {}", worker.dir.display()), Style::new().fg(theme::FAINT)),
+            Span::styled(state, Style::new().fg(theme::muted())),
+            Span::styled(format!(" · {}", worker.dir.display()), Style::new().fg(theme::faint())),
         ];
         let hint = "esc back to fleet";
         let used = Line::from(line.clone()).width();
-        line.push(Span::raw(" ".repeat(width.saturating_sub(used + hint.len()).max(1))));
-        line.push(Span::styled(hint, Style::new().fg(theme::FAINT)));
+        line.push(Span::raw(" ".repeat(width.saturating_sub(used + text_width(hint)).max(1))));
+        line.push(Span::styled(hint, Style::new().fg(theme::faint())));
         let mut head = vec![crumb, Line::from(line), Line::default()];
         for row in wrap(&worker.task, width) {
-            head.push(Line::from(Span::styled(row, Style::new().fg(theme::TEXT))));
+            head.push(Line::from(Span::styled(row, Style::new().fg(theme::text()))));
         }
         if let Some(preview) = self.preview_of(worker.id).map(str::trim).filter(|text| !text.is_empty()) {
             head.push(Line::default());
             for row in wrap(preview, width.saturating_sub(2)) {
                 head.push(Line::from(vec![
-                    Span::styled("▸ ", Style::new().fg(theme::INFO)),
-                    Span::styled(row, Style::new().fg(theme::MUTED)),
+                    Span::styled("▸ ", Style::new().fg(theme::info())),
+                    Span::styled(row, Style::new().fg(theme::muted())),
                 ]));
             }
         }
@@ -1314,6 +1331,15 @@ impl App {
     pub(super) fn insert(&mut self, text: &str) {
         self.composer.insert_str(text);
         self.dirty = true;
+    }
+
+    /// A bracketed paste: the composer takes it, unless a worker's view owns the keys.
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.in_worker_view() {
+            self.notice("paste goes to the prompt: esc leaves this view first");
+            return;
+        }
+        self.insert(text);
     }
 
     /// Ctrl+V, the instant the key lands: the chip goes up before the clipboard is read.
@@ -1409,6 +1435,23 @@ impl App {
         self.dirty = true;
     }
 
+    /// F5: captures the mouse for clicks and the wheel, or hands it back to the terminal.
+    ///
+    /// While it is captured, dragging in the transcript selects nothing: the terminal never sees
+    /// the drag. Returns the new state, which the frontend mirrors on the terminal.
+    pub(super) fn toggle_mouse(&mut self) -> bool {
+        self.mouse = !self.mouse;
+        let line = if self.mouse {
+            "mouse captured: F5 hands it back to the terminal"
+        } else {
+            "mouse released: select and copy with the terminal, F5 captures it again"
+        };
+        // The reader is looking at one stream: a worker's view has its own, and the lead's is behind it.
+        self.active().push(Entry::new(Role::Notice, String::new(), line.to_string()));
+        self.dirty = true;
+        self.mouse
+    }
+
     /// Hides or shows what tool calls returned; every entry changes height, so the cache is dropped.
     pub(super) fn toggle_tool_output(&mut self) {
         self.tool_output = !self.tool_output;
@@ -1494,21 +1537,21 @@ impl App {
 
 fn worker_state(worker: &WorkerView) -> (&'static str, Color, String) {
     if worker.stopped {
-        return ("■", theme::FAINT, "stopped".into());
+        return ("■", theme::faint(), "stopped".into());
     }
     if worker.paused {
-        return ("❚❚", theme::INFO, "paused".into());
+        return ("❚❚", theme::info(), "paused".into());
     }
     if worker.pending > 0 && !worker.finished {
         let secs = worker.busy_for.unwrap_or_default().as_secs();
         let read_only = if worker.read_only { " · read-only" } else { "" };
-        return ("●", theme::WARNING, format!("working {secs}s{read_only}"));
+        return ("●", theme::warning(), format!("working {secs}s{read_only}"));
     }
     if worker.failed || worker.pending > 0 {
-        return ("✕", theme::ERROR, "failed".into());
+        return ("✕", theme::error(), "failed".into());
     }
     let read_only = if worker.read_only { " · read-only" } else { "" };
-    ("○", theme::FAINT, format!("idle{read_only}"))
+    ("○", theme::faint(), format!("idle{read_only}"))
 }
 
 /// The last non-empty line of a streamed preview.
@@ -1526,7 +1569,7 @@ fn fit_hints(hints: &[&str], room: usize) -> String {
     let mut fitted = String::new();
     for hint in hints {
         let next = if fitted.is_empty() { (*hint).to_string() } else { format!("{fitted} · {hint}") };
-        if next.len() > room {
+        if text_width(&next) > room {
             break;
         }
         fitted = next;
@@ -2259,5 +2302,42 @@ mod tests {
         let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
         assert_eq!(rows.len(), 4, "a notice opens a new paragraph: {rows:?}");
         assert!(rows[2].is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn f5_hands_the_mouse_back_to_the_terminal_and_captures_it_again() {
+        let mut app = App::new("m");
+        assert!(app.mouse, "the mouse is captured at startup");
+        assert!(!app.toggle_mouse());
+        let said = row_text(&app.lead.entries[0].lines(200, 0, true));
+        assert!(said.contains("select and copy with the terminal"), "{said}");
+        assert!(app.toggle_mouse(), "F5 captures it again");
+        assert!(app.mouse);
+    }
+
+    #[test]
+    fn f5_in_a_worker_view_says_so_there_and_not_behind_it() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Workers(vec![worker_view(1, "a")]));
+        app.toggle_worker_view();
+        let lead = app.lead.entries.len();
+        assert!(!app.toggle_mouse());
+        assert_eq!(app.lead.entries.len(), lead, "the lead's stream stays out of sight while a view is open");
+        let said = worker_entries(&app, 1).last().expect("the view says what F5 did");
+        assert!(row_text(&said.lines(200, 0, true)).contains("select and copy with the terminal"));
+    }
+
+    #[test]
+    fn a_paste_never_fills_a_prompt_nobody_can_see() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Workers(vec![worker_view(1, "a")]));
+        app.toggle_worker_view();
+        app.paste("a pasted sentence");
+        assert!(app.take_prompt().is_empty(), "a paste in a worker view never fills the hidden prompt");
+        let last = app.lead.entries.last().expect("a notice says where the text would go");
+        assert!(row_text(&last.lines(200, 0, true)).contains("esc leaves this view first"));
+        app.leave_worker();
+        app.paste("a pasted sentence");
+        assert_eq!(app.take_prompt(), "a pasted sentence", "the prompt takes a paste once the view is closed");
     }
 }

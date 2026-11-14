@@ -2,6 +2,7 @@ mod app;
 mod theme;
 
 use crate::clipboard;
+use crate::config::Theme;
 use crate::event::UiEvent;
 use crate::fleet::Event;
 use anyhow::Result;
@@ -24,14 +25,29 @@ const POLL: Duration = Duration::from_millis(50);
 type Copied = (u64, clipboard::Paste);
 
 /// Runs the full-screen frontend until the user quits or the core ends.
-pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str) -> Result<()> {
+pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str, theme: Theme) -> Result<()> {
+    theme::install(theme);
     let mut app = App::new(model);
     let mut terminal = ratatui::try_init()?;
+    // ratatui's hook leaves raw mode and the alternate screen; these two are modes of ours.
+    release_modes_on_panic();
     let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app, ui, input);
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
+}
+
+/// Restores the two modes `ratatui::restore` does not own, then lets the hook it installed run.
+///
+/// Without this a panic leaves the terminal reporting the mouse: the shell then prints escape
+/// sequences on every move, and dragging selects nothing.
+fn release_modes_on_panic() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+        hook(info);
+    }));
 }
 
 /// The channels are owned here: the loop ends the frontend when either side disconnects.
@@ -51,7 +67,7 @@ fn event_loop(
         if event::poll(POLL)? {
             match event::read()? {
                 Input::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, &input, &pasted, key),
-                Input::Paste(text) => app.insert(&text),
+                Input::Paste(text) => app.paste(&text),
                 Input::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.wheel(true),
                     MouseEventKind::ScrollDown => app.wheel(false),
@@ -98,6 +114,8 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
             let _ = input.send(Event::Eof);
             app.drain();
         }
+        // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
+        KeyCode::F(5) => mouse(app),
         // A worker view owns the keys while it is open: esc returns to the fleet from there.
         _ if app.in_worker_view() => app.worker_key(key),
         KeyCode::Char('j') if ctrl => app.insert("\n"),
@@ -130,6 +148,16 @@ fn copy(app: &mut App, pasted: &Sender<Copied>) {
         // The loop drops this receiver when it ends, and then there is nobody left to tell.
         let _ = sender.send((id, found));
     });
+}
+
+/// F5: captures the mouse for clicks and the wheel, or hands it back so the terminal's own
+/// selection and copy work again.
+fn mouse(app: &mut App) {
+    if app.toggle_mouse() {
+        let _ = execute!(stdout(), EnableMouseCapture);
+    } else {
+        let _ = execute!(stdout(), DisableMouseCapture);
+    }
 }
 
 fn quit(app: &mut App, input: &Sender<Event>) {
