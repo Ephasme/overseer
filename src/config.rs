@@ -47,15 +47,25 @@ pub(crate) fn load(path: &Path) -> Result<Config> {
 
 /// `OVERSEER_API_KEY` from the environment, else from `~/.config/overseer/.env`.
 pub(crate) fn api_key() -> Result<String> {
-    let path = path().with_file_name(".env");
-    if env::var("OVERSEER_API_KEY").is_err() && path.exists() {
-        dotenvy::from_path(&path).with_context(|| format!("reading {}", path.display()))?;
+    if let Some(key) = env_var("OVERSEER_API_KEY") {
+        return Ok(key);
     }
-    env::var("OVERSEER_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .map(|key| key.trim().to_string())
-        .with_context(|| format!("OVERSEER_API_KEY is not set; set it in the environment or in {}", path.display()))
+    let path = path().with_file_name(".env");
+    let context = || format!("OVERSEER_API_KEY is not set; set it in the environment or in {}", path.display());
+    if !path.exists() {
+        return Err(anyhow::Error::msg(context()));
+    }
+    for item in dotenvy::from_path_iter(&path).with_context(|| format!("reading {}", path.display()))? {
+        let (key, value) = item.with_context(|| format!("reading {}", path.display()))?;
+        if key == "OVERSEER_API_KEY" && !value.trim().is_empty() {
+            return Ok(value.trim().to_string());
+        }
+    }
+    Err(anyhow::Error::msg(context()))
+}
+
+fn env_var(name: &str) -> Option<String> {
+    env::var(name).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
 }
 
 fn parse(text: &str, home: &Path) -> Result<Config> {

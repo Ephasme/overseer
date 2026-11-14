@@ -94,6 +94,7 @@ impl Fleet {
                 .ok_or_else(|| "missing integer argument 'id'".to_string())
                 .and_then(|id| tools::str_arg(&args, "text").and_then(|text| self.message(id, text))),
             "list_workers" => Ok(self.list()),
+            "list_repos" => Ok(self.list_repos()),
             other => Err(format!("unknown tool {other}")),
         };
         result.unwrap_or_else(|e| format!("error: {e}"))
@@ -148,6 +149,55 @@ impl Fleet {
             .collect();
         lines.join("\n")
     }
+
+    fn list_repos(&self) -> String {
+        let mut found = Vec::new();
+        for root in &self.roots {
+            collect_repos(root, REPO_DEPTH, &mut found);
+        }
+        if found.is_empty() {
+            let roots: Vec<String> = self.roots.iter().map(|root| root.display().to_string()).collect();
+            return format!("no git repositories found under {}", roots.join(", "));
+        }
+        found.sort();
+        let total = found.len();
+        found.truncate(MAX_REPOS);
+        let mut lines: Vec<String> = found.iter().map(|path| path.display().to_string()).collect();
+        if total > MAX_REPOS {
+            lines.push(format!("[{total} repositories found; the first {MAX_REPOS} are listed]"));
+        }
+        lines.join("\n")
+    }
+}
+
+/// Levels below a root searched for repositories; a repository is never descended into.
+const REPO_DEPTH: usize = 3;
+
+/// Longest `list_repos` answer, before it says how many were cut.
+const MAX_REPOS: usize = 300;
+
+fn collect_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_REPOS {
+        return;
+    }
+    if dir.join(".git").exists() {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut children: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')))
+        .collect();
+    children.sort();
+    for child in children {
+        collect_repos(&child, depth - 1, out);
+    }
 }
 
 pub(crate) fn overseer_tool_definitions() -> Value {
@@ -172,19 +222,38 @@ pub(crate) fn overseer_tool_definitions() -> Value {
             "name": "list_workers",
             "description": "List workers with their state (working, idle, failed), repository and task.",
             "parameters": {"type": "object", "properties": {}}
+        }},
+        {"type": "function", "function": {
+            "name": "list_repos",
+            "description": "List the git repositories that already exist under the configured roots, as absolute paths ready for spawn_worker. Call it before spawning; never ask the user for a path.",
+            "parameters": {"type": "object", "properties": {}}
         }}
     ])
 }
 
 pub(crate) fn overseer_prompt(roots: &[PathBuf]) -> String {
-    let roots: Vec<String> = roots.iter().map(|r| format!("- {}", r.display())).collect();
+    let listed: Vec<String> = roots.iter().map(|root| format!("- {}", root.display())).collect();
+    let mut repos = Vec::new();
+    for root in roots {
+        collect_repos(root, REPO_DEPTH, &mut repos);
+    }
+    repos.sort();
+    let known = if repos.is_empty() {
+        "none found yet; list_repos finds them as workers create them".to_string()
+    } else {
+        repos.iter().map(|repo| format!("- {}", repo.display())).collect::<Vec<_>>().join("\n")
+    };
     format!(
         "You are Overseer. You coordinate a fleet of worker agents and never do the work yourself: you cannot read files or run commands. \
 Delegate every request with spawn_worker, one worker per independent task, each in an existing repository under one of these roots:\n{}\n\
+Repositories that exist right now (list_repos refreshes this list):\n{}\n\
+Spawn workers in those paths. Never ask the user for a path, a command output or any other fact a worker could find: \
+put the question to a worker in the right repository with message_worker.\n\
 Workers never clone repositories. Give each worker complete instructions. Reuse an idle worker with message_worker for follow-ups in the same repository instead of spawning a new one. Check the fleet with list_workers.\n\
 Messages that start with [worker N ...] come from workers, not the user: \"says\" is a progress note or question, \"finished\" carries the worker's final report, \"failed\" an error. \
 Answer a worker question yourself with message_worker when you can; otherwise ask the user. Report results to the user concisely.",
-        roots.join("\n")
+        listed.join("\n"),
+        known
     )
 }
 
@@ -268,7 +337,7 @@ mod tests {
         queue: Receiver<Event>,
         repo: PathBuf,
         logs: tempfile::TempDir,
-        _root: tempfile::TempDir,
+        root: tempfile::TempDir,
     }
 
     fn harness(replies: Vec<Message>) -> Harness {
@@ -279,7 +348,7 @@ mod tests {
         let (sender, queue) = mpsc::channel();
         let roots = vec![fs::canonicalize(root.path()).unwrap()];
         let fleet = Fleet::new(Arc::new(Scripted::new(replies)), roots, logs.path().to_path_buf(), sender);
-        Harness { fleet, queue, repo, logs, _root: root }
+        Harness { fleet, queue, repo, logs, root }
     }
 
     fn spawn(fleet: &mut Fleet, repo: &Path) -> String {
@@ -290,6 +359,31 @@ mod tests {
         fleet.execute(&tool_call("l", "list_workers", &json!({})))
     }
 
+    fn repos(fleet: &mut Fleet) -> String {
+        fleet.execute(&tool_call("r", "list_repos", &json!({})))
+    }
+
+    #[test]
+    fn list_repos_reports_git_directories_and_nothing_else() {
+        let mut h = harness(vec![]);
+        assert_eq!(
+            repos(&mut h.fleet),
+            format!("no git repositories found under {}", fs::canonicalize(h.root.path()).unwrap().display())
+        );
+        fs::create_dir(h.repo.join(".git")).unwrap();
+        fs::create_dir(h.root.path().join("plain")).unwrap();
+        fs::create_dir_all(h.repo.join("nested/.git")).unwrap();
+        assert_eq!(repos(&mut h.fleet), fs::canonicalize(&h.repo).unwrap().display().to_string());
+    }
+
+    #[test]
+    fn overseer_prompt_lists_existing_repositories() {
+        let h = harness(vec![]);
+        fs::create_dir(h.repo.join(".git")).unwrap();
+        let roots = vec![fs::canonicalize(h.root.path()).unwrap()];
+        let prompt = overseer_prompt(&roots);
+        assert!(prompt.contains(&fs::canonicalize(&h.repo).unwrap().display().to_string()), "{prompt}");
+    }
     #[test]
     fn worker_reply_and_final_answer_reach_overseer() {
         let mut h = harness(vec![call("c1", "reply", &json!({"text": "halfway"})), text("done")]);

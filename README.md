@@ -1,6 +1,6 @@
 # overseer
 
-A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it only spawns, messages and lists workers. Each worker starts in one existing repository under the directories you configure, with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
+A coding-agent harness written in Rust. One overseer agent coordinates a fleet of worker agents and never does the work itself. It has no file or shell tools: it spawns, messages and lists workers, and reads the list of git repositories already sitting under the directories you configure, which starts it with its fleet inventory and refills it through `list_repos`. Each worker starts in one existing repository under those directories, with `bash`, `read_file`, `write_file`, and `reply` (a progress note to the overseer). There is no clone tool. Workers are not sandboxed: their commands run without confirmation and can reach any path your user can.
 
 ## Install
 
@@ -8,7 +8,7 @@ A coding-agent harness written in Rust. One overseer agent coordinates a fleet o
 brew install ephasme/tap/overseer
 ```
 
-Prebuilt for macOS (Apple silicon and Intel) and Linux (x86_64). From source: `cargo install --git https://github.com/Ephasme/overseer`.
+Prebuilt for macOS (Apple silicon and Intel) and Linux (x86_64). From source: `cargo install --git https://github.com/Ephasme/overseer`, or `just install` in a clone, which builds the release binary into `~/.local/bin`.
 
 ## Configure
 

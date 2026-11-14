@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{env, time::Duration};
 
 /// One chat message in the chat-completions wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,11 +72,15 @@ impl OpenAiClient {
 
 impl Llm for OpenAiClient {
     fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
+        let payload = json!({ "model": self.model, "messages": messages, "tools": tools });
+        if env::var_os("OVERSEER_DEBUG").is_some() {
+            eprintln!("request: {payload}");
+        }
         let response = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(&json!({ "model": self.model, "messages": messages, "tools": tools }))
+            .json(&payload)
             .send()
             .context("request to model failed")?;
         let status = response.status();
