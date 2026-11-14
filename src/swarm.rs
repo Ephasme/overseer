@@ -271,6 +271,16 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
+    /// The model's reasoning, as it streams: shown, never fed back to the model.
+    Thought {
+        id: usize,
+        text: String,
+    },
+    /// The instruction an agent is about to work on, the one the user or its owner gave it.
+    Instruction {
+        id: usize,
+        text: String,
+    },
 }
 
 impl Event {
@@ -903,6 +913,9 @@ fn spawn_thread(
             StreamStep::Text(delta) => {
                 let _ = stream_sender.send(Event::Delta { id, text: delta.to_string() });
             }
+            StreamStep::Reasoning(thought) => {
+                let _ = stream_sender.send(Event::Thought { id, text: thought.to_string() });
+            }
         }),
     ));
     let agent_dir = working_dir.to_path_buf();
@@ -997,6 +1010,8 @@ impl AgentRun<'_> {
             }
             // Rebuilt per instruction: a server that connected after this agent started must reach it.
             let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
+            // Sent before the turn's first delta, so a frontend always reads the instruction first.
+            let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
             let _ = writeln!(self.log, "> {input}");
             let result = {
                 let context = tools::Context { skills: &skills, mcp: mcp.as_ref() };
@@ -1111,11 +1126,12 @@ mod tests {
         root: tempfile::TempDir,
     }
 
-    /// The next event that is not streamed model output: these tests assert agent outcomes.
+    /// The next event that is not streamed model output or a turn's opening line: these tests
+    /// assert agent outcomes.
     fn next_event(queue: &Receiver<Event>) -> Event {
         loop {
             match queue.recv_timeout(WAIT).unwrap() {
-                Event::Delta { .. } | Event::TurnStart { .. } => {}
+                Event::Delta { .. } | Event::Thought { .. } | Event::TurnStart { .. } | Event::Instruction { .. } => {}
                 event => return event,
             }
         }

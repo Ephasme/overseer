@@ -66,15 +66,31 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
+/// One piece of a streamed model call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Piece<'a> {
+    /// The answer: shown to the user and kept in the history.
+    Text(&'a str),
+    /// The model's reasoning: shown to the user, never kept.
+    Reasoning(&'a str),
+}
+
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
     fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message>;
 
-    /// The same call, reporting content as it arrives. A backend without streaming reports it once.
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+    /// The same call, reporting pieces as they arrive. A backend without streaming reports them once.
+    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
         let message = self.chat(messages, tools)?;
-        on_delta(message.content.as_deref().unwrap_or_default());
+        report(&message, on_piece);
         Ok(message)
+    }
+}
+
+/// Reports a whole message as the piece streaming it would have produced.
+fn report(message: &Message, on_piece: &mut dyn FnMut(Piece<'_>)) {
+    if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
+        on_piece(Piece::Text(content));
     }
 }
 
@@ -103,7 +119,7 @@ impl Llm for OpenAiClient {
         parse_response(&body)
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
         let response = self.send(messages, tools, true)?;
         let streamed = response
             .headers()
@@ -114,10 +130,10 @@ impl Llm for OpenAiClient {
             // A provider that ignored `stream` sends one whole response instead.
             let body = response.text().context("reading model response failed")?;
             let message = parse_response(&body)?;
-            on_delta(message.content.as_deref().unwrap_or_default());
+            report(&message, on_piece);
             return Ok(message);
         }
-        read_stream(std::io::BufReader::new(response), on_delta)
+        read_stream(std::io::BufReader::new(response), on_piece)
     }
 }
 
@@ -191,6 +207,12 @@ struct StreamChoice {
 #[derive(Deserialize, Default)]
 struct Delta {
     content: Option<String>,
+    /// The reasoning a thinking model streams before its answer. Providers disagree on the name,
+    /// and one of them sends both keys with the same text, so each is read into its own field.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     tool_calls: Option<Vec<Fragment>>,
 }
 
@@ -208,8 +230,8 @@ struct FragmentFunction {
     arguments: Option<String>,
 }
 
-/// Rebuilds the assistant message from `data:` lines, reporting each content delta as it arrives.
-fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+/// Rebuilds the assistant message from `data:` lines, reporting each piece as it arrives.
+fn read_stream(reader: impl std::io::BufRead, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut complete = false;
@@ -238,11 +260,17 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
             if choice.finish_reason.is_some() {
                 complete = true;
             }
-            if let Some(text) = choice.delta.content {
-                content.push_str(&text);
-                on_delta(&text);
+            let Delta { content: text, reasoning_content, reasoning: alias, tool_calls } = choice.delta;
+            // A provider sends an empty `content` beside each reasoning delta and an empty
+            // `reasoning` beside the answer; an empty piece would open an entry of its own.
+            if let Some(thought) = reasoning_content.or(alias).filter(|text| !text.is_empty()) {
+                on_piece(Piece::Reasoning(&thought));
             }
-            for fragment in choice.delta.tool_calls.unwrap_or_default() {
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                on_piece(Piece::Text(&text));
+                content.push_str(&text);
+            }
+            for fragment in tool_calls.unwrap_or_default() {
                 merge_fragment(&mut calls, fragment)?;
             }
         }
@@ -294,10 +322,11 @@ fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
     Ok(())
 }
 
-/// One step of a stream: a new model call, or text from the current one.
+/// One step of a stream: a new model call, or a piece of the current one.
 pub(crate) enum StreamStep<'a> {
     Start,
     Text(&'a str),
+    Reasoning(&'a str),
 }
 
 /// Forwards the model's streaming output to a sink while `Turn` keeps its blocking interface.
@@ -320,12 +349,15 @@ impl Llm for StreamLlm {
         self.chat_stream(messages, tools, &mut |_| ())
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+    fn chat_stream(&self, messages: &[Message], tools: &Value, on_piece: &mut dyn FnMut(Piece<'_>)) -> Result<Message> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
-        self.inner.chat_stream(messages, tools, &mut |delta| {
-            (self.sink)(StreamStep::Text(delta));
-            on_delta(delta);
+        self.inner.chat_stream(messages, tools, &mut |piece| {
+            (self.sink)(match piece {
+                Piece::Text(text) => StreamStep::Text(text),
+                Piece::Reasoning(text) => StreamStep::Reasoning(text),
+            });
+            on_piece(piece);
         })
     }
 }
@@ -392,7 +424,12 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = String::new();
-        let message = read_stream(std::io::Cursor::new(sse), &mut |delta| seen.push_str(delta)).unwrap();
+        let message = read_stream(std::io::Cursor::new(sse), &mut |piece| {
+            if let Piece::Text(text) = piece {
+                seen.push_str(text);
+            }
+        })
+        .unwrap();
         assert_eq!(seen, "Looking now.");
         assert_eq!(message.content.as_deref(), Some("Looking now."));
         let calls = message.tool_calls.unwrap();
@@ -435,16 +472,46 @@ mod tests {
                 let seen = std::sync::Arc::clone(&seen);
                 move |step: StreamStep<'_>| {
                     seen.lock().unwrap().push_str(match step {
-                        StreamStep::Text(text) => text,
+                        StreamStep::Text(text) | StreamStep::Reasoning(text) => text,
                         StreamStep::Start => "|",
                     });
                 }
             }),
         );
         let mut reported = String::new();
-        llm.chat_stream(&[], &json!([]), &mut |delta| reported.push_str(delta)).unwrap();
+        llm.chat_stream(&[], &json!([]), &mut |piece| {
+            if let Piece::Text(text) = piece {
+                reported.push_str(text);
+            }
+        })
+        .unwrap();
         assert_eq!(reported, "hi");
         assert_eq!(*seen.lock().unwrap(), "|hi");
+    }
+
+    #[test]
+    fn reasoning_streams_before_the_answer_and_never_goes_back() {
+        // Chunk shapes copied from the provider this project runs against: it sends both reasoning
+        // keys with the same text, and an empty `content` beside them.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\"weigh it\",",
+            "\"reasoning_content\":\"weigh it\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\" twice\",",
+            "\"reasoning_content\":\" twice\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\",\"role\":\"assistant\",\"reasoning\":null}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut seen = Vec::new();
+        let message = read_stream(std::io::Cursor::new(sse), &mut |piece| {
+            seen.push(match piece {
+                Piece::Text(text) => format!("text {text}"),
+                Piece::Reasoning(text) => format!("think {text}"),
+            });
+        })
+        .unwrap();
+        assert_eq!(seen, ["think weigh it", "think  twice", "text done"]);
+        assert_eq!(message.content.as_deref(), Some("done"), "the answer holds only the answer");
+        assert_eq!(message.tool_calls, None);
     }
 
     #[test]
@@ -476,7 +543,7 @@ mod tests {
                 let seen = std::sync::Arc::clone(&seen);
                 move |step: StreamStep<'_>| {
                     let text = match step {
-                        StreamStep::Text(text) => text,
+                        StreamStep::Text(text) | StreamStep::Reasoning(text) => text,
                         StreamStep::Start => "|",
                     };
                     seen.lock().unwrap().push_str(text);

@@ -35,7 +35,7 @@ OVERSEER_API_KEY=...
 overseer
 ```
 
-On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Overseer answers stream in as they are generated, and each worker's live output shows under its row in the panel. The transcript is the lead's own stream: a worker's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`, `interrupted`). Every worker has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the worker panel counts the lines a closed view missed and shows each worker as working, paused, stopped, idle or failed, with `read-only` when restricted. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
+On a terminal it opens a full-screen UI: the transcript, a worker panel on the right, and the prompt at the bottom. Every model call reaches its view one way: entries appended in the order the call produced them, so a thought, the answer and the tool call it asks for read top to bottom, and a worker's stream opens with the instruction that started it. The transcript is the lead's own stream: a worker's tool calls, progress notes and messages never enter it, only one lifecycle line per event (`started`, `says`, `finished`, `failed`, `interrupted`). Every worker has a stream of its own, with its own scrollback and scroll position, opened by clicking its row or with F4; the worker panel counts the lines a closed view missed and shows each worker as working, paused, stopped, idle or failed, with `read-only` when restricted. `/resume <id>` re-tasks a worker without spending a model call; `exit` quits at once.
 
 |Key|Effect|
 |---|---|

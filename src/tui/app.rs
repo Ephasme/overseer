@@ -7,7 +7,7 @@ use crate::version;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
@@ -33,9 +33,6 @@ const WHEEL_LINES: u16 = 3;
 
 /// Redraw interval of the spinner.
 const TICK: Duration = Duration::from_millis(120);
-
-/// Longest worker preview kept, in characters.
-const PREVIEW_CHARS: usize = 400;
 
 /// Body rows a collapsed tool card keeps, before the row that counts what it hid.
 const BODY_ROWS: usize = 2;
@@ -89,8 +86,12 @@ const SIDE_RULE: border::Set = border::Set {
 /// What a transcript line is about; decides its gutter and colours.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Role {
+    /// What an agent was asked: the user's prompt, or the instruction a worker was started with.
     You,
-    Overseer,
+    /// A model's prose: the overseer's or a worker's.
+    Model,
+    /// The reasoning a model streamed before that prose.
+    Thinking,
     /// A tool call, by the overseer or by one of its workers.
     Tool,
     Worker(AgentEvent),
@@ -145,8 +146,16 @@ impl Entry {
             Role::You => {
                 bar("▌ ", Style::new().fg(theme::primary()), &self.body, Style::new().fg(theme::text()), width)
             }
-            // The overseer reads as plain prose: the user's bar above it is the only mark it needs.
-            Role::Overseer => block("  ", Style::new(), &self.body, Style::new().fg(theme::text()), width),
+            // A model reads as plain prose: the user's bar above it is the only mark the answer needs.
+            Role::Model => block("  ", Style::new(), &self.body, Style::new().fg(theme::text()), width),
+            // The reasoning is the same model's, one shade quieter and marked as not the answer.
+            Role::Thinking => block(
+                "✻ ",
+                Style::new().fg(theme::faint()),
+                &self.body,
+                Style::new().fg(theme::muted()).add_modifier(Modifier::ITALIC),
+                width,
+            ),
             Role::Tool => self.tool_lines(width, spinning, expand),
             Role::Worker(kind) => {
                 let (label, colour) = match kind {
@@ -483,11 +492,16 @@ impl Stream {
         self.dirty_from = self.entries.len();
     }
 
-    /// Blank rows before an entry: a tool call hangs off the message or call above it, with no gap.
+    /// Blank rows before an entry. Only two pairs touch: a tool call hangs off what it belongs to,
+    /// and a thought runs into the answer it explains. Everything else opens a paragraph.
     fn gap_before(&self, index: usize) -> usize {
         let previous = self.entries.get(index.wrapping_sub(1)).map(|entry| &entry.role);
         let current = self.entries.get(index).map(|entry| &entry.role);
-        let attached = matches!((previous, current), (Some(Role::You | Role::Overseer | Role::Tool), Some(Role::Tool)));
+        let attached = matches!(
+            (previous, current),
+            (Some(Role::You | Role::Model | Role::Thinking | Role::Tool), Some(Role::Tool))
+                | (Some(Role::Model | Role::Thinking), Some(Role::Thinking | Role::Model))
+        );
         usize::from(index > 0 && !attached)
     }
 
@@ -628,11 +642,11 @@ pub(super) struct App {
     recall: Option<usize>,
     /// Where each agent tool call's entry landed: (agent, its call number, entry index).
     calls: Vec<(usize, usize, usize)>,
-    /// Index of the entry the overseer's streamed text is filling.
-    live: Option<usize>,
+    /// The entry each agent's streamed output is filling: (agent, entry index in its own stream).
+    /// One entry per agent, opened by the first piece of a model call and closed by whatever
+    /// arrives that is not streamed output.
+    live: Vec<(usize, usize)>,
     workers: Vec<AgentView>,
-    /// Last streamed text per worker, for the panel.
-    previews: Vec<(usize, String)>,
     worker_panel: bool,
     /// Expanded: every row of what a call acts on, and what it returned. Off is the launch state.
     pub(super) tool_output: bool,
@@ -669,9 +683,8 @@ impl App {
             history: Vec::new(),
             recall: None,
             calls: Vec::new(),
-            live: None,
+            live: Vec::new(),
             workers: Vec::new(),
-            previews: Vec::new(),
             worker_panel: true,
             tool_output: false,
             workers_area: Rect::ZERO,
@@ -697,29 +710,32 @@ impl App {
             UiEvent::Answer(text) => self.answer(text),
             UiEvent::Error(text) => self.push(Role::Error, String::new(), text),
             UiEvent::Debug(text) => self.push(Role::Debug, String::new(), text),
-            UiEvent::TurnBoundary => self.boundary(),
+            UiEvent::Boundary { id } => self.boundary(id),
             UiEvent::Agent { id, kind, text } => {
-                self.clear_preview(id);
                 let name = format!("agent {id}");
                 // The agent's own stream keeps the whole message; the lead gets one lifecycle line.
+                let answered = self.close_live(id);
                 let first = text.lines().next().unwrap_or_default().trim().to_string();
                 let line = if first.is_empty() {
                     format!("{name} {}", kind.verb())
                 } else {
                     format!("{name} {}: {first}", kind.verb())
                 };
-                self.worker_stream_mut(id).push(Entry::new(Role::Worker(kind), name, text));
-                self.note_unread(id);
+                // A finished turn whose answer already streamed is not written a second time.
+                if kind != AgentEvent::Finished || !answered {
+                    self.worker_stream_mut(id).push(Entry::new(Role::Worker(kind), name, text));
+                    self.note_unread(id);
+                }
                 self.push(Role::Notice, String::new(), line);
             }
-            UiEvent::AgentDelta { id, text } => {
-                if id == Swarm::ROOT {
-                    self.stream(&text);
-                } else {
-                    self.preview(id, &text);
-                }
-            }
+            UiEvent::AgentDelta { id, text } => self.piece(id, Role::Model, &text),
+            UiEvent::AgentThought { id, text } => self.piece(id, Role::Thinking, &text),
             UiEvent::Progress { id, progress } => self.progress(id, progress),
+            UiEvent::Instruction { id, text } => {
+                // The one entry that opens a worker's stream: what it was told, in its own order.
+                self.worker_stream_mut(id).push(Entry::new(Role::You, String::new(), text));
+                self.note_unread(id);
+            }
             UiEvent::Agents(agents) => {
                 // A child that just joined gets a stream of its own and one line in the lead's. The
                 // root already writes into the lead's stream, so it gets neither.
@@ -744,8 +760,9 @@ impl App {
                     // A turn started after ctrl+D: the drain is cancelled.
                     self.draining = false;
                 } else {
-                    // A failed turn never sends an answer: its streamed text stays as the record.
-                    self.live = None;
+                    // Nothing is running, so no streamed paragraph is open: a failed turn never
+                    // sends an answer and its streamed text stays as the record.
+                    self.live.clear();
                 }
             }
             UiEvent::Done => self.quit = true,
@@ -758,9 +775,7 @@ impl App {
             Progress::Started { call, tool, summary } => {
                 // The card ends the paragraph above it: what the next model call streams belongs
                 // below the card, not glued into the entry it would otherwise still be writing to.
-                if id == Swarm::ROOT {
-                    self.live = None;
-                }
+                self.set_live(id, None);
                 let index = self.stream_mut(id).push(Entry::tool(tool, summary));
                 self.calls.push((id, call, index));
                 if id != Swarm::ROOT {
@@ -797,10 +812,11 @@ impl App {
         }
     }
 
-    /// Separates the model calls of one turn with a blank line.
-    fn boundary(&mut self) {
-        let Some(index) = self.live else { return };
-        let changed = if let Some(entry) = self.lead.entries.get_mut(index)
+    /// Separates the model calls of one turn with a blank line, in that agent's own stream.
+    fn boundary(&mut self, id: usize) {
+        let Some(index) = self.live_index(id) else { return };
+        let stream = self.stream_mut(id);
+        let changed = if let Some(entry) = stream.entries.get_mut(index)
             && !entry.body.is_empty()
             && !entry.body.ends_with("\n\n")
         {
@@ -810,78 +826,90 @@ impl App {
             false
         };
         if changed {
-            self.lead.invalidate(index);
+            stream.invalidate(index);
         }
     }
 
-    fn stream(&mut self, text: &str) {
-        if self.live.is_none() {
-            self.push(Role::Overseer, String::new(), String::new());
-            self.live = Some(self.lead.entries.len().saturating_sub(1));
-        }
-        if let Some(index) = self.live
-            && let Some(entry) = self.lead.entries.get_mut(index)
-        {
-            entry.body.push_str(text);
-            self.lead.invalidate(index);
-        }
-    }
-
-    /// The turn's final text: it replaces what streamed when a backend sends nothing.
-    fn answer(&mut self, text: String) {
-        let live = self.live.take();
-        match live.and_then(|index| self.lead.entries.get_mut(index)) {
-            Some(entry) if entry.body.trim().is_empty() => entry.body = text,
-            Some(entry) if !text.trim().is_empty() => {
-                let streamed = entry.body.trim_end();
-                let final_text = text.trim();
-                if streamed.starts_with(final_text) {
-                    // The streamed body already holds the final text, perhaps with more.
-                } else if final_text.starts_with(streamed) {
-                    // The streamed body was a prefix: replace it with the full text.
-                    entry.body = text;
-                } else if !streamed.ends_with(final_text) {
-                    // Neither is a prefix of the other: append the final text.
-                    entry.body.push_str("\n\n");
-                    entry.body.push_str(&text);
+    /// Appends streamed model output to its agent's own stream: the one way a call reaches a view.
+    ///
+    /// A piece of a different kind opens a new entry, so a stream is strictly the order the call
+    /// produced it: reasoning, answer, tool call, then the next call.
+    fn piece(&mut self, id: usize, role: Role, text: &str) {
+        let opened = match self.live_index(id) {
+            Some(index) if self.streamed(id, index).map(|(held, _)| held) == Some(role) => index,
+            _ => {
+                let index = self.stream_mut(id).push(Entry::new(role, String::new(), String::new()));
+                self.set_live(id, Some(index));
+                if id != Swarm::ROOT {
+                    self.note_unread(id);
                 }
+                index
             }
-            Some(_) => {}
-            None => self.push(Role::Overseer, String::new(), text),
+        };
+        let stream = self.stream_mut(id);
+        if let Some(entry) = stream.entries.get_mut(opened) {
+            entry.body.push_str(text);
         }
-        if let Some(index) = live {
-            self.lead.invalidate(index);
-        }
+        stream.invalidate(opened);
     }
 
-    fn preview(&mut self, id: usize, text: &str) {
-        self.dirty = true;
-        let slot = self.previews.iter().position(|(worker, _)| *worker == id).unwrap_or_else(|| {
-            self.previews.push((id, String::new()));
-            self.previews.len().saturating_sub(1)
-        });
-        if let Some((_, buffer)) = self.previews.get_mut(slot) {
-            buffer.push_str(text);
-            let length = buffer.chars().count();
-            if length > PREVIEW_CHARS {
-                *buffer = buffer.chars().skip(length - PREVIEW_CHARS).collect();
+    /// Closes an agent's streamed entry, saying whether it already carries that agent's answer.
+    fn close_live(&mut self, id: usize) -> bool {
+        let Some(index) = self.live_index(id) else { return false };
+        self.set_live(id, None);
+        matches!(self.streamed(id, index), Some((Role::Model, body)) if !body.trim().is_empty())
+    }
+
+    /// The turn's final text: it fills the paragraph when nothing streamed, never replaces one.
+    fn answer(&mut self, text: String) {
+        let live = self.live_index(Swarm::ROOT);
+        self.set_live(Swarm::ROOT, None);
+        match live {
+            Some(index) if self.streamed(Swarm::ROOT, index).map(|(held, _)| held) == Some(Role::Model) => {
+                let stream = &mut self.lead;
+                if let Some(entry) = stream.entries.get_mut(index)
+                    && entry.body.trim().is_empty()
+                {
+                    entry.body = text;
+                }
+                stream.invalidate(index);
             }
+            _ => self.push(Role::Model, String::new(), text),
         }
     }
 
-    fn clear_preview(&mut self, id: usize) {
-        self.previews.retain(|(worker, _)| *worker != id);
+    /// The entry one agent's streamed output is filling, if any.
+    fn live_index(&self, id: usize) -> Option<usize> {
+        self.live.iter().find(|(agent, _)| *agent == id).map(|(_, index)| *index)
     }
 
-    fn preview_of(&self, id: usize) -> Option<&str> {
-        self.previews.iter().find(|(worker, _)| *worker == id).map(|(_, text)| text.as_str())
+    /// Sets or clears the entry one agent's streamed output fills.
+    fn set_live(&mut self, id: usize, index: Option<usize>) {
+        self.live.retain(|(agent, _)| *agent != id);
+        if let Some(index) = index {
+            self.live.push((id, index));
+        }
+    }
+
+    /// One agent's stream, for reading.
+    fn stream_ref(&self, id: usize) -> Option<&Stream> {
+        if id == Swarm::ROOT {
+            return Some(&self.lead);
+        }
+        self.worker_streams.iter().find(|stream| stream.id == id).map(|worker| &worker.stream)
+    }
+
+    /// One entry of one agent's stream: its role and the text it holds.
+    fn streamed(&self, id: usize, index: usize) -> Option<(Role, &str)> {
+        let entry = self.stream_ref(id)?.entries.get(index)?;
+        Some((entry.role, entry.body.as_str()))
     }
 
     /// A line in the lead's stream: the only stream the overseer's own events reach.
     fn push(&mut self, role: Role, title: String, body: String) {
         // Anything landing in the transcript closes the streamed paragraph, so no later delta is
         // appended above the line that interrupted it.
-        self.live = None;
+        self.set_live(Swarm::ROOT, None);
         self.lead.push(Entry::new(role, title, body));
     }
 
@@ -1055,13 +1083,11 @@ impl App {
             return;
         }
         frame.render_widget(Paragraph::new(Line::from(head)), Rect { height: 1, ..inner });
-        let width = usize::from(inner.width);
         let mut top = inner.y.saturating_add(1);
         let mut hidden = false;
         for worker in &self.workers {
             let (glyph, colour, state) = worker_state(worker);
-            let preview = self.preview_of(worker.id).and_then(last_line);
-            let height = if preview.is_some() { 5_u16 } else { 4 };
+            let height = 3_u16;
             let used = top.saturating_sub(inner.y);
             if used.saturating_add(height) > inner.height {
                 hidden = true;
@@ -1069,7 +1095,7 @@ impl App {
             }
             let unread = self.unread_of(worker.id);
             let indent = "  ".repeat(worker.depth);
-            let mut lines = vec![
+            let lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{indent}{glyph} "), Style::new().fg(colour)),
                     Span::styled(
@@ -1083,16 +1109,8 @@ impl App {
                     ),
                 ]),
                 Line::from(Span::styled(short_dir(&worker.dir), Style::new().fg(theme::faint()))),
+                Line::default(),
             ];
-            let task = worker.task.lines().next().unwrap_or_default().trim();
-            lines.push(Line::from(Span::styled(truncate(task, width), Style::new().fg(theme::muted()))));
-            if let Some(preview) = preview {
-                lines.push(Line::from(Span::styled(
-                    format!("▸ {}", truncate(preview, width.saturating_sub(2))),
-                    Style::new().fg(theme::faint()),
-                )));
-            }
-            lines.push(Line::default());
             let band = if self.selected == Some(worker.id) { theme::band() } else { Style::new() };
             let block = Rect { x: inner.x, y: top, width: inner.width, height };
             frame.render_widget(Paragraph::new(lines).style(band), block);
@@ -1300,7 +1318,8 @@ impl App {
         self.dirty = true;
     }
 
-    /// One worker's view: a breadcrumb, its state, its task, then its own lines of the transcript.
+    /// One worker's view: a breadcrumb, its state, then its own transcript, which opens with the
+    /// instruction the worker was started with.
     fn render_worker_view(&mut self, frame: &mut Frame, area: Rect) {
         let Some(worker) = self.focused().cloned() else { return };
         let bar =
@@ -1325,19 +1344,7 @@ impl App {
         let used = Line::from(line.clone()).width();
         line.push(Span::raw(" ".repeat(width.saturating_sub(used + text_width(hint)).max(1))));
         line.push(Span::styled(hint, Style::new().fg(theme::faint())));
-        let mut head = vec![crumb, Line::from(line), Line::default()];
-        for row in wrap(&worker.task, width) {
-            head.push(Line::from(Span::styled(row, Style::new().fg(theme::text()))));
-        }
-        if let Some(preview) = self.preview_of(worker.id).map(str::trim).filter(|text| !text.is_empty()) {
-            head.push(Line::default());
-            for row in wrap(preview, width.saturating_sub(2)) {
-                head.push(Line::from(vec![
-                    Span::styled("▸ ", Style::new().fg(theme::info())),
-                    Span::styled(row, Style::new().fg(theme::muted())),
-                ]));
-            }
-        }
+        let head = vec![crumb, Line::from(line), Line::default()];
         // The header stays put; the worker's own stream scrolls under it, with its own position.
         let head_height = u16::try_from(head.len()).unwrap_or(u16::MAX).min(top.height);
         let header =
@@ -1625,11 +1632,6 @@ fn worker_state(worker: &AgentView) -> (&'static str, Color, String) {
     }
     let read_only = if worker.read_only { " · read-only" } else { "" };
     ("○", theme::faint(), format!("idle{read_only}"))
-}
-
-/// The last non-empty line of a streamed preview.
-fn last_line(text: &str) -> Option<&str> {
-    text.lines().rev().find(|line| !line.trim().is_empty())
 }
 
 /// The last component of the worker's directory, so a narrow panel stays readable.
@@ -1982,7 +1984,7 @@ mod tests {
     fn model_call_boundary_becomes_a_blank_line() {
         let mut app = App::new("m");
         delta(&mut app, "first call");
-        app.apply(UiEvent::TurnBoundary);
+        app.apply(UiEvent::Boundary { id: Swarm::ROOT });
         delta(&mut app, "second call");
         assert_eq!(app.lead.entries[0].body, "first call\n\nsecond call");
         assert_eq!(app.lead.entries[0].lines(40, 0, true).len(), 3);
@@ -1994,7 +1996,7 @@ mod tests {
         delta(&mut app, "checking the config");
         tool_call(&mut app, 0, "bash", "cargo test");
         tool_result(&mut app, 0, "bash", "ok", 1.0);
-        app.apply(UiEvent::TurnBoundary);
+        app.apply(UiEvent::Boundary { id: Swarm::ROOT });
         delta(&mut app, "all green");
         app.apply(UiEvent::Answer("all green".into()));
         let bodies: Vec<&str> = app.lead.entries.iter().map(|entry| entry.body.as_str()).collect();
@@ -2014,7 +2016,7 @@ mod tests {
     #[test]
     fn a_boundary_before_any_text_opens_no_entry() {
         let mut app = App::new("m");
-        app.apply(UiEvent::TurnBoundary);
+        app.apply(UiEvent::Boundary { id: Swarm::ROOT });
         assert!(app.lead.entries.is_empty());
     }
 
@@ -2101,18 +2103,53 @@ mod tests {
     }
 
     #[test]
-    fn agent_preview_shows_the_live_line_then_clears() {
+    fn an_agents_stream_is_its_own_history_in_order() {
         let mut app = App::new("m");
-        let mut busy = agent_view(2, "long job");
-        busy.pending = 1;
-        busy.busy_for = Some(Duration::from_secs(3));
-        app.apply(UiEvent::Agents(vec![busy]));
-        app.apply(UiEvent::AgentDelta { id: 2, text: "reading the config".into() });
-        let rendered = screen(&mut app, 100, 24);
-        assert!(rendered.contains("reading the config"), "{rendered}");
-        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "done".into() });
-        let rendered = screen(&mut app, 100, 24);
-        assert!(!rendered.contains("reading the config"), "{rendered}");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "run the tests")]));
+        app.apply(UiEvent::Instruction { id: 2, text: "run the tests".into() });
+        app.apply(UiEvent::AgentThought { id: 2, text: "first the build".into() });
+        app.apply(UiEvent::AgentDelta { id: 2, text: "building".into() });
+        let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "cargo build".into() };
+        app.apply(UiEvent::Progress { id: 2, progress: started });
+        let preview = tools::preview(tools::BASH, "exit code: 0\nstdout:\n");
+        let finished = Progress::Finished { call: 0, secs: 1.0, preview };
+        app.apply(UiEvent::Progress { id: 2, progress: finished });
+        app.apply(UiEvent::Boundary { id: 2 });
+        app.apply(UiEvent::AgentDelta { id: 2, text: "green".into() });
+        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "green".into() });
+        let got: Vec<(Role, &str)> =
+            worker_entries(&app, 2).iter().map(|entry| (entry.role, entry.body.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (Role::You, "run the tests"),
+                (Role::Thinking, "first the build"),
+                (Role::Model, "building"),
+                (Role::Tool, "cargo build"),
+                (Role::Model, "green"),
+            ],
+            "one entry per piece, in the order the agent produced them, and the answer once"
+        );
+        assert_eq!(app.unread_of(2), 5, "each new entry counts as one line the view has not shown");
+        click_first_agent(&mut app);
+        let view = screen(&mut app, 100, 24);
+        assert!(view.contains("✻ first the build"), "the reasoning is marked as reasoning: {view}");
+        let thought = view.find("first the build").expect("the thought is on screen");
+        let card = view.find("$ cargo build").expect("the tool card is on screen");
+        let answer = view.find("green").expect("the answer is on screen");
+        assert!(thought < card && card < answer, "the screen keeps the order the call produced: {view}");
+    }
+
+    #[test]
+    fn the_task_is_the_first_line_of_a_workers_stream_and_nowhere_else() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "fix the nav")]));
+        app.apply(UiEvent::Instruction { id: 2, text: "fix the nav".into() });
+        let fleet = screen(&mut app, 100, 24);
+        assert!(!fleet.contains("fix the nav"), "the roster names the agent, not its prompt: {fleet}");
+        click_first_agent(&mut app);
+        let view = screen(&mut app, 100, 24);
+        assert_eq!(view.matches("fix the nav").count(), 1, "said once, where it was said: {view}");
     }
 
     #[test]
@@ -2239,12 +2276,13 @@ mod tests {
     fn a_click_opens_the_agent_view_and_esc_returns_to_the_tree() {
         let mut app = App::new("m");
         app.apply(UiEvent::Agents(vec![root_view(), agent_view(3, "fix the nav")]));
+        app.apply(UiEvent::Instruction { id: 3, text: "fix the nav".into() });
         app.apply(UiEvent::Agent { id: 3, kind: AgentEvent::Finished, text: "done".into() });
         click_first_agent(&mut app);
         assert!(app.in_worker_view());
         let view = screen(&mut app, 100, 24);
         assert!(view.contains("agents › agent 3"), "{view}");
-        assert!(view.contains("fix the nav"), "the view shows the task handed to the agent: {view}");
+        assert!(view.contains("fix the nav"), "the stream opens with the instruction: {view}");
         assert!(view.contains("esc back to agents"), "the way out is on the header: {view}");
         assert!(view.contains("[agent 3] done done"), "the view shows the agent's own lines: {view}");
         assert!(!view.contains("Ask agent 1"), "the composer is out of the way: {view}");
