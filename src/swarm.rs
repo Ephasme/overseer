@@ -1156,7 +1156,7 @@ impl AgentRun<'_> {
             let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
             let _ = writeln!(self.log, "> {input}");
             let result = {
-                let context = tools::Context { skills: &skills, mcp: mcp.as_ref() };
+                let context = tools::Context { skills: &skills, profiles: catalogue.as_ref(), mcp: mcp.as_ref() };
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,

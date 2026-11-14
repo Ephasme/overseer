@@ -319,6 +319,6 @@ mod tests {
         };
         let prompt = agent_prompt(&facts);
         assert!(!prompt.contains("Profiles for your sub-agents"), "{prompt}");
-        assert!(!prompt.contains("profile://<name>"), "{prompt}");
+        assert!(!prompt.contains("<profiles>"), "{prompt}");
     }
 }
