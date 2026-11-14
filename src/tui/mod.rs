@@ -176,6 +176,9 @@ mod tests {
             pending: 0,
             failed: false,
             finished: false,
+            stopped: false,
+            paused: false,
+            read_only: false,
             busy_for: None,
         };
         app.apply(UiEvent::Workers(vec![worker]));

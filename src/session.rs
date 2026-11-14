@@ -99,7 +99,8 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Workers(fleet.snapshot()));
                 output
             };
-            let mut turn = agent::Turn { llm: overseer.as_ref(), tool_defs: &tool_defs, execute: &mut execute };
+            let mut turn =
+                agent::Turn { llm: overseer.as_ref(), tool_defs: &tool_defs, execute: &mut execute, cancel: None };
             match turn.run(&mut history, &text) {
                 Ok(answer) if !answer.is_empty() => {
                     let _ = ui.send(UiEvent::Answer(answer));
