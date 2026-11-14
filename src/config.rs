@@ -45,6 +45,19 @@ pub(crate) fn load(path: &Path) -> Result<Config> {
     parse(&text, &home()).with_context(|| format!("invalid config {}", path.display()))
 }
 
+/// `OVERSEER_API_KEY` from the environment, else from `~/.config/overseer/.env`.
+pub(crate) fn api_key() -> Result<String> {
+    let path = path().with_file_name(".env");
+    if env::var("OVERSEER_API_KEY").is_err() && path.exists() {
+        dotenvy::from_path(&path).with_context(|| format!("reading {}", path.display()))?;
+    }
+    env::var("OVERSEER_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_string())
+        .with_context(|| format!("OVERSEER_API_KEY is not set; set it in the environment or in {}", path.display()))
+}
+
 fn parse(text: &str, home: &Path) -> Result<Config> {
     let raw: RawConfig = toml::from_str(text)?;
     if raw.roots.is_empty() {

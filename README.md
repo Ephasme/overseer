@@ -20,12 +20,16 @@ base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions
 model = "gpt-4.1"
 ```
 
-All three keys are required. The API key comes from `OVERSEER_API_KEY`.
+All three keys are required. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
+
+```sh
+OVERSEER_API_KEY=...
+```
 
 ## Run
 
 ```sh
-OVERSEER_API_KEY=... overseer
+overseer
 ```
 
 Talk to the overseer on stdin. Worker reports wake it on their own. Each worker logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/worker-<id>.log`; `tail -f` one to watch it. `exit` quits at once; Ctrl-D quits once no worker is busy.

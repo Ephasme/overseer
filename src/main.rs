@@ -10,10 +10,10 @@ use llm::{Llm, Message, ToolCall};
 use std::io::{self, BufRead};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, fs, thread};
+use std::{fs, thread};
 
 fn main() -> Result<()> {
-    let api_key = env::var("OVERSEER_API_KEY").context("OVERSEER_API_KEY is not set")?;
+    let api_key = config::api_key()?;
     let cfg = config::load(&config::path())?;
     let llm: Arc<dyn Llm> = Arc::new(llm::OpenAiClient::new(&cfg.base_url, api_key, cfg.model)?);
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
