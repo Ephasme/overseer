@@ -1,5 +1,8 @@
 # Local development installs. Releases go through CI on a v* tag; these keep the working tree out of Homebrew's copy.
 
+# Recipe parameters reach the shell as positional arguments, so `"$@"` keeps each one whole.
+set positional-arguments
+
 # Build the release binary and install it at ~/.local/bin/overseer.
 install:
     @cargo build --release --locked
@@ -17,13 +20,13 @@ install:
 # Run the built binary by path: a shell may still hash Homebrew's copy under the same name.
 run *args:
     cargo build --release --locked
-    ./target/release/overseer {{args}}
+    ./target/release/overseer "$@"
 
 # Every check CI runs.
 check:
     cargo fmt --all --check
     cargo clippy --locked --all-targets -- -D warnings
-    cargo nextest run --locked
+    cargo nextest run --locked --profile ci
     cargo shear
     cargo deny check
     typos

@@ -133,7 +133,7 @@ impl OpenAiClient {
     }
 
     fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream });
+        let payload = json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
         if let Some(sink) = &self.debug {
             sink(&payload.to_string());
         }
@@ -180,6 +180,9 @@ struct StreamChunk {
 
 #[derive(Deserialize)]
 struct StreamChoice {
+    /// Which of the request's `n` answers this chunk belongs to; only the first is kept.
+    #[serde(default)]
+    index: usize,
     #[serde(default)]
     delta: Delta,
     finish_reason: Option<String>,
@@ -229,6 +232,9 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
             bail!("model stream failed: {error}");
         }
         for choice in chunk.choices {
+            if choice.index != 0 {
+                continue;
+            }
             if choice.finish_reason.is_some() {
                 complete = true;
             }
@@ -246,6 +252,14 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
     }
     if calls.is_empty() && content.is_empty() {
         bail!("model returned an empty answer");
+    }
+    for (index, call) in calls.iter().enumerate() {
+        if call.id.is_empty() {
+            bail!("tool call {index} has no id: the stream was truncated");
+        }
+        if call.function.name.is_empty() {
+            bail!("tool call {index} has no function name: the stream was truncated");
+        }
     }
     let tool_calls = (!calls.is_empty()).then_some(calls);
     let content = (!content.is_empty()).then_some(content);
@@ -270,8 +284,8 @@ fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
         call.id = id;
     }
     if let Some(function) = fragment.function {
-        if call.function.name.is_empty() {
-            call.function.name = function.name.unwrap_or_default();
+        if let Some(name) = function.name {
+            call.function.name.push_str(&name);
         }
         if let Some(arguments) = function.arguments {
             call.function.arguments.push_str(&arguments);
@@ -303,9 +317,16 @@ impl StreamLlm {
 
 impl Llm for StreamLlm {
     fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
+        self.chat_stream(messages, tools, &mut |_| ())
+    }
+
+    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
-        self.inner.chat_stream(messages, tools, &mut |delta| (self.sink)(StreamStep::Text(delta)))
+        self.inner.chat_stream(messages, tools, &mut |delta| {
+            (self.sink)(StreamStep::Text(delta));
+            on_delta(delta);
+        })
     }
 }
 
@@ -378,6 +399,52 @@ mod tests {
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].function.name, "bash");
         assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn stream_reassembles_a_split_tool_name() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"function\":{\"name\":\"read_\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"name\":\"file\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let message = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap();
+        assert_eq!(message.tool_calls.unwrap()[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn stream_rejects_a_tool_call_without_a_name() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        assert!(err.to_string().contains("no function name"), "{err}");
+    }
+
+    #[test]
+    fn stream_wrapper_does_not_report_text_twice() {
+        let inner: std::sync::Arc<dyn Llm> = std::sync::Arc::new(testing::Scripted::new(vec![testing::text("hi")]));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let llm = StreamLlm::new(
+            inner,
+            std::sync::Arc::new({
+                let seen = std::sync::Arc::clone(&seen);
+                move |step: StreamStep<'_>| {
+                    seen.lock().unwrap().push_str(match step {
+                        StreamStep::Text(text) => text,
+                        StreamStep::Start => "|",
+                    });
+                }
+            }),
+        );
+        let mut reported = String::new();
+        llm.chat_stream(&[], &json!([]), &mut |delta| reported.push_str(delta)).unwrap();
+        assert_eq!(reported, "hi");
+        assert_eq!(*seen.lock().unwrap(), "|hi");
     }
 
     #[test]

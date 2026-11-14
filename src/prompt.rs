@@ -1,4 +1,3 @@
-use crate::config;
 use crate::mcp;
 use crate::skills;
 use crate::tools;
@@ -16,11 +15,28 @@ pub(crate) const LIST_REPOS: &str = "list_repos";
 /// Name of the progress-note tool an agent writes to its owner with.
 pub(crate) const REPLY: &str = "reply";
 
+/// Every tool an owner may ban by name: the file tools, `reply`, and the tree tools.
+const DENIABLE_TOOLS: &[&str] = &[
+    tools::BASH,
+    tools::READ_FILE,
+    tools::WRITE_FILE,
+    REPLY,
+    SPAWN_AGENT,
+    MESSAGE_AGENT,
+    CONTROL_AGENT,
+    LIST_AGENTS,
+    LIST_REPOS,
+];
+
 /// Longest repository list `list_repos` shows.
 pub(crate) const MAX_REPOS: usize = 300;
 
-/// Every tool every agent has: the same set for the root and for the deepest child.
-pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy) -> Value {
+/// The tools an agent is offered: the file tools, `reply` and the tree tools, less what its policy
+/// bans and what `remaining_depth` rules out, plus the servers' unless it is read-only.
+///
+/// The array must match what `Policy::refuse` and the dispatcher will run: a tool shown but
+/// impossible to call teaches the model to waste turns on it.
+pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy, remaining_depth: usize) -> Value {
     let mut defs = tools::definitions();
     let Some(functions) = defs.as_array_mut() else {
         return defs;
@@ -30,15 +46,24 @@ pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy
         "description": "Send a short progress note to the agent that owns you, without ending your turn.",
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
     }}));
-    for tool in swarm_tool_definitions() {
-        functions.push(tool);
-    }
+    functions.extend(swarm_tool_definitions());
     // A read-only agent is offered none of the MCP tools: their side effects are the server's,
     // not something the policy can predict.
     if !policy.read_only {
         functions.extend(mcp.tool_defs());
     }
+    functions.retain(|tool| {
+        let Some(name) = function_name(tool) else { return true };
+        let banned = policy.deny_tools.iter().any(|tool| tool == name);
+        let too_deep = name == SPAWN_AGENT && remaining_depth == 0;
+        !banned && !too_deep
+    });
     defs
+}
+
+/// The function name of one entry of the `tools` array.
+fn function_name(tool: &Value) -> Option<&str> {
+    tool.get("function")?.get("name")?.as_str()
 }
 
 /// The tools an agent commands the tree with, below the file tools.
@@ -46,7 +71,7 @@ fn swarm_tool_definitions() -> Vec<Value> {
     let spawn = with_policy(json!({
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": format!("Directory the agent works in; relative paths resolve there. Defaults to {}.", config::DEFAULT_WORKING_DIR)},
+            "path": {"type": "string", "description": "Directory the agent works in; relative paths resolve there. Defaults to your own directory."},
             "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
         },
         "required": ["task"]
@@ -90,10 +115,10 @@ fn swarm_tool_definitions() -> Vec<Value> {
 /// The restrictions `spawn_agent` may set, as the schema states them.
 fn policy_properties() -> Value {
     json!({
-        "read_only": {"type": "boolean", "description": "Refuse write_file, and refuse any bash command that is not a read-only program (ls cat head tail wc stat file tree pwd rg grep diff jq, and read-only git subcommands)."},
-        "deny_tools": {"type": "array", "items": {"type": "string"}, "description": "Tools this agent may never call: bash, read_file, write_file, reply, spawn_agent, message_agent, control_agent, list_agents, list_repos. Denying spawn_agent stops it from ever starting sub-agents."},
-        "allow_commands": {"type": "array", "items": {"type": "string"}, "description": "When non-empty, a bash command must start with one of these prefixes."},
-        "deny_commands": {"type": "array", "items": {"type": "string"}, "description": "A bash command starting with one of these prefixes never runs. Deny beats allow."}
+        "read_only": {"type": "boolean", "description": format!("Refuse write_file, and refuse any bash command that is not a read-only program ({}) or a read-only git subcommand ({}); a writing flag or argument is refused too.", tools::READ_ONLY_PROGRAMS.join(" "), tools::READ_ONLY_GIT.join(" "))},
+        "deny_tools": {"type": "array", "items": {"type": "string"}, "description": format!("Tools this agent may never call: {}. Denying {SPAWN_AGENT} stops it from ever starting sub-agents.", DENIABLE_TOOLS.join(", "))},
+        "allow_commands": {"type": "array", "items": {"type": "string"}, "description": "When non-empty, a bash command's program word (a path and an `env`/`sudo` wrapper stripped, `VAR=x` skipped) must match one of these. A command carrying shell syntax (`;`, `|`, `&`, `>`) is refused, so this guards one program per call, not a shell."},
+        "deny_commands": {"type": "array", "items": {"type": "string"}, "description": "A bash command whose program word matches one of these never runs, whatever its path or wrapper (`/bin/rm`, `env rm`). Deny beats allow."}
     })
 }
 
@@ -138,12 +163,15 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
     );
     if facts.root {
         out.push_str("The user talks to you directly; your final answer is what they read.\n");
-    } else {
-        let parent = facts.parent.unwrap_or_default();
+    } else if let Some(parent) = facts.parent {
         let _ = writeln!(
             out,
             "Agent {parent} started you and owns you: your final answer goes to it, so make it a complete report."
         );
+    } else {
+        // Non-root with no parent: the caller contradicted itself, and naming agent 0 would give the
+        // model an owner it does not have.
+        out.push_str("Your owner is not recorded: this agent reported itself as non-root with no parent.\n");
     }
     if !facts.children.is_empty() {
         let listed: Vec<String> = facts.children.iter().map(|id| format!("agent {id}")).collect();
@@ -157,8 +185,12 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
             "Skills you can read: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>\n"
         );
     }
-    for (server, notes) in facts.mcp.instructions() {
-        let _ = write!(out, "MCP server notes ({server}):\n{notes}\n");
+    // A read-only agent is offered no MCP tool, so notes about them would describe calls it cannot
+    // make. The servers' prose is fenced: it is theirs, not an instruction of yours.
+    if !facts.policy.read_only {
+        for (server, notes) in facts.mcp.instructions() {
+            let _ = write!(out, "MCP server notes ({server}):\n<mcp server=\"{server}\">\n{notes}\n</mcp>\n");
+        }
     }
     out.push_str(
         "Ownership is one way: you may message, pause, resume or stop any agent below you, and nobody below you may do any of that to you. You cannot command your parent, your siblings, or any agent outside your own subtree.\n\
@@ -168,7 +200,7 @@ Do the work yourself when it is yours to do; delegate when a task splits into in
 Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
 If you need a decision to continue, end your turn with the question as your final answer.\n",
     );
-    let defs = agent_tool_definitions(facts.mcp, facts.policy);
+    let defs = agent_tool_definitions(facts.mcp, facts.policy, remaining);
     out.push_str(&tool_section(&defs));
     // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
     let counts = facts.mcp.tool_counts();

@@ -358,6 +358,9 @@ fn char_width(character: char) -> usize {
 
 /// Shortens `text` to `width` columns, marking the cut with an ellipsis.
 fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if text_width(text) <= width {
         return text.to_string();
     }
@@ -392,6 +395,8 @@ struct Stream {
     entry_rows: Vec<usize>,
     flattened: usize,
     dirty_from: usize,
+    /// Rows the flattened transcript held, so a rebuild need not re-sum `entry_rows`.
+    total_rows: usize,
     /// Follow new lines; off while the reader looks at older ones.
     follow: bool,
     /// Lines scrolled up from the bottom while `follow` is off.
@@ -409,6 +414,7 @@ impl Stream {
             entry_rows: Vec::new(),
             flattened: 0,
             dirty_from: 0,
+            total_rows: 0,
             follow: true,
             scroll: 0,
             view: (0, 0),
@@ -441,8 +447,14 @@ impl Stream {
     fn reflatten(&mut self, spinning: usize, expand: bool) {
         let from = self.dirty_from.min(self.entries.len());
         let keep = from.min(self.flattened);
-        let rows = self.entry_rows.iter().take(keep).sum::<usize>();
+        let rows = if keep == self.flattened {
+            self.total_rows
+        } else {
+            let tail: usize = self.entry_rows.iter().skip(keep).take(self.flattened.saturating_sub(keep)).sum();
+            self.total_rows.saturating_sub(tail)
+        };
         self.transcript.truncate(rows);
+        let mut total = rows;
         for index in keep..self.entries.len() {
             let gap = self.gap_before(index);
             self.transcript.extend(std::iter::repeat_n(Line::default(), gap));
@@ -450,9 +462,11 @@ impl Stream {
                 self.entries.get(index).map_or_else(Vec::new, |entry| entry.lines(self.width, spinning, expand));
             if let Some(slot) = self.entry_rows.get_mut(index) {
                 *slot = gap + lines.len();
+                total += *slot;
             }
             self.transcript.extend(lines);
         }
+        self.total_rows = total;
         self.flattened = self.entries.len();
         self.dirty_from = self.entries.len();
     }
@@ -495,9 +509,11 @@ impl Stream {
     }
 
     fn scroll_up(&mut self) {
-        self.follow = false;
         let bottom = self.view.1.saturating_sub(self.view.0);
-        self.scroll = self.scroll.saturating_add(self.page()).min(bottom);
+        if bottom > 0 {
+            self.follow = false;
+            self.scroll = self.scroll.saturating_add(self.page()).min(bottom);
+        }
     }
 
     fn scroll_down(&mut self) {
@@ -508,8 +524,11 @@ impl Stream {
     }
 
     fn scroll_top(&mut self) {
-        self.follow = false;
-        self.scroll = self.view.1.saturating_sub(self.view.0);
+        let bottom = self.view.1.saturating_sub(self.view.0);
+        if bottom > 0 {
+            self.follow = false;
+            self.scroll = bottom;
+        }
     }
 
     fn scroll_bottom(&mut self) {
@@ -521,7 +540,9 @@ impl Stream {
         let bottom = self.view.1.saturating_sub(self.view.0);
         let step = WHEEL_LINES.min(bottom);
         self.scroll = if up {
-            self.follow = false;
+            if bottom > 0 {
+                self.follow = false;
+            }
             self.scroll.saturating_add(step).min(bottom)
         } else {
             self.scroll.saturating_sub(step)
@@ -792,11 +813,20 @@ impl App {
         let live = self.live.take();
         match live.and_then(|index| self.lead.entries.get_mut(index)) {
             Some(entry) if entry.body.trim().is_empty() => entry.body = text,
-            Some(entry) if !entry.body.trim_end().ends_with(text.trim()) && !text.trim().is_empty() => {
-                entry.body.push_str("\n\n");
-                entry.body.push_str(&text);
+            Some(entry) if !text.trim().is_empty() => {
+                let streamed = entry.body.trim_end();
+                let final_text = text.trim();
+                if streamed.starts_with(final_text) {
+                    // The streamed body already holds the final text, perhaps with more.
+                } else if final_text.starts_with(streamed) {
+                    // The streamed body was a prefix: replace it with the full text.
+                    entry.body = text;
+                } else if !streamed.ends_with(final_text) {
+                    // Neither is a prefix of the other: append the final text.
+                    entry.body.push_str("\n\n");
+                    entry.body.push_str(&text);
+                }
             }
-
             Some(_) => {}
             None => self.push(Role::Overseer, String::new(), text),
         }
@@ -841,9 +871,11 @@ impl App {
             self.worker_streams.push(AgentStream { id, stream: Stream::new(), unread: 0 });
             self.worker_streams.len().saturating_sub(1)
         };
-        match self.worker_streams.get_mut(slot) {
-            Some(worker) => &mut worker.stream,
-            None => &mut self.lead,
+        if let Some(worker) = self.worker_streams.get_mut(slot) {
+            &mut worker.stream
+        } else {
+            debug_assert!(false, "the slot was just obtained from this vector");
+            &mut self.lead
         }
     }
 
@@ -890,10 +922,34 @@ impl App {
         self.last_tick = Instant::now();
         self.spinning = self.spinning.wrapping_add(1);
         self.dirty = true;
-        match running {
-            Some((Some(id), index)) => self.worker_stream_mut(id).invalidate(index),
-            Some((None, index)) => self.lead.invalidate(index),
-            None => {}
+        self.invalidate_running_tools();
+    }
+
+    /// Invalidates every in-flight tool entry, so every stream with a call animates its spinner.
+    fn invalidate_running_tools(&mut self) {
+        let lead_indices: Vec<usize> = self
+            .lead
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.role == Role::Tool && entry.output.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        for index in lead_indices {
+            self.lead.invalidate(index);
+        }
+        for worker in &mut self.worker_streams {
+            let indices: Vec<usize> = worker
+                .stream
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.role == Role::Tool && entry.output.is_none())
+                .map(|(index, _)| index)
+                .collect();
+            for index in indices {
+                worker.stream.invalidate(index);
+            }
         }
     }
 
@@ -1523,7 +1579,7 @@ impl App {
     /// Replaces the composer's text with a recalled prompt, caret at its end.
     fn refill(&mut self, text: &str) {
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        let cursor = (lines.len().saturating_sub(1), lines.last().map_or(0, String::len));
+        let cursor = (lines.len().saturating_sub(1), lines.last().map_or(0, |line| line.chars().count()));
         self.composer.set_lines(lines, cursor);
         self.dirty = true;
     }
@@ -1591,10 +1647,11 @@ mod paste_tests {
     /// A file where a real paste writes it, so the chip can drop it: `discard` only removes its own.
     fn pasted() -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join("overseer-attachments");
-        fs::create_dir_all(&dir).expect("the attachments dir");
-        let name = format!("chip-test-{}-{}.png", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
-        let path = dir.join(name);
+        let path = crate::clipboard::pasted(&format!(
+            "chip-test-{}-{}.png",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::write(&path, b"\x89PNG\r\n\x1a\n").expect("a png");
         path
     }
@@ -2176,7 +2233,9 @@ mod tests {
         for index in 0..40 {
             app.apply(UiEvent::Answer(format!("lead line {index}")));
         }
-        app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "agent line".into() });
+        for index in 0..40 {
+            app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Reply, text: format!("agent line {index}") });
+        }
         screen(&mut app, 80, 16);
         app.scroll_up();
         assert!(!app.lead.follow, "the lead stops following when scrolled up");

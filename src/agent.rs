@@ -3,6 +3,14 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Text of the error that means an overseer order ended the turn. No other path may produce this
+/// exact message: a caller matches on it to tell an interrupt from a model or transport failure.
+pub(crate) const INTERRUPTED: &str = "interrupted";
+
+/// Tool rounds one turn may run before it gives up. A model that keeps calling tools otherwise
+/// loops until an overseer interrupt, growing its history with every round.
+const MAX_TOOL_ROUNDS: usize = 200;
+
 /// The model-facing inputs of one turn: the client, the tool schemas it may call, how to run them,
 /// and the flag an overseer order sets to cut the turn short.
 pub(crate) struct Turn<'a> {
@@ -20,10 +28,11 @@ impl Turn<'_> {
     pub(crate) fn run(&mut self, history: &mut Vec<Message>, input: &str) -> Result<String> {
         let base = history.len();
         history.push(Message::user(input));
+        let mut rounds = 0;
         loop {
             if cancelled(self.cancel) {
                 history.truncate(base);
-                bail!("interrupted");
+                bail!(INTERRUPTED);
             }
             let reply = match self.llm.chat(history, self.tool_defs) {
                 Ok(reply) => reply,
@@ -34,9 +43,19 @@ impl Turn<'_> {
             };
             let text = reply.content.clone().unwrap_or_default();
             let asks = reply.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+            // A reply with neither text nor calls is a truncated or filtered answer, not an empty one.
+            if !asks && text.trim().is_empty() {
+                history.truncate(base);
+                bail!("model returned neither text nor tool calls");
+            }
             history.push(reply);
             if !asks {
                 return Ok(text);
+            }
+            rounds += 1;
+            if rounds > MAX_TOOL_ROUNDS {
+                history.truncate(base);
+                bail!("model kept calling tools for {MAX_TOOL_ROUNDS} rounds without answering");
             }
             // Read the calls back out of the committed message: the assistant message must keep them,
             // or the provider cannot match the tool results that follow. The calls are copied out
@@ -47,7 +66,7 @@ impl Turn<'_> {
             for call in &calls {
                 if cancelled(self.cancel) {
                     history.truncate(base);
-                    bail!("interrupted");
+                    bail!(INTERRUPTED);
                 }
                 outputs.push((call.id.clone(), (self.execute)(call)));
             }
@@ -109,6 +128,18 @@ mod tests {
         assert!(turn.run(&mut history, "go").is_err());
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn an_empty_reply_is_an_error_and_leaves_history_untouched() {
+        let empty = Message { role: "assistant".into(), content: None, tool_calls: None, tool_call_id: None };
+        let llm = Scripted::new(vec![empty]);
+        let mut history = vec![Message::system("sys".into())];
+        let mut turn =
+            Turn { llm: &llm, tool_defs: &json!([]), execute: &mut |_: &ToolCall| String::new(), cancel: None };
+        let err = turn.run(&mut history, "go").unwrap_err();
+        assert!(err.to_string().contains("neither text nor tool calls"), "{err}");
+        assert_eq!(history.len(), 1, "an empty reply was committed as an answer");
     }
 
     #[test]

@@ -34,10 +34,6 @@ pub(crate) struct Config {
     pub(crate) home: PathBuf,
 }
 
-/// Where an agent starts when nothing names a directory: the root's configured `dir`, or a child's
-/// `spawn_agent` path.
-pub(crate) const DEFAULT_WORKING_DIR: &str = "/tmp";
-
 /// Delegations allowed below the root when `config.toml` names no `max_depth`.
 pub(crate) const DEFAULT_MAX_DEPTH: usize = 3;
 
@@ -88,14 +84,20 @@ pub(crate) const DEBUG: &str = "OVERSEER_DEBUG";
 /// Environment variable that forces line mode even on a terminal.
 pub(crate) const PLAIN: &str = "OVERSEER_PLAIN";
 
+/// `$XDG_*_HOME` is absolute by spec: a relative value would put config and logs under the CWD.
 fn xdg(var: &str, fallback: &str, home: &Path) -> PathBuf {
-    env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(fallback), PathBuf::from)
+    env::var_os(var).map(PathBuf::from).filter(|value| value.is_absolute()).unwrap_or_else(|| home.join(fallback))
 }
 
 pub(crate) fn load(home: &Path) -> Result<Config> {
     let path = path(home);
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}; create it with:\n{EXAMPLE}", path.display()))?;
+    let text = fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::Error::msg(format!("cannot read {}; create it with:\n{EXAMPLE}", path.display()))
+        } else {
+            anyhow::Error::new(e).context(format!("cannot read {}", path.display()))
+        }
+    })?;
     parse(&text, home).with_context(|| format!("invalid config {}", path.display()))
 }
 
@@ -103,6 +105,9 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     let raw: RawConfig = toml::from_str(text)?;
     if raw.roots.is_empty() {
         bail!("roots is empty");
+    }
+    if raw.base_url.trim().is_empty() || raw.model.trim().is_empty() {
+        bail!("base_url and model must not be empty");
     }
     let mut roots = Vec::new();
     for root in &raw.roots {
@@ -114,7 +119,8 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots.push(canonical);
     }
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
-    let dir = resolve_dir(raw.dir.as_deref().unwrap_or(DEFAULT_WORKING_DIR), home).map_err(anyhow::Error::msg)?;
+    // The root works in the user's home, not in the world-writable directory a child falls back to.
+    let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
     Ok(Config {
         roots,
         base_url: raw.base_url,
@@ -136,10 +142,18 @@ fn expand_home(path: &str, home: &Path) -> PathBuf {
 
 /// Canonical directory a worker works in, or why the path is unusable.
 pub(crate) fn resolve_dir(path: &str, home: &Path) -> Result<PathBuf, String> {
+    canonical_dir(path, home).map_err(|error| format!("{error}"))
+}
+
+/// As [`resolve_dir`], typed so `parse` keeps the OS error chain.
+fn canonical_dir(path: &str, home: &Path) -> Result<PathBuf> {
     let expanded = expand_home(path, home);
-    let canonical = fs::canonicalize(&expanded).map_err(|e| io_error(expanded.display(), &e))?;
+    let canonical = fs::canonicalize(&expanded).map_err(|e| {
+        let message = io_error(expanded.display(), &e);
+        anyhow::Error::new(e).context(message)
+    })?;
     if !canonical.is_dir() {
-        return Err(format!("{} is not a directory", canonical.display()));
+        bail!("{} is not a directory", canonical.display());
     }
     Ok(canonical)
 }
@@ -172,6 +186,8 @@ mod tests {
         );
         assert!(parse(&format!("roots = [\"/\"]\n{rest}\ntypo = 1"), home.path()).is_err());
         assert!(parse("roots = [\"/\"]\nmodel = \"m\"", home.path()).unwrap_err().to_string().contains("base_url"));
+        let blank = parse("roots = [\"/\"]\nbase_url = \" \"\nmodel = \"m\"", home.path()).unwrap_err().to_string();
+        assert!(blank.contains("must not be empty"), "{blank}");
     }
 
     #[test]
@@ -210,13 +226,14 @@ mod tests {
 
     #[test]
     fn depth_and_root_directory_default_when_absent() {
+        let home = tempfile::tempdir().unwrap();
         let text = r#"roots = ["/tmp"]
 base_url = "http://localhost:8080/v1"
 model = "m""#;
-        let resolved = parse(text, Path::new("/Users/nobody")).unwrap();
+        let resolved = parse(text, home.path()).unwrap();
         assert_eq!(resolved.max_depth, DEFAULT_MAX_DEPTH);
         assert_eq!(DEFAULT_MAX_DEPTH, 3);
-        assert_eq!(resolved.dir, fs::canonicalize(DEFAULT_WORKING_DIR).unwrap());
+        assert_eq!(resolved.dir, fs::canonicalize(home.path()).unwrap());
     }
 
     #[test]

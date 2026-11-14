@@ -4,12 +4,17 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.100"
 publish = false
+description = "Rust CLI agent swarm"
+repository = "https://github.com/Ephasme/overseer"
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = { version = "3", default-features = false }
+# No image-data (pulls in image, objc2-core-*): the clipboard only moves text. Without wayland-data-control the
+# Wayland backend is dropped too and paste silently fails on a pure Wayland session.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
 dotenvy = "0.15.7"
+getrandom = "0.3"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }

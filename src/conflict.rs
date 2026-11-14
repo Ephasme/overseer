@@ -8,6 +8,7 @@ use crate::config;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Prefix that makes a tool path a conflict reference rather than a file.
@@ -15,9 +16,6 @@ pub(crate) const SCHEME: &str = "conflict://";
 
 /// Suffix that lists a file's blocks without printing its text.
 pub(crate) const LIST_SUFFIX: &str = ":conflicts";
-
-/// Widest run of lines a replacement may repeat from around the block before they are dropped.
-const CONTEXT: usize = 12;
 
 const OPEN: &str = "<<<<<<<";
 const BASE: &str = "|||||||";
@@ -56,7 +54,6 @@ struct Outcome {
     path: PathBuf,
     display: String,
     range: String,
-    dropped: usize,
 }
 
 impl Registry {
@@ -122,7 +119,7 @@ impl Registry {
             );
         }
         out.push_str(
-            "`content` may be a literal replacement or @ours / @theirs / @both. Many at once: `write_file({ \"path\": \"conflict://*\", \"content\": \"1: @ours\\n2: @theirs\" })`. Inspect one: `read_file({ \"path\": \"conflict://<N>\" })`, or `/ours`, `/theirs`, `/base` for a single side.\n",
+            "`content` may be a literal replacement or @ours / @theirs / @both; write a literal that starts with `@` as `@@…`. Many at once: `write_file({ \"path\": \"conflict://*\", \"content\": \"1: @ours\\n2: @theirs\" })`. Inspect one: `read_file({ \"path\": \"conflict://<N>\" })`, or `/ours`, `/theirs`, `/base` for a single side.\n",
         );
         out
     }
@@ -182,13 +179,6 @@ impl Registry {
         }
         let outcome = self.apply(id, content)?;
         let mut out = format!("resolved conflict #{} at {} in {}", id, outcome.range, outcome.display);
-        if outcome.dropped > 0 {
-            let _ = write!(
-                out,
-                "\nnote: dropped {} replacement line(s) that repeated the code around the block — a write replaces only the marker block",
-                outcome.dropped
-            );
-        }
         let summary = self.summary(&outcome.path);
         if !summary.is_empty() {
             out.push('\n');
@@ -211,9 +201,17 @@ impl Registry {
         if let Some(missing) = plan.iter().map(|(id, _)| *id).find(|id| self.get(*id).is_none()) {
             return Err(self.unknown(missing));
         }
+        // Validate the whole plan before the first write, so a bad entry cannot leave a partial batch.
+        for (id, side) in &plan {
+            if side == "@base" && self.get(*id).is_some_and(|block| block.base.is_none()) {
+                return Err(format!("conflict #{id} has no base section (a 2-way merge): use @ours, @theirs or @both"));
+            }
+        }
         let mut done = Vec::new();
         for (id, side) in &plan {
-            self.apply(*id, side)?;
+            if let Err(e) = self.apply(*id, side) {
+                return Err(if done.is_empty() { e } else { format!("{e}\nafter resolving {}", done.join(", ")) });
+            }
             done.push(format!("#{id}"));
         }
         let mut out = format!("resolved {} conflict(s): {}", done.len(), done.join(", "));
@@ -230,12 +228,30 @@ impl Registry {
         let block = self.get(id).ok_or_else(|| self.unknown(id))?.clone();
         let text = fs::read_to_string(&block.path).map_err(|e| config::io_error(&block.display, &e))?;
         let replacement = pick(&block, content)?;
-        let (updated, dropped) = splice(&text, &block, &replacement)?;
-        fs::write(&block.path, &updated).map_err(|e| config::io_error(&block.display, &e))?;
+        let updated = splice(&text, &block, &replacement)?;
+        write_atomic(&block.path, &updated).map_err(|e| config::io_error(&block.display, &e))?;
         self.reconcile(&block.path, &block.display, &updated);
         let range = range(&block);
-        Ok(Outcome { path: block.path, display: block.display, range, dropped })
+        Ok(Outcome { path: block.path, display: block.display, range })
     }
+}
+
+/// Replaces `path`'s contents atomically: a crash mid-write leaves the old file whole.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().map_or_else(|| "file".to_string(), |name| name.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.overseer-{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A block as it sits in the file, before it is given an id.
@@ -295,7 +311,9 @@ fn scan(text: &str) -> Vec<Scanned> {
             index += 1;
         }
         let Some(end) = closed else {
-            break;
+            // A stray marker must not hide the well-formed blocks that follow it.
+            index = start + 1;
+            continue;
         };
         let raw: Vec<String> =
             lines.get(start..=end).unwrap_or_default().iter().map(|line| (*line).to_string()).collect();
@@ -353,8 +371,14 @@ fn side<'a>(block: &'a Block, scope: &str) -> Result<&'a [String], String> {
 }
 
 /// The replacement a write asks for: one of the shorthand tokens, or the literal content.
+///
+/// A literal that would read as a token is written with a doubled `@`: `@@ours` is the text `@ours`.
 fn pick(block: &Block, content: &str) -> Result<Vec<String>, String> {
-    match content.trim() {
+    let trimmed = content.trim();
+    if let Some(literal) = trimmed.strip_prefix("@@") {
+        return Ok(body(&format!("@{literal}")));
+    }
+    match trimmed {
         "@ours" => Ok(block.ours.clone()),
         "@theirs" => Ok(block.theirs.clone()),
         "@both" => Ok(block.ours.iter().chain(&block.theirs).cloned().collect()),
@@ -375,12 +399,11 @@ fn body(content: &str) -> Vec<String> {
     lines
 }
 
-/// Replaces the block's marker lines in `text`, and reports how many replacement lines repeated
-/// the code around the block and were dropped.
-fn splice(text: &str, block: &Block, replacement: &[String]) -> Result<(String, usize), String> {
+/// Replaces the block's marker lines in `text` with `replacement`, verbatim.
+fn splice(text: &str, block: &Block, replacement: &[String]) -> Result<String, String> {
     let crlf = text.split('\n').next().is_some_and(|line| line.ends_with('\r'));
     let lines: Vec<&str> = text.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
-    let start = find(&lines, &block.raw).ok_or_else(|| {
+    let start = find(&lines, &block.raw, block.start.saturating_sub(1)).ok_or_else(|| {
         format!(
             "conflict #{} is no longer in {}: the file changed since the block was registered, so read it again",
             block.id, block.display
@@ -389,41 +412,22 @@ fn splice(text: &str, block: &Block, replacement: &[String]) -> Result<(String, 
     let end = start + block.raw.len();
     let before = lines.get(..start).unwrap_or_default();
     let after = lines.get(end..).unwrap_or_default();
-    let (lead, trail) = overlap(replacement, before, after);
-    let kept = replacement.get(lead..replacement.len().saturating_sub(trail)).unwrap_or_default();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + kept.len());
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + replacement.len());
     out.extend(before);
-    out.extend(kept.iter().map(String::as_str));
+    out.extend(replacement.iter().map(String::as_str));
     out.extend(after);
-    Ok((out.join(if crlf { "\r\n" } else { "\n" }), lead + trail))
+    Ok(out.join(if crlf { "\r\n" } else { "\n" }))
 }
 
-/// Where `raw` sits in `lines`, as a start index.
-fn find(lines: &[&str], raw: &[String]) -> Option<usize> {
+/// Where `raw` sits in `lines`, as a start index, preferring the occurrence nearest `expected` so
+/// two identical blocks resolve to the place their id was registered at.
+fn find(lines: &[&str], raw: &[String], expected: usize) -> Option<usize> {
     if raw.is_empty() || raw.len() > lines.len() {
         return None;
     }
     (0..=lines.len() - raw.len())
-        .find(|start| lines.iter().skip(*start).zip(raw).all(|(line, want)| *line == want.as_str()))
-}
-
-/// The runs of `replacement` that repeat the lines just before and just after the block.
-fn overlap(replacement: &[String], before: &[&str], after: &[&str]) -> (usize, usize) {
-    let replace: Vec<&str> = replacement.iter().map(String::as_str).collect();
-    let widest = CONTEXT.min(before.len()).min(replace.len());
-    let lead = (1..=widest).rev().find(|count| tail(before, *count) == head(&replace, *count)).unwrap_or(0);
-    let rest = replace.get(lead..).unwrap_or_default();
-    let widest = CONTEXT.min(after.len()).min(rest.len());
-    let trail = (1..=widest).rev().find(|count| head(after, *count) == tail(rest, *count)).unwrap_or(0);
-    (lead, trail)
-}
-
-fn head<'a>(lines: &[&'a str], count: usize) -> Vec<&'a str> {
-    lines.iter().take(count).copied().collect()
-}
-
-fn tail<'a>(lines: &[&'a str], count: usize) -> Vec<&'a str> {
-    lines.iter().skip(lines.len().saturating_sub(count)).copied().collect()
+        .filter(|start| lines.iter().skip(*start).zip(raw).all(|(line, want)| *line == want.as_str()))
+        .min_by_key(|start| start.abs_diff(expected))
 }
 
 /// `<id>: @side` lines a bulk write may carry.
@@ -548,13 +552,48 @@ fn tail() {}
     }
 
     #[test]
-    fn repeated_context_is_dropped_not_duplicated() {
+    fn a_replacement_that_repeats_context_is_written_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         let (mut registry, file) = registry(dir.path());
         let content = "use a;\n\nlet x = 9;\n\nfn tail() {}\n";
-        let out = registry.write("1", content).unwrap();
-        assert!(out.contains("dropped 4 replacement line(s)"), "{out}");
-        assert_eq!(fs::read_to_string(&file).unwrap(), "use a;\n\nlet x = 9;\n\nfn tail() {}\n");
+        registry.write("1", content).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "use a;\n\nuse a;\n\nlet x = 9;\n\nfn tail() {}\n\nfn tail() {}\n",
+            "no line the model wrote is dropped"
+        );
+    }
+
+    #[test]
+    fn a_literal_that_reads_as_a_token_is_escaped_with_a_doubled_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut registry, file) = registry(dir.path());
+        registry.write("1", "@@ours").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "use a;\n\n@ours\n\nfn tail() {}\n");
+    }
+
+    #[test]
+    fn two_identical_blocks_resolve_where_their_id_was_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("same.rs");
+        let block = "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> other\n";
+        let text = format!("{block}\n{block}");
+        fs::write(&file, &text).unwrap();
+        let mut registry = Registry::default();
+        registry.reconcile(&file, "same.rs", &text);
+        assert_eq!(registry.blocks.len(), 2);
+        registry.write("2", "@theirs").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), format!("{block}\nb\n"));
+    }
+
+    #[test]
+    fn a_bulk_write_validates_every_entry_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut registry, file) = registry(dir.path());
+        let before = fs::read_to_string(&file).unwrap();
+        let out = registry.write("*", "1: @base").unwrap_err();
+        assert!(out.contains("no base section"), "{out}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), before, "nothing was written");
     }
 
     #[test]

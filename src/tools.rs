@@ -31,17 +31,28 @@ const MAX_SCAN_BYTES: u64 = 8 << 20;
 /// A command that outlives this is killed: one stuck worker must not stall the fleet forever.
 const BASH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long the pipes may stay open after the command itself exited: a child it backgrounded
+/// inherits them, and joining its drain would wait for that child.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 /// Process groups running right now, so quitting overseer does not leave a `cargo build` behind.
 ///
-/// A group is deregistered before its command is reaped, so a recycled pid cannot be killed by name.
+/// A group is deregistered the moment its command is reaped: that is the first moment its id may be
+/// handed to another process, and `kill_running` must never signal one that is not ours.
 static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 fn groups() -> MutexGuard<'static, Vec<i32>> {
     GROUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn register(group: i32) {
-    groups().push(group);
+/// Spawns `command` and registers its process group while holding the registry lock, so a sweep
+/// cannot drain the list between the start and the registration and leave the command behind.
+fn spawn_grouped(command: &mut Command) -> Result<(Child, i32), String> {
+    let mut live = groups();
+    let child = command.spawn().map_err(|e| e.to_string())?;
+    let group = i32::try_from(child.id()).map_err(|e| e.to_string())?;
+    live.push(group);
+    Ok((child, group))
 }
 
 fn deregister(group: i32) {
@@ -61,11 +72,11 @@ pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
 /// Programs a read-only worker may still run.
-const READ_ONLY_PROGRAMS: &[&str] =
+pub(crate) const READ_ONLY_PROGRAMS: &[&str] =
     &["ls", "cat", "head", "tail", "wc", "stat", "file", "tree", "pwd", "rg", "grep", "diff", "jq", "git"];
 
 /// `git` subcommands a read-only worker may run; everything else writes to the repository.
-const READ_ONLY_GIT: &[&str] = &[
+pub(crate) const READ_ONLY_GIT: &[&str] = &[
     "status",
     "log",
     "diff",
@@ -82,23 +93,46 @@ const READ_ONLY_GIT: &[&str] = &[
     "tag",
 ];
 
+/// `git` subcommands that list on flags alone; a bare word after them names a branch, a tag or a
+/// remote to write (`git branch topic`, `git tag v1`, `git remote add`).
+const GIT_LISTING: &[&str] = &["branch", "remote", "tag"];
+
+/// Arguments that make another listed program write a file or run a program of its own.
+const WRITING_ARGS: &[(&str, &[&str])] = &[
+    ("git", &["--output"]),
+    ("rg", &["--pre", "--hostname-bin"]),
+    ("file", &["-C", "--compile"]),
+    ("tree", &["-o", "--output"]),
+    ("diff", &["-o", "--output"]),
+];
+
 /// Shell syntax that writes, feeds a program or hides what runs.
 const WRITING_SHELL: &[&str] = &[">", "<", ";", "&&", "||", "&", "`", "$(", "\n"];
 
+/// Shell syntax a word-based command rule cannot see through, so a policy with rules refuses it:
+/// `ls; rm -rf x` names its program `ls` to a rule and runs two.
+const SHELL_SYNTAX: &[&str] = &[";", "|", "&", ">", "<", "`", "$(", "\n"];
+
+/// Programs that hand the command to the program named after them, for a command rule.
+const WRAPPERS: &[&str] = &["env", "command", "exec", "nohup", "nice", "time", "timeout", "sudo"];
+
 /// What one worker may do, as Overseer set it.
 ///
-/// A guard, not a sandbox: a `bash` command is matched as text, so the lists are only as good as
-/// they are tight. Workers already run unsandboxed, with the user's own rights.
+/// A guard, not a sandbox: a `bash` command is matched word by word, so the lists are only as good
+/// as they are tight. Workers already run unsandboxed, with the user's own rights.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Policy {
     /// `write_file` is refused and `bash` runs only `READ_ONLY_PROGRAMS`.
     pub(crate) read_only: bool,
     /// Tool names this worker may never call.
     pub(crate) deny_tools: Vec<String>,
-    /// When non-empty, a `bash` command must start with one of these.
+    /// When non-empty, a `bash` command's program word must match one of these.
     pub(crate) allow_commands: Vec<String>,
-    /// A `bash` command that starts with one of these never runs. Deny beats allow.
+    /// A `bash` command whose program word matches one of these never runs. Deny beats allow.
     pub(crate) deny_commands: Vec<String>,
+    /// Every `bash` command is refused. Two allow lists that share nothing allow nothing, and an
+    /// empty `allow_commands` already means "no restriction", so the refusal needs its own flag.
+    pub(crate) deny_all_commands: bool,
 }
 
 impl Policy {
@@ -115,14 +149,16 @@ impl Policy {
             deny_tools: deny_tools.unwrap_or_else(|| self.deny_tools.clone()),
             allow_commands: allow_commands.unwrap_or_else(|| self.allow_commands.clone()),
             deny_commands: deny_commands.unwrap_or_else(|| self.deny_commands.clone()),
+            deny_all_commands: self.deny_all_commands,
         }
     }
 
     /// The policy a spawned agent is born with: this one, tightened by `given` and never loosened.
     ///
     /// `read_only` sticks, deny lists are unioned, and two allow lists intersect — a child of a
-    /// restricted agent cannot be handed back a capability the owner refused. Called once, on the
-    /// spawn path: an agent's policy never changes after that.
+    /// restricted agent cannot be handed back a capability the owner refused. An intersection that
+    /// leaves nothing allows nothing, rather than reading as an absent allow list. Called once, on
+    /// the spawn path: an agent's policy never changes after that.
     pub(crate) fn inherit(&self, given: &Self) -> Self {
         let mut deny_tools = self.deny_tools.clone();
         for tool in &given.deny_tools {
@@ -130,20 +166,31 @@ impl Policy {
                 deny_tools.push(tool.clone());
             }
         }
-        let allow_commands = if self.allow_commands.is_empty() {
+        let allow_commands = if self.deny_all_commands || given.deny_all_commands {
+            Vec::new()
+        } else if self.allow_commands.is_empty() {
             given.allow_commands.clone()
         } else if given.allow_commands.is_empty() {
             self.allow_commands.clone()
         } else {
             self.allow_commands.iter().filter(|allowed| given.allow_commands.contains(allowed)).cloned().collect()
         };
+        let deny_all_commands = self.deny_all_commands
+            || given.deny_all_commands
+            || (!self.allow_commands.is_empty() && !given.allow_commands.is_empty() && allow_commands.is_empty());
         let mut deny_commands = self.deny_commands.clone();
         for command in &given.deny_commands {
             if !deny_commands.contains(command) {
                 deny_commands.push(command.clone());
             }
         }
-        Self { read_only: self.read_only || given.read_only, deny_tools, allow_commands, deny_commands }
+        Self {
+            read_only: self.read_only || given.read_only,
+            deny_tools,
+            allow_commands,
+            deny_commands,
+            deny_all_commands,
+        }
     }
 
     /// The restriction lines a worker reads in its prompt; empty when nothing is restricted.
@@ -159,8 +206,11 @@ impl Policy {
         if !self.deny_tools.is_empty() {
             lines.push(format!("- banned tools: {}.", self.deny_tools.join(" ")));
         }
+        if self.deny_all_commands {
+            lines.push("- bash runs nothing: your allow list and your owner's share no command.".into());
+        }
         if !self.allow_commands.is_empty() {
-            lines.push(format!("- bash commands must start with one of: {}.", self.allow_commands.join(" · ")));
+            lines.push(format!("- bash commands must match one of: {}.", self.allow_commands.join(" · ")));
         }
         if !self.deny_commands.is_empty() {
             lines.push(format!("- banned bash commands: {}.", self.deny_commands.join(" · ")));
@@ -190,18 +240,61 @@ impl Policy {
         if name != BASH {
             return None;
         }
+        if self.deny_all_commands {
+            return Some("this agent runs no bash command: its allow list and its owner's share none".into());
+        }
         // Bad arguments are the dispatcher's error to report, not a policy decision.
         let Ok(args) = serde_json::from_str::<BashArgs>(arguments) else { return None };
         let command = args.command.trim();
-        if let Some(rule) = self.deny_commands.iter().find(|rule| command.starts_with(rule.as_str())) {
-            return Some(format!("this agent may not run commands starting with `{rule}`"));
-        }
-        if !self.allow_commands.is_empty() && !self.allow_commands.iter().any(|rule| command.starts_with(rule.as_str()))
+        // A rule names words, and only a shell can see past them: `ls; rm -rf x` starts with `ls`.
+        if (!self.allow_commands.is_empty() || !self.deny_commands.is_empty())
+            && let Some(token) = SHELL_SYNTAX.iter().find(|token| command.contains(*token))
         {
+            return Some(format!("this agent's command rules do not cover shell syntax `{token}`"));
+        }
+        let words = rule_words(command);
+        if let Some(rule) = self.deny_commands.iter().find(|rule| rule_matches(&words, rule)) {
+            return Some(format!("this agent may not run `{rule}`"));
+        }
+        if !self.allow_commands.is_empty() && !self.allow_commands.iter().any(|rule| rule_matches(&words, rule)) {
             return Some(format!("this agent runs only: {}", self.allow_commands.join(" · ")));
         }
         self.read_only.then(|| read_only_refusal(command)).flatten()
     }
+}
+
+/// `path`'s last component: a rule never tells `/bin/rm` and `rm` apart.
+fn file_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// The words a command rule matches: the program reduced to its file name, with leading
+/// `VAR=value` assignments, wrapper programs and their flags skipped, then its arguments. So
+/// `/bin/rm`, `env rm` and `X=1 rm` all read as `rm`.
+fn rule_words(command: &str) -> Vec<&str> {
+    let mut words = command.split_whitespace();
+    let program = words.by_ref().find_map(|word| {
+        let name = file_name(word);
+        let assignment = word.contains('=') && !word.starts_with('-');
+        (!assignment && !WRAPPERS.contains(&name) && !word.starts_with('-')).then_some(name)
+    });
+    program.into_iter().chain(words).collect()
+}
+
+/// Whether the command's program and arguments start with the rule's words.
+fn rule_matches(words: &[&str], rule: &str) -> bool {
+    let mut expected = rule.split_whitespace();
+    let Some(program) = expected.next() else { return false };
+    let mut command = words.iter();
+    if command.next().copied() != Some(file_name(program)) {
+        return false;
+    }
+    expected.all(|word| command.next().copied() == Some(word))
+}
+
+/// Whether `word` is `flags` entry `flag`, bare or carrying a value (`--output=x`).
+fn names_flag(flags: &[&str], word: &str) -> bool {
+    flags.iter().any(|flag| *flag == word || word.strip_prefix(flag).is_some_and(|rest| rest.starts_with('=')))
 }
 
 /// Why this command is not read-only, or `None` when every pipeline segment is.
@@ -223,6 +316,17 @@ fn read_only_refusal(command: &str) -> Option<String> {
             if !READ_ONLY_GIT.contains(&sub) {
                 return Some(format!("this agent is read-only: `git {sub}` writes ({})", READ_ONLY_GIT.join(" ")));
             }
+            // These three list on flags alone: a bare word names a branch, a tag or a remote to write.
+            if GIT_LISTING.contains(&sub)
+                && let Some(arg) = words.iter().skip(2).copied().find(|arg| !arg.starts_with('-'))
+            {
+                return Some(format!("this agent is read-only: `git {sub} {arg}` names what to write"));
+            }
+        }
+        if let Some(writing) = WRITING_ARGS.iter().find(|entry| entry.0 == *program).map(|entry| entry.1)
+            && let Some(arg) = words.iter().skip(1).copied().find(|arg| names_flag(writing, arg))
+        {
+            return Some(format!("this agent is read-only: `{program} {arg}` writes"));
         }
     }
     None
@@ -405,26 +509,34 @@ enum Stopped {
 fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<String, String> {
     // Its own process group, so a timeout kills the command's children too: killing `sh` alone leaves a
     // grandchild holding the pipes open, and reading their output then blocks until it exits by itself.
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&args.command)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let group = i32::try_from(child.id()).map_err(|e| e.to_string())?;
+        .process_group(0);
+    let (mut child, group) = spawn_grouped(&mut command)?;
     // Both pipes are drained by their own thread, so a chatty command cannot fill a pipe and stall.
-    register(group);
     let mut stdout = drain(child.stdout.take());
     let mut stderr = drain(child.stderr.take());
-    let waited = wait_with_deadline(&mut child, group, timeout, cancel);
+    let (status, stopped) = match wait_with_deadline(&mut child, group, timeout, cancel) {
+        Ok(done) => done,
+        Err(e) => {
+            // The command may still be running: nothing else would kill it once it is deregistered.
+            let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+            deregister(group);
+            return Err(e);
+        }
+    };
+    // Still registered: a `sleep 300 &` the command left behind holds these pipes, and only the
+    // group kill below makes their drains finish.
+    let drain_by = Instant::now() + DRAIN_GRACE;
+    let (out, out_cut) = stdout.take_output(drain_by, group);
+    let (err, err_cut) = stderr.take_output(drain_by, group);
     deregister(group);
-    let (status, stopped) = waited?;
-    let (out, out_cut) = stdout.take_output();
-    let (err, err_cut) = stderr.take_output();
     Ok(format_output(status, stopped, timeout, (&out, out_cut), (&err, err_cut)))
 }
 
@@ -488,8 +600,18 @@ struct Drain(Option<thread::JoinHandle<(Vec<u8>, bool)>>);
 
 impl Drain {
     /// The bytes kept, and whether the stream held more than were kept.
-    fn take_output(&mut self) -> (Vec<u8>, bool) {
-        self.0.take().and_then(|handle| handle.join().ok()).unwrap_or_default()
+    ///
+    /// Waits for the pipe to close until `deadline`, then kills the leftover process group: a child
+    /// the command backgrounded inherited the pipe, and joining it would never return.
+    fn take_output(&mut self, deadline: Instant, group: i32) -> (Vec<u8>, bool) {
+        let Some(handle) = self.0.take() else { return (Vec::new(), false) };
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !handle.is_finished() {
+            let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+        }
+        handle.join().unwrap_or_default()
     }
 }
 
@@ -713,6 +835,22 @@ mod tests {
     }
 
     #[test]
+    fn allow_lists_that_share_nothing_refuse_every_command() {
+        let owner = Policy { allow_commands: vec!["git".into()], ..Policy::default() };
+        let asked = Policy { allow_commands: vec!["cargo".into()], ..Policy::default() };
+        let inherited = owner.inherit(&asked);
+        assert!(inherited.deny_all_commands, "an empty intersection read as an absent allow list");
+        assert_eq!(inherited.allow_commands, Vec::<String>::new());
+        let dir = tempfile::tempdir().unwrap();
+        let command = json!({"command": "git status"}).to_string();
+        let out = guarded(dir.path(), BASH, &command, &inherited, None, &mut registry());
+        assert!(out.starts_with("error: this agent runs no bash command"), "{out}");
+        // A child of a deny-all agent stays deny-all, whatever allow list it asks for.
+        let looser = inherited.inherit(&Policy { allow_commands: vec!["ls".into()], ..Policy::default() });
+        assert!(looser.deny_all_commands);
+    }
+
+    #[test]
     fn a_denied_spawn_agent_survives_inheritance() {
         let owner = Policy { deny_tools: vec!["spawn_agent".into()], ..Policy::default() };
         let inherited = owner.inherit(&Policy::default());
@@ -860,6 +998,30 @@ mod tests {
     }
 
     #[test]
+    fn a_backgrounded_child_does_not_hold_the_call_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conflicts = conflict::Registry::default();
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let context = Context { skills: &skills, mcp: &mcp };
+        let started = Instant::now();
+        // `sh` exits at once; the child it left behind inherits both pipes, so only the group kill
+        // DRAIN_GRACE allows can close them.
+        let out = outcome(run(
+            dir.path(),
+            BASH,
+            r#"{"command":"sleep 300 &"}"#,
+            &mut conflicts,
+            Duration::from_millis(200),
+            None,
+            &context,
+        ));
+        assert!(out.contains("exit code: 0"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(20), "the call waited on the backgrounded child");
+    }
+
+    #[test]
     fn kill_running_stops_a_command_in_flight() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("pid");
@@ -906,6 +1068,34 @@ mod tests {
         assert!(!out.starts_with("error:"), "a read-only pipeline was refused: {out}");
     }
 
+    /// A subcommand or a flag that writes must not pass as read-only: listing `git` subcommands and
+    /// the programs with a writing option are the ways around a list of program names.
+    #[test]
+    fn read_only_refuses_writing_subcommands_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy { read_only: true, ..Policy::default() };
+        for command in [
+            "git branch -D feature",
+            "git branch topic",
+            "git remote add origin url",
+            "git tag -d v1",
+            "git tag v1",
+            "git diff --output=x",
+            "rg --pre 'sh -c id' needle",
+            "file -C -m out src",
+            "tree -o out.md",
+        ] {
+            let args = json!({"command": command}).to_string();
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            assert!(out.starts_with("error: this agent is read-only"), "`{command}` ran: {out}");
+        }
+        for command in ["git branch --merged", "git remote -v", "git tag -l", "git log --oneline -5"] {
+            let args = json!({"command": command}).to_string();
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            assert!(!out.starts_with("error: this agent is read-only"), "`{command}` was refused: {out}");
+        }
+    }
+
     #[test]
     fn denied_tools_and_commands_never_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -914,6 +1104,7 @@ mod tests {
             deny_tools: vec![READ_FILE.into()],
             allow_commands: vec!["ls".into(), "echo".into()],
             deny_commands: vec!["echo secret".into()],
+            deny_all_commands: false,
         };
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
@@ -923,7 +1114,7 @@ mod tests {
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
             guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
-            "error: this agent may not run commands starting with `echo secret`"
+            "error: this agent may not run `echo secret`"
         );
         let outside = json!({"command": "pwd"}).to_string();
         assert_eq!(
@@ -932,6 +1123,28 @@ mod tests {
         );
         let allowed = json!({"command": "ls"}).to_string();
         assert!(!guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
+    }
+
+    /// A rule names words: what a text prefix would let through must be refused, and what hides the
+    /// program behind a path or a wrapper must not.
+    #[test]
+    fn a_command_rule_matches_words_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let only_ls = Policy { allow_commands: vec!["ls".into()], ..Policy::default() };
+        for command in ["lsof", "ls; rm -rf x", "ls | sh", "ls && id"] {
+            let args = json!({"command": command}).to_string();
+            let out = guarded(dir.path(), BASH, &args, &only_ls, None, &mut registry());
+            assert!(out.starts_with("error:"), "`{command}` passed an `ls` rule: {out}");
+        }
+        let wrapped = json!({"command": "env ls"}).to_string();
+        assert!(!guarded(dir.path(), BASH, &wrapped, &only_ls, None, &mut registry()).starts_with("error:"));
+
+        let no_rm = Policy { deny_commands: vec!["rm".into()], ..Policy::default() };
+        for command in ["env rm -rf x", "/bin/rm -rf x", "X=1 rm -rf x"] {
+            let args = json!({"command": command}).to_string();
+            let out = guarded(dir.path(), BASH, &args, &no_rm, None, &mut registry());
+            assert!(out.starts_with("error: this agent may not run `rm`"), "`{command}` ran: {out}");
+        }
     }
 
     #[test]

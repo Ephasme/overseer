@@ -2,17 +2,21 @@
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::{LazyLock, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Longest a `!command` header or environment value may take.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest a killed `!command` may take to be reaped before it is abandoned.
+const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long a failed `!command` is remembered before it is tried again.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -26,7 +30,7 @@ pub(crate) fn path(home: &Path) -> PathBuf {
 }
 
 /// One server's OAuth settings, as the file declares them.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct OAuthConfig {
     pub(crate) client_id: Option<String>,
     pub(crate) client_secret: Option<String>,
@@ -37,9 +41,23 @@ pub(crate) struct OAuthConfig {
     pub(crate) prompt: Option<String>,
 }
 
+impl fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| super::REDACTED))
+            .field("scope", &self.scope)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("callback_port", &self.callback_port)
+            .field("callback_path", &self.callback_path)
+            .field("prompt", &self.prompt)
+            .finish()
+    }
+}
+
 /// One server's static token settings; `credentialId` is accepted and ignored, because credentials
 /// are keyed by the server URL instead.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AuthConfig {
     pub(crate) token_url: Option<String>,
     pub(crate) client_id: Option<String>,
@@ -47,7 +65,18 @@ pub(crate) struct AuthConfig {
     pub(crate) resource: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| super::REDACTED))
+            .field("resource", &self.resource)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) enum Transport {
     Stdio {
         command: String,
@@ -63,7 +92,28 @@ pub(crate) enum Transport {
     },
 }
 
-#[derive(Debug, Clone)]
+/// Environment values and headers are secrets: their names are printed, never their contents.
+impl fmt::Debug for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Transport::Stdio { command, args, env, cwd } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("env", &env.keys().collect::<Vec<&String>>())
+                .field("cwd", cwd)
+                .finish(),
+            Transport::Http { url, headers, legacy_sse } => f
+                .debug_struct("Http")
+                .field("url", url)
+                .field("headers", &headers.keys().collect::<Vec<&String>>())
+                .field("legacy_sse", legacy_sse)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ServerConfig {
     pub(crate) name: String,
     pub(crate) transport: Transport,
@@ -73,6 +123,19 @@ pub(crate) struct ServerConfig {
     pub(crate) instructions: bool,
     pub(crate) oauth: Option<OAuthConfig>,
     pub(crate) auth: Option<AuthConfig>,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("timeout", &self.timeout)
+            .field("instructions", &self.instructions)
+            .field("oauth", &self.oauth)
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -151,7 +214,11 @@ pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String)>>;
 /// Reads the server list; a missing file is an empty list, an unreadable one is one failure.
 pub(crate) fn discover(home: &Path) -> Discovery {
     let file = path(home);
-    let Ok(text) = fs::read_to_string(&file) else { return Vec::new() };
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return vec![Err(("mcp.json".to_string(), format!("{}: {e}", file.display())))],
+    };
     let raw: RawFile = match serde_json::from_str(&text) {
         Ok(raw) => raw,
         Err(e) => return vec![Err(("mcp.json".to_string(), format!("{}: {e}", file.display())))],
@@ -298,17 +365,27 @@ pub(crate) fn resolve_value(value: &str) -> Option<String> {
     let Some(command) = value.strip_prefix('!') else {
         return Some(env_value(value).unwrap_or_else(|| value.to_string()));
     };
-    let mut known = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = known.get(command) {
-        // A value that worked is kept for the process's lifetime; a failure is retried, but not
-        // on every launch, or a broken secret would stall each server start.
-        if entry.value.is_some() || entry.at.elapsed() < RETRY_AFTER {
-            return entry.value.clone();
-        }
+    // A value that worked is kept for the process's lifetime; a failure is retried, but not on
+    // every launch, or a broken secret would stall each server start.
+    if let Some(entry) = cache().get(command).cloned()
+        && (entry.value.is_some() || entry.at.elapsed() < RETRY_AFTER)
+    {
+        return entry.value;
     }
+    // The command runs outside the lock: one slow secret must not stall every other launch.
     let value = run_command(command);
+    let mut known = cache();
+    if let Some(entry) = known.get(command)
+        && (entry.value.is_some() || entry.at.elapsed() < RETRY_AFTER)
+    {
+        return entry.value.clone();
+    }
     known.insert(command.to_string(), Cached { at: Instant::now(), value: value.clone() });
     value
+}
+
+fn cache() -> MutexGuard<'static, HashMap<String, Cached>> {
+    CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Runs one `!command`, bounded, and keeps its trimmed stdout when it succeeded.
@@ -322,14 +399,20 @@ fn run_command(command: &str) -> Option<String> {
         .process_group(0)
         .spawn()
         .ok()?;
-    let group = i32::try_from(child.id()).ok()?;
+    let Some(group) = i32::try_from(child.id()).ok() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
     let stdout = child.stdout.take();
-    let reader = thread::spawn(move || {
-        let mut out = Vec::new();
+    // The drain is bounded too: a process that left the group can hold the pipe open for ever.
+    let (drained, out) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
         if let Some(mut pipe) = stdout {
-            let _ = pipe.read_to_end(&mut out);
+            let _ = pipe.read_to_end(&mut bytes);
         }
-        out
+        let _ = drained.send(bytes);
     });
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let status = loop {
@@ -337,29 +420,45 @@ fn run_command(command: &str) -> Option<String> {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(_) => {
-                kill_group(group);
-                let _ = child.wait();
+                stop(&mut child, group);
                 return None;
             }
         }
         if Instant::now() >= deadline {
-            kill_group(group);
-            let _ = child.wait();
+            stop(&mut child, group);
             return None;
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let out = reader.join().ok()?;
+    let Ok(bytes) = out.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+        kill_group(group);
+        return None;
+    };
     if !status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out).trim().to_string();
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
     (!text.is_empty()).then_some(text)
 }
 
 /// Kills a command's whole process group, so a child of `sh` cannot hold the pipe open.
-fn kill_group(group: i32) {
-    let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+fn kill_group(group: i32) -> bool {
+    Command::new("kill").arg("-9").arg(format!("-{group}")).status().is_ok_and(|status| status.success())
+}
+
+/// Ends a `!command` and its group, then reaps it without waiting past `REAP_TIMEOUT`.
+fn stop(child: &mut Child, group: i32) {
+    if !kill_group(group) {
+        // A `kill` missing from PATH must not leave the child running behind an endless `wait`.
+        let _ = child.kill();
+    }
+    let until = Instant::now() + REAP_TIMEOUT;
+    while Instant::now() < until {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// The environment a stdio server starts with: overseer's own, plus every entry that resolved.

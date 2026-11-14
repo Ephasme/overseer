@@ -1,18 +1,29 @@
 # cargo deny check: known vulnerabilities, licences, duplicate or yanked crates, foreign sources.
 
+[graph]
+# The release targets, whatever the host, so a developer's mac and CI check the same graph: the default is
+# the host target alone, which silently skipped the macOS-only dependencies on the Linux runner.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+
 [advisories]
 yanked = "deny"
 
 [licenses]
 private = { ignore = true }
+# Above the 0.8 default: a licence matched only heuristically (a README-style dump, a hand-merged dual-licence
+# file) fails and gets read, instead of being auto-approved on a fuzzy match.
 confidence-threshold = 0.9
+# Fails when an entry below matches nothing in the graph, so the allow-list cannot quietly widen as deps churn.
+unused-allowed-license = "deny"
 allow = [
-  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSL-1.0", "MPL-2.0", "Unicode-3.0", "Unlicense", "Zlib",
-  "ISC", "OpenSSL", "BSD-3-Clause", "CDLA-Permissive-2.0",
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSL-1.0", "Unicode-3.0", "Unlicense", "Zlib", "ISC",
+  "BSD-3-Clause",
 ]
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
+# Split across two majors by upstream dependency chains, so not resolvable here; any other duplicate fails.
+skip = ["base64", "core-foundation", "foldhash", "hashbrown", "syn"]
 wildcards = "deny"
 
 [sources]

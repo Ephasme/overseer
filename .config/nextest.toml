@@ -3,5 +3,7 @@
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.ci]
+# Explicit: the 30s slow-timeout above is inherited, so a new test that only passes under a slower bound
+# fails here too.
+inherits = "default"
 fail-fast = false
-retries = 0
