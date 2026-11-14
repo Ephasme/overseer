@@ -21,14 +21,17 @@ tempfile = "3.27.0"
 
 [profile.release]
 lto = true
+codegen-units = 1
+strip = true
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# Every unwrap in non-test code is a crash path: name the invariant with expect, or handle the error.
+# Every unwrap and every expect in non-test code is a crash path: name the invariant, or handle the error.
 unwrap_used = "warn"
+expect_used = "warn"
 panic = "warn"
 indexing_slicing = "warn"
 # Casts that silently truncate or wrap.

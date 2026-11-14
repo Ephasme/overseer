@@ -138,24 +138,40 @@ fn progress(sender: &Sender<Event>, id: usize, progress: Progress) {
     let _ = sender.send(Event::Progress { id, progress });
 }
 
+/// The arguments `describe` reads: one field per tool. Everything else is skipped rather than
+/// deserialised into a `Value` — a `write_file` content is as large as the file.
+#[derive(Deserialize, Default)]
+struct Described {
+    path: Option<String>,
+    task: Option<String>,
+    text: Option<String>,
+    command: Option<String>,
+    id: Option<u64>,
+}
+
+/// A string field of the arguments, or `""` when absent.
+fn field(value: Option<&String>) -> &str {
+    value.map_or("", String::as_str)
+}
+
+/// Its first line, so a multi-line instruction stays one row.
+fn first_line(value: Option<&String>) -> &str {
+    field(value).lines().next().unwrap_or_default()
+}
+
 /// One line naming what a tool call acts on: the transcript header and the worker panel both show it.
 pub(crate) fn describe(name: &str, arguments: &str) -> String {
-    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-    let text = |key: &str| args.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
-    let first = |key: &str| text(key).lines().next().unwrap_or_default().to_string();
+    let args: Described = serde_json::from_str(arguments).unwrap_or_default();
     let line = match name {
         prompt::SPAWN_WORKER => {
-            let path = text("path");
+            let path = field(args.path.as_ref());
             let dir = if path.is_empty() { prompt::DEFAULT_WORKING_DIR } else { path };
-            format!("{dir} · {}", first("task"))
+            format!("{dir} · {}", first_line(args.task.as_ref()))
         }
-        prompt::MESSAGE_WORKER => {
-            let id = args.get("id").and_then(serde_json::Value::as_u64).unwrap_or_default();
-            format!("#{id} · {}", first("text"))
-        }
-        prompt::REPLY => first("text"),
-        tools::BASH => first("command"),
-        tools::READ_FILE | tools::WRITE_FILE => text("path").to_string(),
+        prompt::MESSAGE_WORKER => format!("#{} · {}", args.id.unwrap_or_default(), first_line(args.text.as_ref())),
+        prompt::REPLY => first_line(args.text.as_ref()).to_string(),
+        tools::BASH => first_line(args.command.as_ref()).to_string(),
+        tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
         _ => String::new(),
     };
     let mut short: String = line.chars().take(PROGRESS_WIDTH).collect();
@@ -285,7 +301,6 @@ impl Fleet {
         let log_path = self.log_dir.join(format!("worker-{id}.log"));
         let log = File::create(&log_path).map_err(|e| config::io_error(log_path.display(), &e))?;
         let (inbox, instructions) = mpsc::channel();
-        inbox.send(task.to_string()).expect("the receiver lives in this scope");
         let (llm, sender) = (Arc::clone(&self.llm), self.sender.clone());
         let stream_sender = sender.clone();
         let streamed = Arc::new(StreamLlm::new(
@@ -302,6 +317,9 @@ impl Fleet {
             let mut run = WorkerRun { id, working_dir: &worker_dir, sender: &sender, log: &mut log };
             run.run(streamed.as_ref(), instructions);
         });
+        // The thread is already waiting on the channel, so a closed receiver here means it died on
+        // startup: report that rather than leaving a worker in the roster that will never answer.
+        inbox.send(task.to_string()).map_err(|_| format!("worker {id} could not be started"))?;
         self.workers.push(Worker {
             id,
             working_dir,

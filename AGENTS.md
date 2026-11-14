@@ -44,11 +44,13 @@
 
 ## Key conventions
 
-- Handle errors with `Result`; outside tests, `unwrap`, `panic!`, slice indexing and `as` casts fail the lints.
+- Handle errors with `Result`; outside tests, `unwrap`, `expect`, `panic!`, slice indexing and `as` casts fail the lints.
 - A tool failure goes back to the model as text starting `error: `; it never aborts a turn.
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - A worker's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
+- Quitting calls `tools::kill_running`: without it a worker's `cargo build` outlives the process, because the session never reaps a group that is still running.
+- `agent::trim` drops the oldest turns past `HISTORY_BUDGET` before each model call. Without it a long session reaches a context-length error it can never recover from: the failed call leaves history unchanged, so every later turn fails the same way.
 - A worker's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked worker cannot leave the fleet busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
 - Worker model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the worker panel and the core never feeds back to the overseer.
