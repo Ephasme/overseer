@@ -7,6 +7,7 @@ mod llm;
 mod mcp;
 mod names;
 mod plain;
+mod profiles;
 mod prompt;
 mod repos;
 mod secrets;
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let llm: Arc<dyn llm::Llm> = Arc::new(llm::OpenAiClient::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
+    let models = Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
+    let profiles = Arc::new(profiles::Catalogue::load(&cfg.home));
 
     // Started before the core loop: a server that is slow to connect must not delay startup.
     let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
@@ -55,10 +57,15 @@ fn main() -> Result<()> {
     let stop = input_tx.clone();
     let quit = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::clone(&quit);
-    let model = cfg.model.clone();
+    let model = profiles
+        .get(profiles::ORCHESTRATOR)
+        .and_then(|profile| profile.model.clone())
+        .unwrap_or_else(|| cfg.model.clone());
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
-    let core = thread::spawn(move || session::run(llm, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown));
+    let core = thread::spawn(move || {
+        session::run(models, profiles, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown)
+    });
 
     let frontend = if tui_available() {
         tui::run(ui_rx, input_tx, &model, theme)

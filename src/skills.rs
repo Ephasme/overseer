@@ -2,6 +2,8 @@
 
 use crate::config;
 use crate::tools;
+use gray_matter::{Matter, engine::YAML};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -146,14 +148,29 @@ fn scan(root: &Path, out: &mut Vec<Skill>) {
     }
 }
 
+/// The fields a `SKILL.md` frontmatter sets.
+#[derive(Deserialize, Default)]
+struct Frontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+    hide: Option<bool>,
+}
+
+/// Reads the frontmatter of one file; a block that is malformed or absent yields no fields, so a
+/// bad `SKILL.md` still loads instead of dropping out of the catalogue.
+fn fields(text: &str) -> Frontmatter {
+    Matter::<YAML>::new().parse::<Frontmatter>(text).ok().and_then(|parsed| parsed.data).unwrap_or_default()
+}
+
 /// One skill, or `None` when the directory carries no usable `SKILL.md`.
 fn load(dir: &Path) -> Option<Skill> {
     let text = fs::read_to_string(dir.join("SKILL.md")).ok()?;
-    let (fields, _) = parse(&text);
-    if fields.get("enabled").is_some_and(|value| value == "false") {
+    let fields = fields(&text);
+    if fields.enabled == Some(false) {
         return None;
     }
-    let declared = fields.get("name").map(|name| name.trim()).filter(|name| !name.is_empty());
+    let declared = fields.name.as_deref().map(str::trim).filter(|name| !name.is_empty());
     let name = match declared {
         Some(name) => name.to_string(),
         None => dir.file_name()?.to_string_lossy().into_owned(),
@@ -163,125 +180,10 @@ fn load(dir: &Path) -> Option<Skill> {
     }
     Some(Skill {
         name,
-        description: fields.get("description").cloned().unwrap_or_default(),
-        hidden: fields.get("hide").is_some_and(|value| value == "true"),
+        description: fields.description.unwrap_or_default(),
+        hidden: fields.hide == Some(true),
         dir: dir.to_path_buf(),
     })
-}
-
-/// Reads the `---` frontmatter and returns its fields with the body after it.
-///
-/// Hand-written on purpose: a YAML crate is a dependency for the handful of scalar fields a
-/// `SKILL.md` carries, and a malformed file must still load rather than fail the worker.
-fn parse(text: &str) -> (HashMap<String, String>, &str) {
-    let mut fields = HashMap::new();
-    let after = text.strip_prefix("---").and_then(|rest| rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")));
-    let Some(after) = after else { return (fields, text.trim()) };
-    let mut lines: Vec<&str> = Vec::new();
-    let mut consumed = 0;
-    let mut closed = false;
-    for line in after.split_inclusive('\n') {
-        let content = line.trim_end_matches(['\n', '\r']);
-        if content == "---" {
-            consumed += line.len();
-            closed = true;
-            break;
-        }
-        lines.push(content);
-        consumed += line.len();
-    }
-    if !closed {
-        return (fields, text.trim());
-    }
-    let mut index = 0;
-    while let Some(line) = lines.get(index).copied() {
-        index += 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else { continue };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = scalar(value.trim());
-        let block = matches!(value, "" | ">" | ">-" | ">+" | "|" | "|-" | "|+");
-        if !block {
-            fields.insert(key.to_string(), unquote(value).to_string());
-            continue;
-        }
-        let mut body: Vec<&str> = Vec::new();
-        while let Some(next) = lines.get(index).copied() {
-            let indented = next.starts_with(' ') || next.starts_with('\t');
-            if !indented && !next.trim().is_empty() {
-                break;
-            }
-            body.push(next);
-            index += 1;
-        }
-        while body.last().is_some_and(|line| line.trim().is_empty()) {
-            body.pop();
-        }
-        if value.is_empty() && body.is_empty() {
-            fields.insert(key.to_string(), String::new());
-            continue;
-        }
-        let indent = body
-            .iter()
-            .find(|line| !line.trim().is_empty())
-            .map_or(0, |line| line.len() - line.trim_start_matches([' ', '\t']).len());
-        let dedented: Vec<&str> =
-            body.iter().map(|line| line.get(indent.min(line.len())..).unwrap_or_default()).collect();
-        let literal = value.starts_with('|');
-        let keep_newline = matches!(value, "|" | ">" | "|+" | ">+");
-        let mut joined = String::new();
-        if literal {
-            joined = dedented.join("\n");
-            if keep_newline && !joined.is_empty() {
-                joined.push('\n');
-            }
-        } else {
-            let mut pending_blank = false;
-            for line in &dedented {
-                if line.trim().is_empty() {
-                    pending_blank = true;
-                    continue;
-                }
-                if !joined.is_empty() {
-                    joined.push(if pending_blank { '\n' } else { ' ' });
-                }
-                joined.push_str(line);
-                pending_blank = false;
-            }
-            if keep_newline && !joined.is_empty() {
-                joined.push('\n');
-            }
-        }
-        fields.insert(key.to_string(), joined);
-    }
-    (fields, after.get(consumed..).unwrap_or_default().trim())
-}
-
-/// A scalar with a trailing YAML comment removed; a quoted scalar keeps any `#` it holds.
-fn scalar(value: &str) -> &str {
-    if let Some(quote) = value.chars().next().filter(|c| matches!(*c, '\'' | '"')) {
-        let rest = value.get(1..).unwrap_or_default();
-        return rest.find(quote).map_or(value, |end| value.get(..end + 2).unwrap_or(value));
-    }
-    if value.starts_with('#') {
-        return "";
-    }
-    value.split_once(" #").map_or(value, |(scalar, _)| scalar.trim_end())
-}
-
-/// A plain scalar without the one pair of quotes around it.
-fn unquote(value: &str) -> &str {
-    for quote in ['\'', '"'] {
-        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
-            return value.get(1..value.len() - 1).unwrap_or(value);
-        }
-    }
-    value
 }
 
 /// `text` with every run of whitespace collapsed to one space.
@@ -301,24 +203,20 @@ mod tests {
 
     #[test]
     fn frontmatter_descriptions_fold_or_keep_their_lines() {
-        let (fields, body) = parse("---\nname: x\ndescription: >-\n  one\n  two\n\n  three\n---\nbody\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("one two\nthree"));
-        assert_eq!(body, "body");
-        let (fields, _) = parse("---\ndescription: |-\n  one\n  two\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("one\ntwo"));
-        let (fields, _) = parse("---\ndescription: |\n  one\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("one\n"));
-        let (fields, _) = parse("---\ndescription: \"quoted: value\"\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("quoted: value"));
-        let (fields, _) = parse("---\ndescription: > # note\n  one\n  two\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("one two\n"));
-        let (fields, _) = parse("---\ndescription: foo # comment\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("foo"));
-        let (fields, _) = parse("---\ndescription: |+\n  one\n---\n");
-        assert_eq!(fields.get("description").map(String::as_str), Some("one\n"));
-        let (fields, body) = parse("no frontmatter here");
-        assert!(fields.is_empty());
-        assert_eq!(body, "no frontmatter here");
+        let folded = fields("---\nname: x\ndescription: >-\n  one\n  two\n\n  three\n---\nbody\n");
+        assert_eq!(folded.description.as_deref(), Some("one two\nthree"));
+        let literal = fields("---\ndescription: |-\n  one\n  two\n---\n");
+        assert_eq!(literal.description.as_deref(), Some("one\ntwo"));
+        let kept = fields("---\ndescription: |\n  one\n---\n");
+        assert_eq!(kept.description.as_deref(), Some("one\n"));
+        let quoted = fields("---\ndescription: \"quoted: value\"\n---\n");
+        assert_eq!(quoted.description.as_deref(), Some("quoted: value"));
+        let commented = fields("---\ndescription: foo # comment\n---\n");
+        assert_eq!(commented.description.as_deref(), Some("foo"));
+        let absent = fields("no frontmatter here");
+        assert!(absent.description.is_none() && absent.name.is_none());
+        let broken = fields("---\ndescription: a: b\n---\nbody\n");
+        assert!(broken.description.is_none(), "malformed YAML loads as no fields, never as a failure");
     }
 
     #[test]

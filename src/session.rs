@@ -1,7 +1,8 @@
 use crate::config;
 use crate::event::UiEvent;
-use crate::llm::Llm;
+use crate::llm::Models;
 use crate::mcp;
+use crate::profiles;
 use crate::swarm::{AgentEvent, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
@@ -21,7 +22,8 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// Blocking by design: the model client and every agent are blocking, so a frontend keeps this on its own thread.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(crate) fn run(
-    llm: Arc<dyn Llm>,
+    models: Arc<dyn Models>,
+    profiles: Arc<profiles::Catalogue>,
     cfg: &config::Config,
     log_dir: PathBuf,
     input: Sender<Event>,
@@ -32,7 +34,8 @@ pub(crate) fn run(
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
     let swarm = Arc::new(Mutex::new(Swarm::new(
-        llm,
+        models,
+        profiles,
         cfg.roots.clone(),
         cfg.home.clone(),
         log_dir,
@@ -213,7 +216,8 @@ mod tests {
         let frontend = input.clone();
         let handle = thread::spawn(move || {
             run(
-                Arc::new(Scripted::new(vec![text("hello back")])),
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("hello back")])))),
+                Arc::new(profiles::Catalogue::default()),
                 &cfg,
                 logs.path().to_path_buf(),
                 input,
@@ -260,7 +264,8 @@ mod tests {
         let logs = root.path().join("missing");
         let handle = thread::spawn(move || {
             run(
-                Arc::new(Scripted::new(vec![text("unused")])),
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("unused")])))),
+                Arc::new(profiles::Catalogue::default()),
                 &cfg,
                 logs,
                 input,

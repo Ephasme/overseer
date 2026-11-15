@@ -15,6 +15,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 base64 = "0.22"
 dotenvy = "0.15.7"
 getrandom = "0.3"
+gray_matter = { version = "0.3.2", default-features = false, features = ["yaml"] }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }

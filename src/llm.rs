@@ -2,7 +2,9 @@ use crate::agent::{INTERRUPTED, cancelled};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Longest response body echoed into an error: a proxy's error page must not land in the transcript.
@@ -106,19 +108,82 @@ fn report(message: &Message, on_piece: &mut dyn FnMut(Piece<'_>)) {
 /// Where `OVERSEER_DEBUG` output goes: stderr in line mode, the transcript in the TUI.
 pub(crate) type DebugSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Builds the client for one agent: a backend's default, or the model and effort a profile names.
+pub(crate) trait Models: Send + Sync {
+    fn get(&self, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm>;
+}
+
+/// One client per `(model, effort)` pair, shared rather than rebuilt: a pair costs a pool.
+type Clients = Mutex<HashMap<(String, Option<String>), Arc<dyn Llm>>>;
+
+/// The real backend: one cheap client per `(model, effort)` pair, shared by every agent that asks.
+pub(crate) struct Backend {
+    http: reqwest::blocking::Client,
+    base_url: String,
+    api_key: String,
+    default_model: String,
+    debug: Option<DebugSink>,
+    clients: Clients,
+}
+
+impl Backend {
+    pub(crate) fn new(
+        base_url: &str,
+        api_key: String,
+        default_model: String,
+        debug: Option<DebugSink>,
+    ) -> Result<Self> {
+        // reqwest's 30 s default is shorter than a long model answer.
+        let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            default_model,
+            debug,
+            clients: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl Models for Backend {
+    fn get(&self, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm> {
+        let model = model.unwrap_or(&self.default_model).to_string();
+        let key = (model.clone(), effort.map(str::to_string));
+        let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(clients.entry(key).or_insert_with(move || {
+            Arc::new(OpenAiClient::new(
+                self.http.clone(),
+                &self.base_url,
+                self.api_key.clone(),
+                model,
+                effort.map(str::to_string),
+                self.debug.clone(),
+            ))
+        }))
+    }
+}
+
 pub(crate) struct OpenAiClient {
     http: reqwest::blocking::Client,
     base_url: String,
     api_key: String,
     model: String,
+    /// Sent as `reasoning_effort`; `None` leaves the provider's own default.
+    effort: Option<String>,
     debug: Option<DebugSink>,
 }
 
 impl OpenAiClient {
-    pub(crate) fn new(base_url: &str, api_key: String, model: String, debug: Option<DebugSink>) -> Result<Self> {
-        // reqwest's 30 s default is shorter than a long model answer.
-        let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
-        Ok(Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, debug })
+    pub(crate) fn new(
+        http: reqwest::blocking::Client,
+        base_url: &str,
+        api_key: String,
+        model: String,
+        effort: Option<String>,
+        debug: Option<DebugSink>,
+    ) -> Self {
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug }
     }
 }
 
@@ -163,8 +228,19 @@ impl OpenAiClient {
         Ok(body)
     }
 
+    fn payload(&self, messages: &[Message], tools: &Value, stream: bool) -> Value {
+        let mut payload =
+            json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
+        if let Some(effort) = &self.effort
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        }
+        payload
+    }
+
     fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
+        let payload = self.payload(messages, tools, stream);
         if let Some(sink) = &self.debug {
             sink(&payload.to_string());
         }
@@ -434,6 +510,15 @@ pub(crate) mod testing {
             Ok(replies.remove(0))
         }
     }
+
+    /// One scripted client for every model and effort: a test sees no provider.
+    pub(crate) struct Fixed(pub(crate) Arc<dyn Llm>);
+
+    impl Models for Fixed {
+        fn get(&self, _: Option<&str>, _: Option<&str>) -> Arc<dyn Llm> {
+            Arc::clone(&self.0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -629,5 +714,26 @@ mod tests {
         // Some providers reject `"tool_calls": null` on non-assistant messages.
         let v = serde_json::to_value(Message::tool("c1", "out".into())).unwrap();
         assert_eq!(v, json!({"role":"tool","content":"out","tool_call_id":"c1"}));
+    }
+
+    #[test]
+    fn a_request_carries_the_effort_only_when_one_is_set() {
+        let http = reqwest::blocking::Client::new();
+        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None);
+        let body = plain.payload(&[], &json!([]), false);
+        assert!(body.get("reasoning_effort").is_none());
+        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None);
+        let body = effortful.payload(&[], &json!([]), false);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["model"], "m");
+    }
+
+    #[test]
+    fn the_backend_reuses_one_client_per_pair() {
+        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None).unwrap();
+        let first = backend.get(None, None);
+        assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
+        assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
+        assert!(!Arc::ptr_eq(&first, &backend.get(None, Some("high"))));
     }
 }

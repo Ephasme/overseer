@@ -5,6 +5,7 @@
 //! nobody ever wrote, so a model cannot learn about a capability this build does not have.
 
 use crate::conflict;
+use crate::profiles;
 use crate::skills;
 use std::fmt::Write as _;
 
@@ -14,6 +15,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) conflicts: Option<&'a mut conflict::Registry>,
     /// The skills the caller may read; `None` for a caller that has no catalogue, such as a write.
     pub(crate) skills: Option<&'a skills::Catalogue>,
+    /// The profiles the caller may read; `None` for a caller that has none, such as a write.
+    pub(crate) profiles: Option<&'a profiles::Catalogue>,
 }
 
 /// A handler answers one `scheme://…` path: `(caller, rest of the URI)` or `(caller, rest, content)`.
@@ -38,7 +41,8 @@ struct Scheme {
     status: Status,
 }
 
-/// Every scheme of the toolkit this port follows, in its order. `conflict` and `skill` answer.
+/// Every scheme of the toolkit this port follows, in its order. `conflict`, `profile` and `skill`
+/// answer.
 ///
 /// The reserved names are the roadmap, not documentation: nothing reads them into a prompt.
 const SCHEMES: &[Scheme] = &[
@@ -64,6 +68,14 @@ const SCHEMES: &[Scheme] = &[
     Scheme { name: "out", status: Status::Reserved },
     Scheme { name: "pr", status: Status::Reserved },
     Scheme { name: "proc", status: Status::Reserved },
+    Scheme {
+        name: "profile",
+        status: Status::Active(Active {
+            summary: "an agent profile by name: read `profile://<name>` for its file, frontmatter included",
+            read: Some(profile_read),
+            write: None,
+        }),
+    },
     Scheme { name: "rule", status: Status::Reserved },
     Scheme { name: "security", status: Status::Reserved },
     Scheme {
@@ -189,6 +201,13 @@ fn skill_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
     skills.read(rest)
 }
 
+fn profile_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
+    let Some(profiles) = ctx.profiles else {
+        return Err("profiles are not available to this caller: it has no profile catalogue".to_string());
+    };
+    profiles.read(rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +230,7 @@ mod tests {
         "out",
         "pr",
         "proc",
+        "profile",
         "rule",
         "security",
         "skill",
@@ -220,7 +240,7 @@ mod tests {
     ];
 
     fn context(registry: &mut conflict::Registry) -> Ctx<'_> {
-        Ctx { conflicts: Some(registry), skills: None }
+        Ctx { conflicts: Some(registry), skills: None, profiles: None }
     }
 
     #[test]
@@ -235,6 +255,7 @@ mod tests {
         let summary = summary().unwrap();
         assert!(summary.contains("`conflict://`"), "{summary}");
         assert!(summary.contains("`skill://`"), "{summary}");
+        assert!(summary.contains("`profile://`"), "{summary}");
         assert!(!summary.contains("mcp"), "{summary}");
         assert!(!summary.contains("ssh"), "{summary}");
     }
@@ -246,7 +267,9 @@ mod tests {
             let error = read(&mut context(&mut registry), &format!("{scheme}://x")).unwrap_err();
             assert_eq!(
                 error,
-                format!("`{scheme}://` is not an available scheme: this build resolves `conflict://`, `skill://`")
+                format!(
+                    "`{scheme}://` is not an available scheme: this build resolves `conflict://`, `profile://`, `skill://`"
+                )
             );
         }
     }
@@ -289,8 +312,20 @@ mod tests {
 
     #[test]
     fn a_caller_without_a_registry_cannot_use_conflict_ids() {
-        let mut ctx = Ctx { conflicts: None, skills: None };
+        let mut ctx = Ctx { conflicts: None, skills: None, profiles: None };
         assert_eq!(read(&mut ctx, "conflict://1").unwrap_err(), "conflict ids belong to the agent that read the file");
         assert!(write(&mut ctx, "conflict://1", "@ours").is_err());
+    }
+
+    #[test]
+    fn a_profile_reads_through_its_scheme_and_nothing_writes_one() {
+        let catalogue = profiles::Catalogue::default();
+        let mut ctx = Ctx { conflicts: None, skills: None, profiles: Some(&catalogue) };
+        assert!(read(&mut ctx, "profile://orchestrator").unwrap().contains("You coordinate."));
+        let error = read(&mut ctx, "profile://ghost").unwrap_err();
+        assert!(error.contains("unknown profile ghost"), "{error}");
+        let mut blind = Ctx { conflicts: None, skills: None, profiles: None };
+        assert!(read(&mut blind, "profile://orchestrator").is_err());
+        assert!(write(&mut blind, "profile://orchestrator", "x").is_err(), "profiles are read-only");
     }
 }

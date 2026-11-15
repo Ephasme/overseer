@@ -1647,6 +1647,10 @@ impl App {
                         label,
                         Style::new().fg(if self.selected == Some(worker.id) { theme::text() } else { theme::info() }),
                     ),
+                    Span::styled(
+                        worker.profile.as_deref().map_or(String::new(), |name| format!(" {name}")),
+                        Style::new().fg(theme::faint()),
+                    ),
                     Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
                 ]),
                 Line::from(vec![
@@ -1923,11 +1927,15 @@ impl App {
         let top = Rect { y: inner.y.saturating_add(1), height: inner.height.saturating_sub(1), ..inner };
         let width = usize::from(top.width.saturating_sub(4));
         let (glyph, colour, state) = worker_state(&worker);
-        let crumb = Line::from(vec![
+        let mut crumb = vec![
             Span::styled("agents ", Style::new().fg(theme::muted())),
             Span::styled("› ", Style::new().fg(theme::faint())),
             Span::styled(worker.label.clone(), Style::new().fg(theme::info())),
-        ]);
+        ];
+        if let Some(name) = &worker.profile {
+            crumb.push(Span::styled(format!(" · {name}"), Style::new().fg(theme::faint())));
+        }
+        let crumb = Line::from(crumb);
         let mut line = vec![
             Span::styled(format!("{glyph} "), Style::new().fg(colour)),
             Span::styled(state, Style::new().fg(theme::muted())),
@@ -3007,6 +3015,7 @@ mod tests {
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: task.into(),
+            profile: None,
             pending: 0,
             failed: false,
             finished: false,
@@ -3074,6 +3083,16 @@ mod tests {
         let list = screen(&mut app, 100, 24);
         assert!(list.contains("Ask agent 1"), "{list}");
         assert!(list.contains("agent 3"), "the transcript still names the agent it kept picked: {list}");
+    }
+
+    #[test]
+    fn the_worker_panel_names_the_profile() {
+        let mut app = App::new("m");
+        let mut reviewer = agent_view(2, "review");
+        reviewer.profile = Some("reviewer".into());
+        app.apply(UiEvent::Agents(vec![root_view(), reviewer]));
+        let screen = screen(&mut app, 120, 30);
+        assert!(screen.contains("(2) reviewer"), "the panel shows the flavor: {screen}");
     }
 
     #[test]

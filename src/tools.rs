@@ -1,6 +1,7 @@
 use crate::config;
 use crate::conflict;
 use crate::mcp;
+use crate::profiles;
 use crate::skills;
 use crate::url;
 use serde::Deserialize;
@@ -452,9 +453,11 @@ pub(crate) fn outcome(result: Result<String, String>) -> String {
     truncate(result.unwrap_or_else(|e| format!("error: {e}")))
 }
 
-/// What a worker's tool call may reach beyond its working directory: its skills and the servers.
+/// What a worker's tool call may reach beyond its working directory: its skills, its profiles and
+/// the servers.
 pub(crate) struct Context<'a> {
     pub(crate) skills: &'a skills::Catalogue,
+    pub(crate) profiles: &'a profiles::Catalogue,
     pub(crate) mcp: &'a mcp::Registry,
 }
 
@@ -649,7 +652,14 @@ fn read_file(
     context: &Context<'_>,
 ) -> Result<String, String> {
     if url::is_url(&args.path) {
-        return url::read(&mut url::Ctx { conflicts: Some(conflicts), skills: Some(context.skills) }, &args.path);
+        return url::read(
+            &mut url::Ctx {
+                conflicts: Some(conflicts),
+                skills: Some(context.skills),
+                profiles: Some(context.profiles),
+            },
+            &args.path,
+        );
     }
     if let Some(display) = args.path.strip_suffix(conflict::LIST_SUFFIX) {
         return list_conflicts(working_dir, display, conflicts);
@@ -724,7 +734,11 @@ fn list_conflicts(working_dir: &Path, display: &str, conflicts: &mut conflict::R
 
 fn write_file(working_dir: &Path, args: &WriteArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
     if url::is_url(&args.path) {
-        return url::write(&mut url::Ctx { conflicts: Some(conflicts), skills: None }, &args.path, &args.content);
+        return url::write(
+            &mut url::Ctx { conflicts: Some(conflicts), skills: None, profiles: None },
+            &args.path,
+            &args.content,
+        );
     }
     let full = working_dir.join(&args.path);
     if let Some(parent) = full.parent() {
@@ -798,7 +812,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
-        execute_guarded(dir, name, arguments, policy, cancel, conflicts, &Context { skills: &skills, mcp: &mcp })
+        let profiles = profiles::Catalogue::default();
+        execute_guarded(
+            dir,
+            name,
+            arguments,
+            policy,
+            cancel,
+            conflicts,
+            &Context { skills: &skills, profiles: &profiles, mcp: &mcp },
+        )
     }
 
     #[test]
@@ -876,7 +899,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
-        let context = Context { skills: &skills, mcp: &mcp };
+        let profiles = profiles::Catalogue::default();
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
         let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None, &context));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
@@ -1004,7 +1028,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
-        let context = Context { skills: &skills, mcp: &mcp };
+        let profiles = profiles::Catalogue::default();
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
         let started = Instant::now();
         // `sh` exits at once; the child it left behind inherits both pipes, so only the group kill
         // DRAIN_GRACE allows can close them.
@@ -1156,13 +1181,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
-        let context = Context { skills: &skills, mcp: &mcp };
+        let profiles = profiles::Catalogue::default();
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
         let read = json!({"path": "skill://caveman"}).to_string();
         let out = execute_guarded(dir.path(), READ_FILE, &read, &Policy::default(), None, &mut registry(), &context);
         assert!(out.contains("body"), "{out}");
         let missing = json!({"path": "skill://nope"}).to_string();
         let out = execute_guarded(dir.path(), READ_FILE, &missing, &Policy::default(), None, &mut registry(), &context);
         assert!(out.starts_with("error: unknown skill nope"), "{out}");
+    }
+
+    #[test]
+    fn a_worker_reads_a_profile_through_read_file() {
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let profiles = profiles::Catalogue::default();
+        let mcp = mcp::Registry::load(home.path());
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
+        let mut conflicts = conflict::Registry::default();
+        let args = ReadArgs { path: "profile://orchestrator".into() };
+        let text = read_file(home.path(), &args, &mut conflicts, &context).unwrap();
+        assert!(text.contains("You coordinate."), "{text}");
+        let missing = ReadArgs { path: "profile://ghost".into() };
+        let text = read_file(home.path(), &missing, &mut conflicts, &context).unwrap_err();
+        assert!(text.contains("unknown profile ghost"), "{text}");
     }
 
     #[test]
