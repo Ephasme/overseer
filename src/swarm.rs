@@ -1435,7 +1435,7 @@ mod tests {
             prompt::SPAWN_AGENT,
             &json!({"path": h.repo, "task": "review", "profile": "reviewer", "read_only": false}),
         );
-        assert_eq!(spawned, "agent 2 started");
+        assert_eq!(spawned, format!("{} started", codename(2)));
         let policy = h.swarm.lock().unwrap().agent(2).unwrap().control.policy();
         assert!(policy.read_only, "read_only from the profile sticks");
         assert!(policy.refuse(tools::WRITE_FILE, &json!({"path": "x", "content": ""}).to_string()).is_some());

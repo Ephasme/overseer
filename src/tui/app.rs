@@ -3092,7 +3092,7 @@ mod tests {
         reviewer.profile = Some("reviewer".into());
         app.apply(UiEvent::Agents(vec![root_view(), reviewer]));
         let screen = screen(&mut app, 120, 30);
-        assert!(screen.contains("a2 reviewer"), "the panel shows the flavor: {screen}");
+        assert!(screen.contains("(2) reviewer"), "the panel shows the flavor: {screen}");
     }
 
     #[test]
