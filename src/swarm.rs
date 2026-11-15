@@ -1,6 +1,7 @@
 use crate::agent::{INTERRUPTED, Turn};
 use crate::config;
 use crate::conflict;
+use crate::edit;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::mcp;
 use crate::prompt;
@@ -374,7 +375,7 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         prompt::CONTROL_AGENT => format!("#{} · {}", args.id.unwrap_or_default(), field(args.action.as_ref())),
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => first_line(args.command.as_ref()).to_string(),
-        tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
+        tools::READ_FILE | tools::WRITE_FILE | tools::EDIT => field(args.path.as_ref()).to_string(),
         _ => String::new(),
     };
     if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT) {
@@ -919,6 +920,7 @@ fn spawn_thread(
             calls: 0,
             control: &control,
             conflicts: conflict::Registry::default(),
+            seen: edit::Store::default(),
         };
         run.run(streamed.as_ref(), &instructions);
     });
@@ -953,6 +955,8 @@ struct AgentRun<'a> {
     control: &'a Control,
     /// Conflict blocks this agent has read, by id: resolving one writes only its marker lines.
     conflicts: conflict::Registry,
+    /// What this agent has read or written, by canonical path: `edit` refuses anything else.
+    seen: edit::Store,
     /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
     calls: usize,
 }
@@ -1044,8 +1048,8 @@ impl AgentRun<'_> {
         }
         let policy = control.policy();
         // A banned tool is refused before any dispatch, so a denied `spawn_agent` reads as a ban and
-        // not as a depth or ownership error. The three file tools are refused inside execute_guarded.
-        if !matches!(call.function.name.as_str(), tools::BASH | tools::READ_FILE | tools::WRITE_FILE)
+        // not as a depth or ownership error. The four file tools are refused inside execute_guarded.
+        if !matches!(call.function.name.as_str(), tools::BASH | tools::READ_FILE | tools::WRITE_FILE | tools::EDIT)
             && let Some(refusal) = policy.refuse(&call.function.name, &call.function.arguments)
         {
             let output = format!("error: {refusal}");
@@ -1081,6 +1085,7 @@ impl AgentRun<'_> {
                 &policy,
                 Some(control.flag()),
                 &mut self.conflicts,
+                &mut self.seen,
                 context,
             )
         };
@@ -1440,6 +1445,32 @@ mod tests {
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
+    }
+
+    #[test]
+    fn a_workers_read_is_what_licenses_its_edit() {
+        let h = harness(vec![
+            call("r1", tools::READ_FILE, &json!({"path": "t.rs"})),
+            call("e1", tools::EDIT, &json!({"path": "t.rs", "patch": "PUT 1.=1:\n+B\n"})),
+            text("done"),
+            call("e2", tools::EDIT, &json!({"path": "t.rs", "patch": "PUT 1.=1:\n+C\n"})),
+            text("refused"),
+        ]);
+        fs::write(h.repo.join("t.rs"), "a\n").unwrap();
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "edit it"), "agent 2 started");
+        assert_eq!(next_finished(&h.queue).status, "1 lines");
+        let edited = next_finished(&h.queue);
+        assert_eq!(edited.status, "+1/-1");
+        assert_eq!(edited.head, "-1|a\n+1|B");
+        assert!(
+            matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Finished, .. }),
+            "the first worker must finish before the second starts"
+        );
+        // The second agent sees the same file, but its own store has never read it.
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "edit it again"), "agent 3 started");
+        let refused = next_finished(&h.queue);
+        assert!(refused.failed);
+        assert!(refused.head.contains("read t.rs before editing it"), "{}", refused.head);
     }
 
     #[test]

@@ -38,7 +38,9 @@
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |
-| `src/tools.rs` | the file tools `bash`, `read_file`, `write_file`, and the `Policy` that guards them |
+| `src/tools.rs` | the file tools `bash`, `read_file`, `write_file`, `edit`, and the `Policy` that guards them |
+| `src/diff.rs` | Myers over interned line ids, and the compact `-N|…` / `+N|…` rows both the model and the transcript read |
+| `src/edit.rs` | the line-anchored `edit` patch engine and the per-agent `Store` of files read |
 | `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
@@ -53,6 +55,7 @@
 
 - Handle errors with `Result`; outside tests, `unwrap`, `expect`, `panic!`, slice indexing and `as` casts fail the lints.
 - A tool failure goes back to the model as text starting `error: `; it never aborts a turn.
+- `edit` refuses a file its agent has not read, or one whose hash changed since: `read_file` records the whole file's hash, its line count and the range it showed, and `write_file` and `edit` record what they wrote. The store is per agent, so a read by one worker licenses nothing for another.
 - Tests run offline: script the model with `llm::testing::Scripted`, never call a real endpoint. nextest kills a test after 60 s (`.config/nextest.toml`).
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.

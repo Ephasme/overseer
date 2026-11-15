@@ -2,6 +2,8 @@ mod agent;
 mod clipboard;
 mod config;
 mod conflict;
+mod diff;
+mod edit;
 mod event;
 mod llm;
 mod mcp;

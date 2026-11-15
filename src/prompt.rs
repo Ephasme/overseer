@@ -20,6 +20,7 @@ const DENIABLE_TOOLS: &[&str] = &[
     tools::BASH,
     tools::READ_FILE,
     tools::WRITE_FILE,
+    tools::EDIT,
     REPLY,
     SPAWN_AGENT,
     MESSAGE_AGENT,
@@ -202,6 +203,9 @@ If you need a decision to continue, end your turn with the question as your fina
     );
     let defs = agent_tool_definitions(facts.mcp, facts.policy, remaining);
     out.push_str(&tool_section(&defs));
+    out.push_str(
+        "Editing files: read a file with `read_file` before you change it — the numbers in that output are the anchors `edit` takes, and `edit` refuses a file this agent has not read or one that changed since. Use `edit` for every change to an existing file and `write_file` to create one. Do not rewrite source through `bash` (`sed -i`, `tee`, `>`, heredocs, `git apply`): those leave no record of what changed. A refusal telling you to read a range again means read that range, then edit.\n",
+    );
     // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
     let counts = facts.mcp.tool_counts();
     if !facts.policy.read_only && !counts.is_empty() {
@@ -235,4 +239,35 @@ fn tool_section(defs: &Value) -> String {
         })
         .collect();
     format!("Tools:\n{}\n", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Facts for the root agent, on an empty home: no skill, no MCP server, the default policy.
+    #[test]
+    fn the_prompt_teaches_the_numbered_edit() {
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let policy = tools::Policy::default();
+        let facts = AgentFacts {
+            id: 1,
+            parent: None,
+            depth: 0,
+            max_depth: 3,
+            dir: home.path(),
+            policy: &policy,
+            children: Vec::new(),
+            skills: &skills,
+            mcp: &mcp,
+            root: true,
+        };
+        let prompt = agent_prompt(&facts);
+        assert!(prompt.contains("read a file with `read_file` before you change it"), "{prompt}");
+        assert!(prompt.contains("Do not rewrite source through `bash`"), "{prompt}");
+        assert!(prompt.contains("- edit: Change an existing file"), "{prompt}");
+        assert!(prompt.contains("- read_file:"), "{prompt}");
+    }
 }
