@@ -24,8 +24,6 @@ struct Palette {
     accent: Color,
     primary: Color,
     info: Color,
-    /// What a worker is still working out, before it answers.
-    thought: Color,
     /// A worker's answer to its owner.
     reply: Color,
     /// One agent speaking to another: a message call, a lifecycle line.
@@ -75,7 +73,6 @@ fn dark() -> Palette {
         accent: Color::Rgb(0x9d, 0x7c, 0xd8),
         primary: Color::Rgb(0xfa, 0xb2, 0x83),
         info: Color::Rgb(0x56, 0xb6, 0xc2),
-        thought: Color::Rgb(0xa9, 0xc4, 0xff),
         reply: Color::Rgb(0x89, 0xdc, 0xeb),
         message: Color::Rgb(0xff, 0xa3, 0xc7),
         success: Color::Rgb(0x7f, 0xd8, 0x8f),
@@ -98,7 +95,6 @@ fn light() -> Palette {
         accent: Color::Rgb(0x6d, 0x4b, 0xb8),
         primary: Color::Rgb(0xb4, 0x50, 0x1f),
         info: Color::Rgb(0x0f, 0x6e, 0x78),
-        thought: Color::Rgb(0x3f, 0x5f, 0xa8),
         reply: Color::Rgb(0x0a, 0x6b, 0x78),
         message: Color::Rgb(0xa1, 0x2c, 0x72),
         success: Color::Rgb(0x2c, 0x7a, 0x3c),
@@ -120,7 +116,6 @@ fn mono() -> Palette {
         accent: Color::Reset,
         primary: Color::Reset,
         info: Color::Reset,
-        thought: Color::Reset,
         reply: Color::Reset,
         message: Color::Reset,
         success: Color::Reset,
@@ -179,11 +174,6 @@ pub(super) fn info() -> Color {
     chosen().info
 }
 
-/// A worker still working something out: its previewed text, its thinking status.
-pub(super) fn thought() -> Color {
-    chosen().thought
-}
-
 /// A worker answering its owner.
 pub(super) fn reply() -> Color {
     chosen().reply
@@ -239,7 +229,6 @@ mod tests {
             ("accent", dark.accent, light.accent),
             ("primary", dark.primary, light.primary),
             ("info", dark.info, light.info),
-            ("thought", dark.thought, light.thought),
             ("reply", dark.reply, light.reply),
             ("message", dark.message, light.message),
             ("success", dark.success, light.success),

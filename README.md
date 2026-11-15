@@ -53,6 +53,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |F4|open the picked agent's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
 |click an agent row|open that agent's view; click its `esc back to fleet` line to come back|
+|drag the rule left of the panel|resize the agent panel: the transcript keeps at least 40 columns, the panel never drops below 20, and the width it is left at opens the next run|
 |↑ / ↓|inside an agent view: the previous or next agent|
 |PageUp / Home|inside an agent view: scroll its own stream|
 |esc|in an agent's view: stop that agent and everything below it now; with nothing running, back to the lead's stream. It never stops the overseer and never quits the app|

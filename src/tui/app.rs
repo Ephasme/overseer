@@ -29,8 +29,14 @@ const TIMED: f64 = 0.1;
 /// Rows the composer grows to before it scrolls.
 const COMPOSER_ROWS: u16 = 8;
 
-/// Width of the worker panel, its rule included.
+/// Width the worker panel opens at, its rule included; the user drags the rule from there.
 const WORKERS_WIDTH: u16 = 34;
+
+/// Narrowest the worker panel drags to: below it the codename and its state stop fitting.
+const WORKERS_MIN: u16 = 20;
+
+/// Columns the transcript keeps whatever the panel is dragged to.
+const TRANSCRIPT_MIN: u16 = 40;
 
 /// Rows one wheel notch scrolls.
 const WHEEL_LINES: u16 = 3;
@@ -172,12 +178,12 @@ impl Entry {
             }
             // Prose is Markdown: headings, lists, emphasis and fences render; the gutter stays plain.
             Role::Model => markdown(&self.body, "  ", Style::new(), width),
-            // The reasoning is the same model's: marked as not the answer, and cooler than one.
+            // The reasoning is the same model's: marked as not the answer, and quieter than one.
             Role::Thinking => block(
                 "✻ ",
-                Style::new().fg(theme::thought()),
+                Style::new().fg(theme::muted()),
                 &self.body,
-                Style::new().fg(theme::thought()).add_modifier(Modifier::ITALIC),
+                Style::new().fg(theme::muted()).add_modifier(Modifier::ITALIC),
                 width,
             ),
             Role::Tool => self.tool_lines(width, spinning, expand),
@@ -1091,6 +1097,16 @@ pub(super) struct App {
     live: Vec<(usize, usize)>,
     workers: Vec<AgentView>,
     worker_panel: bool,
+    /// Width the panel wants, rule included: what a drag of its rule sets, and what F2 brings back.
+    workers_width: u16,
+    /// The column the panel's rule sits on, while the panel is drawn: a drag there resizes it.
+    split: Option<u16>,
+    /// The area the panel and the transcript share, so a drag can tell how much room is left.
+    body_area: Rect,
+    /// Whether the pointer is dragging the panel's rule.
+    resizing: bool,
+    /// Whether the width changed since the frontend last wrote it down.
+    width_dirty: bool,
     /// Expanded: every row of what a call acts on, and what it returned. Off is the launch state.
     pub(super) tool_output: bool,
     /// The worker panel's inner area, so a click can tell the panel from the transcript.
@@ -1132,6 +1148,11 @@ impl App {
             live: Vec::new(),
             workers: Vec::new(),
             worker_panel: true,
+            workers_width: WORKERS_WIDTH,
+            split: None,
+            body_area: Rect::ZERO,
+            resizing: false,
+            width_dirty: false,
             tool_output: false,
             workers_area: Rect::ZERO,
             worker_rows: Vec::new(),
@@ -1573,14 +1594,16 @@ impl App {
         if view {
             self.render_worker_view(frame, body);
         } else {
-            let transcript = if self.worker_panel && body.width > WORKERS_WIDTH + 40 {
+            self.body_area = body;
+            let transcript = if let Some(width) = self.panel_width(body.width) {
                 let [left, right] =
-                    Layout::horizontal([Constraint::Min(40), Constraint::Length(WORKERS_WIDTH)]).areas(body);
+                    Layout::horizontal([Constraint::Min(TRANSCRIPT_MIN), Constraint::Length(width)]).areas(body);
                 self.render_workers(frame, right);
                 left
             } else {
                 self.workers_area = Rect::ZERO;
                 self.worker_rows.clear();
+                self.split = None;
                 body
             };
             self.render_transcript(frame, transcript);
@@ -1612,6 +1635,7 @@ impl App {
         let inner = rule.inner(area);
         frame.render_widget(rule, area);
         self.workers_area = inner;
+        self.split = Some(area.x);
         self.worker_rows.clear();
         let mut head = vec![
             Span::styled("agents", Style::new().fg(theme::muted())),
@@ -1713,7 +1737,7 @@ impl App {
         let mut spans = vec![Span::raw("  ")];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::thought())));
+            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::muted())));
             let secs = self.busy_since.elapsed().as_secs_f32();
             spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::muted())));
         } else if self.draining {
@@ -1872,6 +1896,11 @@ impl App {
             if self.back_area.contains(point) {
                 self.leave_worker();
             }
+            return;
+        }
+        // The rule between the two panes is a handle: pressing it starts a drag, not a pick.
+        if self.split == Some(column) {
+            self.resizing = true;
             return;
         }
         if !self.workers_area.contains(point) {
@@ -2116,6 +2145,54 @@ impl App {
     pub(super) fn toggle_workers(&mut self) {
         self.worker_panel = !self.worker_panel;
         self.dirty = true;
+    }
+
+    /// The width the panel opens at, as the last run left it; the launch width when it never moved.
+    pub(super) fn set_workers_width(&mut self, width: u16) {
+        self.workers_width = width.max(WORKERS_MIN);
+        self.dirty = true;
+    }
+
+    /// The width the panel is set to, which a resize of the terminal never narrows: it is what the
+    /// next run comes back to.
+    pub(super) fn workers_width(&self) -> u16 {
+        self.workers_width
+    }
+
+    /// Whether the width moved since the last call, so the frontend writes it down once per drag.
+    pub(super) fn take_width_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.width_dirty)
+    }
+
+    /// The width the panel takes this frame, or `None` when it is hidden or the terminal has no room
+    /// left for a readable transcript beside it.
+    fn panel_width(&self, total: u16) -> Option<u16> {
+        let room = total.checked_sub(TRANSCRIPT_MIN)?;
+        (self.worker_panel && room >= WORKERS_MIN).then(|| self.workers_width.clamp(WORKERS_MIN, room))
+    }
+
+    /// A drag of the panel's rule: the width follows the pointer, bounded so neither side vanishes.
+    ///
+    /// The transcript rewraps to the columns it has left, so the whole cache is dropped rather than
+    /// scrolled through at the old width.
+    pub(super) fn drag(&mut self, column: u16) {
+        if !self.resizing || self.split.is_none() {
+            return;
+        }
+        let right = self.body_area.x.saturating_add(self.body_area.width);
+        let room = self.body_area.width.saturating_sub(TRANSCRIPT_MIN).max(WORKERS_MIN);
+        let width = right.saturating_sub(column).clamp(WORKERS_MIN, room);
+        if width == self.workers_width {
+            return;
+        }
+        self.workers_width = width;
+        self.width_dirty = true;
+        self.resize();
+    }
+
+    /// The pointer let go: the panel keeps the width it was dragged to.
+    pub(super) fn release(&mut self) {
+        self.resizing = false;
     }
 
     /// F5: captures the mouse for clicks and the wheel, or hands it back to the terminal.
@@ -3093,6 +3170,67 @@ mod tests {
         app.apply(UiEvent::Agents(vec![root_view(), reviewer]));
         let screen = screen(&mut app, 120, 30);
         assert!(screen.contains("(2) reviewer"), "the panel shows the flavor: {screen}");
+    }
+
+    /// The rule between the panes is a handle: a press on it, then a drag, sets the panel's width.
+    #[test]
+    fn a_drag_of_the_rule_resizes_the_agent_panel() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "job")]));
+        screen(&mut app, 120, 24);
+        let opened = app.workers_area.width;
+        let rule = app.split.expect("the panel draws its rule");
+        assert_eq!(rule + WORKERS_WIDTH, 120, "the rule sits where the panel begins");
+        app.click(rule, 1);
+        app.drag(rule - 20);
+        screen(&mut app, 120, 24);
+        assert_eq!(app.workers_area.width, opened + 20, "the panel followed the pointer left");
+        assert_eq!(app.split, Some(rule - 20), "and its rule moved with it");
+        // Dragged past the far edge: the transcript keeps its columns, so the panel stops growing.
+        app.drag(0);
+        screen(&mut app, 120, 24);
+        assert_eq!(app.workers_area.width + 2, 120 - TRANSCRIPT_MIN, "the transcript is never squeezed away");
+        // Dragged past the near edge: the panel stops at its narrowest.
+        app.drag(120);
+        screen(&mut app, 120, 24);
+        assert_eq!(app.workers_area.width + 2, WORKERS_MIN, "the panel never vanishes");
+        app.release();
+        app.click(120, 1);
+        assert_eq!(app.workers_area.width + 2, WORKERS_MIN, "a click past the panel resizes nothing");
+    }
+
+    /// The width a drag lands on is what the next run opens at, and no drag can hide the panel.
+    #[test]
+    fn a_resize_is_written_down_once_and_narrowed_no_further_than_the_floor() {
+        let mut app = App::new("m");
+        screen(&mut app, 120, 24);
+        assert!(!app.take_width_dirty(), "a fresh app has nothing to write down");
+        let rule = app.split.expect("the panel draws its rule");
+        app.click(rule, 1);
+        app.drag(rule - 10);
+        assert!(app.take_width_dirty(), "the drag asks for one write");
+        assert!(!app.take_width_dirty(), "and only one, however many frames it took");
+        screen(&mut app, 120, 24);
+        let mut next = App::new("m");
+        next.set_workers_width(app.workers_width());
+        screen(&mut next, 120, 24);
+        assert_eq!(next.workers_area, app.workers_area, "the next run opens where the drag left the panel");
+        next.set_workers_width(0);
+        assert_eq!(next.workers_width(), WORKERS_MIN, "a width that would hide the panel is refused");
+    }
+
+    /// A drag starts on the rule and nowhere else: nothing else in the frame moves the split.
+    #[test]
+    fn a_drag_off_the_rule_leaves_the_panel_alone() {
+        let mut app = App::new("m");
+        screen(&mut app, 120, 24);
+        let before = app.workers_width;
+        app.drag(10);
+        assert_eq!(app.workers_width, before, "no press on the rule, no resize");
+        let rule = app.split.expect("the panel draws its rule");
+        app.click(rule, 1);
+        app.drag(rule - 10);
+        assert_ne!(app.workers_width, before, "the press on the rule is what arms the drag");
     }
 
     #[test]
