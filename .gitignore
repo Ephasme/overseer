@@ -3,3 +3,6 @@
 .env
 .env.*
 !.env.example
+
+# The herdr dashboard writes its survey beside the checkout it runs in.
+herdr-survey.json
