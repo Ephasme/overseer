@@ -1,5 +1,7 @@
+use crate::artifacts;
 use crate::config;
 use crate::conflict;
+use crate::jobs;
 use crate::mcp;
 use crate::profiles;
 use crate::skills;
@@ -66,6 +68,7 @@ pub(crate) fn kill_running() {
     for group in running {
         let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
     }
+    jobs::kill_all();
 }
 
 /// Names of the worker's file and shell tools. The schema and the dispatch both use these.
@@ -283,6 +286,24 @@ impl Policy {
     }
 }
 
+/// What this policy says about one tool: allowed, denied with the reason, or not offered at all.
+pub(crate) fn verdict(policy: &Policy, tool: &str, known: &[String]) -> String {
+    if !known.iter().any(|name| name == tool) {
+        return format!("unknown tool {tool}; tools are {}", known.join(", "));
+    }
+    if let Some(refusal) = policy.refuse(tool, "{}") {
+        return format!("denied: {refusal}");
+    }
+    if tool == BASH {
+        let constrained = policy.read_only
+            || policy.deny_all_commands
+            || !policy.allow_commands.is_empty()
+            || !policy.deny_commands.is_empty();
+        return if constrained { policy.describe() } else { "bash: no command rules".to_string() };
+    }
+    "allowed".to_string()
+}
+
 /// `path`'s last component: a rule never tells `/bin/rm` and `rm` apart.
 fn file_name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
@@ -426,8 +447,11 @@ pub(crate) fn definitions() -> Value {
     json!([
         {"type": "function", "function": {
             "name": BASH,
-            "description": format!("Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after {} seconds.", BASH_TIMEOUT.as_secs()),
-            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+            "description": format!("Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after {} seconds. With `background`, it keeps running and its output is read through `proc://`.", BASH_TIMEOUT.as_secs()),
+            "parameters": {"type": "object", "properties": {
+                "command": {"type": "string"},
+                "background": {"type": "boolean", "description": "Start the command as a background job and return its proc:// id instead of waiting."}
+            }, "required": ["command"]}
         }},
         {"type": "function", "function": {
             "name": READ_FILE,
@@ -447,6 +471,9 @@ pub(crate) fn definitions() -> Value {
 #[serde(deny_unknown_fields)]
 struct BashArgs {
     command: String,
+    /// Start the command as a background job and return its `proc://` id instead of waiting.
+    #[serde(default)]
+    background: bool,
 }
 
 #[derive(Deserialize)]
@@ -472,12 +499,13 @@ pub(crate) fn outcome(result: Result<String, String>) -> String {
     truncate(result.unwrap_or_else(|e| format!("error: {e}")))
 }
 
-/// What a worker's tool call may reach beyond its working directory: its skills, its profiles and
-/// the servers.
+/// What a worker's tool call may reach beyond its working directory: its skills, its profiles, the
+/// servers, and the caller itself when it has one.
 pub(crate) struct Context<'a> {
     pub(crate) skills: &'a skills::Catalogue,
     pub(crate) profiles: &'a profiles::Catalogue,
     pub(crate) mcp: &'a mcp::Registry,
+    pub(crate) scope: Option<&'a url::Scope<'a>>,
 }
 
 /// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
@@ -510,7 +538,9 @@ fn run(
         READ_FILE => {
             parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts, context))
         }
-        WRITE_FILE => parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts)),
+        WRITE_FILE => {
+            parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts, context))
+        }
         // An MCP server reports its own failures as text, which is what the model reads.
         _ if name.starts_with(mcp::PREFIX) => Ok(context.mcp.call(name, arguments)),
         _ => Err(format!("unknown tool {name}")),
@@ -529,6 +559,10 @@ enum Stopped {
 }
 
 fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration, cancel: Option<&AtomicBool>) -> Result<String, String> {
+    if args.background {
+        let id = jobs::start(&args.command, working_dir)?;
+        return Ok(format!("started job {id}; read proc://{id} for its output"));
+    }
     // Its own process group, so a timeout kills the command's children too: killing `sh` alone leaves a
     // grandchild holding the pipes open, and reading their output then blocks until it exits by itself.
     let mut command = Command::new("sh");
@@ -542,8 +576,8 @@ fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration, cancel: Option<&
         .process_group(0);
     let (mut child, group) = spawn_grouped(&mut command)?;
     // Both pipes are drained by their own thread, so a chatty command cannot fill a pipe and stall.
-    let mut stdout = drain(child.stdout.take());
-    let mut stderr = drain(child.stderr.take());
+    let mut stdout = drain(child.stdout.take(), MAX_OUTPUT_BYTES);
+    let mut stderr = drain(child.stderr.take(), MAX_OUTPUT_BYTES);
     let (status, stopped) = match wait_with_deadline(&mut child, group, timeout, cancel) {
         Ok(done) => done,
         Err(e) => {
@@ -560,6 +594,52 @@ fn bash(working_dir: &Path, args: &BashArgs, timeout: Duration, cancel: Option<&
     let (err, err_cut) = stderr.take_output(drain_by, group);
     deregister(group);
     Ok(format_output(status, stopped, timeout, (&out, out_cut), (&err, err_cut)))
+}
+
+/// Runs a program to completion and returns its stdout, for a scheme that shells out to a client.
+pub(crate) fn capture(program: &str, args: &[String], cwd: &Path, timeout: Duration) -> Result<String, String> {
+    capture_limited(program, args, cwd, timeout, MAX_OUTPUT_BYTES)
+}
+
+/// As [`capture`], keeping only the first `max_bytes` of stdout: `ssh://` reads a bound file, not a whole one.
+pub(crate) fn capture_limited(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let (mut child, group) = spawn_grouped(&mut command).map_err(|e| format!("{program}: {e}"))?;
+    let mut stdout = drain(child.stdout.take(), max_bytes);
+    let mut stderr = drain(child.stderr.take(), MAX_OUTPUT_BYTES);
+    let (status, stopped) = match wait_with_deadline(&mut child, group, timeout, None) {
+        Ok(done) => done,
+        Err(e) => {
+            let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
+            deregister(group);
+            return Err(e);
+        }
+    };
+    let drain_by = Instant::now() + DRAIN_GRACE;
+    let (out, _) = stdout.take_output(drain_by, group);
+    let (err, _) = stderr.take_output(drain_by, group);
+    deregister(group);
+    if let Stopped::TimedOut = stopped {
+        return Err(format!("{program} killed after {}s", timeout.as_secs()));
+    }
+    if status.success() {
+        return Ok(String::from_utf8_lossy(&out).into_owned());
+    }
+    let code = status.code().map_or_else(|| "killed by signal".to_string(), |code| code.to_string());
+    Err(format!("{program} exited {code}: {}", String::from_utf8_lossy(&err).trim()))
 }
 
 /// Waits for `child` to exit, killing its process group once `timeout` elapses or `cancel` is set.
@@ -637,7 +717,7 @@ impl Drain {
     }
 }
 
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
+fn drain<R: Read + Send + 'static>(pipe: Option<R>, cap: usize) -> Drain {
     Drain(pipe.map(|mut pipe| {
         thread::spawn(move || {
             // Storage stops at the cap; reading never does, because an unread pipe blocks its writer.
@@ -648,7 +728,7 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
                 match pipe.read(&mut scratch) {
                     Ok(0) | Err(_) => return (kept, truncated),
                     Ok(read) => {
-                        let room = MAX_OUTPUT_BYTES.saturating_sub(kept.len());
+                        let room = cap.saturating_sub(kept.len());
                         let keep = read.min(room);
                         if let Some(head) = scratch.get(..keep) {
                             kept.extend_from_slice(head);
@@ -676,6 +756,7 @@ fn read_file(
                 conflicts: Some(conflicts),
                 skills: Some(context.skills),
                 profiles: Some(context.profiles),
+                scope: context.scope,
             },
             &args.path,
         );
@@ -751,10 +832,15 @@ fn list_conflicts(working_dir: &Path, display: &str, conflicts: &mut conflict::R
     Ok(summary)
 }
 
-fn write_file(working_dir: &Path, args: &WriteArgs, conflicts: &mut conflict::Registry) -> Result<String, String> {
+fn write_file(
+    working_dir: &Path,
+    args: &WriteArgs,
+    conflicts: &mut conflict::Registry,
+    context: &Context<'_>,
+) -> Result<String, String> {
     if url::is_url(&args.path) {
         return url::write(
-            &mut url::Ctx { conflicts: Some(conflicts), skills: None, profiles: None },
+            &mut url::Ctx { conflicts: Some(conflicts), skills: None, profiles: None, scope: context.scope },
             &args.path,
             &args.content,
         );
@@ -773,13 +859,14 @@ fn truncate(s: String) -> String {
         return s;
     }
     let total = s.len();
+    let id = artifacts::spill(s.clone());
     let half = MAX_OUTPUT_BYTES / 2;
     let head_end = floor_boundary(&s, half);
     let tail_start = ceil_boundary(&s, total - half);
     let elided = tail_start.saturating_sub(head_end);
     let head = s.get(..head_end).unwrap_or_default();
     let tail = s.get(tail_start..).unwrap_or_default();
-    format!("{head}\n[truncated: {elided} of {total} bytes elided]\n{tail}")
+    format!("{head}\n[truncated: {elided} of {total} bytes elided; full output at artifact://{id}]\n{tail}")
 }
 
 /// Largest char boundary of `s` at or below `at`.
@@ -813,6 +900,86 @@ mod tests {
         Policy { allow_tools: vec![BASH.into(), READ_FILE.into(), WRITE_FILE.into()], ..Policy::default() }
     }
 
+    /// The configuration a scoped call runs under: one root, one model, one base URL.
+    fn test_config(dir: &Path) -> config::Config {
+        config::Config {
+            roots: vec![dir.to_path_buf()],
+            base_url: "https://user:pass@example.test/v1".into(),
+            model: "m-1".into(),
+            theme: config::Theme::Auto,
+            max_depth: 3,
+            dir: dir.to_path_buf(),
+            home: dir.to_path_buf(),
+        }
+    }
+
+    /// A `read_file` as a real agent makes it: with a scope over `cfg` and `policy`.
+    fn scoped(dir: &Path, cfg: &config::Config, policy: &Policy, path: &str) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let skills = skills::Catalogue::user(home.path());
+        let profiles = profiles::Catalogue::default();
+        let mcp = mcp::Registry::load(home.path());
+        let scope =
+            url::Scope { caller: 1, swarm: None, config: cfg, working_dir: dir, policy, mcp: &mcp, remaining_depth: 3 };
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: Some(&scope) };
+        let args = json!({"path": path}).to_string();
+        execute_guarded(dir, READ_FILE, &args, policy, None, &mut registry(), &context)
+    }
+
+    #[test]
+    fn the_settings_are_readable_one_key_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let policy = file_tools();
+        assert_eq!(scoped(dir.path(), &cfg, &policy, "cfg://model"), "m-1");
+        assert_eq!(
+            scoped(dir.path(), &cfg, &policy, "cfg://base_url"),
+            "https://***@example.test/v1",
+            "the userinfo of a base URL never reaches a model"
+        );
+        assert_eq!(scoped(dir.path(), &cfg, &policy, "cfg://max_depth"), "3");
+        let unknown = scoped(dir.path(), &cfg, &policy, "cfg://nobody");
+        assert!(unknown.starts_with("error: unknown setting nobody; settings are roots, base_url"), "{unknown}");
+        let listing = scoped(dir.path(), &cfg, &policy, "cfg://");
+        assert!(listing.starts_with("roots = "), "{listing}");
+        assert!(listing.contains("\nmodel = m-1\n"), "{listing}");
+    }
+
+    #[test]
+    fn the_rights_and_the_schemas_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let open = file_tools();
+        assert!(
+            scoped(dir.path(), &cfg, &open, "security://").contains("tools you may call: bash read_file write_file"),
+            "{}",
+            scoped(dir.path(), &cfg, &open, "security://")
+        );
+        assert_eq!(scoped(dir.path(), &cfg, &open, "security://bash"), "bash: no command rules");
+        assert_eq!(scoped(dir.path(), &cfg, &open, "security://read_file"), "allowed");
+        let readonly = Policy { read_only: true, ..file_tools() };
+        assert_eq!(
+            scoped(dir.path(), &cfg, &readonly, "security://write_file"),
+            "denied: this agent is read-only: write_file is refused"
+        );
+        assert!(
+            scoped(dir.path(), &cfg, &open, "security://nobody").starts_with("unknown tool nobody; tools are "),
+            "an unknown tool names the ones that exist"
+        );
+
+        let schema = scoped(dir.path(), &cfg, &open, "xd://read_file");
+        let parsed: Value = serde_json::from_str(&schema).expect("the schema is JSON");
+        assert_eq!(parsed.get("name").and_then(Value::as_str), Some("read_file"));
+        let names = scoped(dir.path(), &cfg, &open, "xd://");
+        assert!(names.lines().any(|line| line == "write_file"), "{names}");
+        assert!(scoped(dir.path(), &cfg, &open, "xd://nobody").starts_with("error: unknown tool nobody"));
+
+        assert_eq!(scoped(dir.path(), &cfg, &open, "overseer://"), "topics: schemes, config, tools, agents");
+        assert!(scoped(dir.path(), &cfg, &open, "overseer://schemes").contains("internal URIs:"));
+        assert!(scoped(dir.path(), &cfg, &open, "overseer://config").starts_with("roots = "));
+        assert!(scoped(dir.path(), &cfg, &open, "overseer://tools").lines().any(|line| line == "bash: Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after 300 seconds. With `background`, it keeps running and its output is read through `proc://`."));
+        assert!(scoped(dir.path(), &cfg, &open, "overseer://x").starts_with("error: unknown topic x; topics are "));
+    }
     /// A tool call under `file_tools`, no cancellation and a fresh registry: each test sees its own ids.
     fn execute(dir: &Path, name: &str, arguments: &str) -> String {
         guarded(dir, name, arguments, &file_tools(), None, &mut registry())
@@ -843,7 +1010,7 @@ mod tests {
             policy,
             cancel,
             conflicts,
-            &Context { skills: &skills, profiles: &profiles, mcp: &mcp },
+            &Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None },
         )
     }
 
@@ -948,7 +1115,7 @@ mod tests {
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
         let profiles = profiles::Catalogue::default();
-        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
         let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None, &context));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
@@ -1019,10 +1186,11 @@ mod tests {
         for name in [READ_FILE, WRITE_FILE] {
             let text = described(name);
             assert!(text.contains("Internal URIs are accepted as `path`"), "{text}");
-            assert!(text.contains("`conflict://`"), "{text}");
-            for reserved in ["mcp://", "ssh://", "pr://"] {
-                assert!(!text.contains(reserved), "{name} advertises {reserved}: {text}");
+            // Every scheme the build resolves is named, and nothing else looks like one.
+            for scheme in url::SCHEMES.iter().map(|scheme| scheme.name) {
+                assert!(text.contains(&format!("`{scheme}://`")), "{name} does not advertise {scheme}: {text}");
             }
+            assert!(!text.contains("`nobody://`"), "{name} advertises a scheme this build lacks: {text}");
         }
     }
 
@@ -1058,10 +1226,34 @@ mod tests {
     #[test]
     fn truncation_keeps_the_head_and_the_tail() {
         let out = truncate("é".repeat(20_000)); // 40 000 bytes, 2 per char
-        assert!(out.contains("[truncated: 10000 of 40000 bytes elided]"), "{out}");
+        assert!(out.contains("[truncated: 10000 of 40000 bytes elided; full output at artifact://"), "{out}");
         assert!(out.starts_with("éé"), "{out}");
         assert!(out.ends_with("éé"), "{out}");
-        assert!(out.len() < MAX_OUTPUT_BYTES + 80, "{}", out.len());
+        assert!(out.len() < MAX_OUTPUT_BYTES + 120, "{}", out.len());
+    }
+
+    #[test]
+    fn an_elided_result_is_read_back_whole_through_its_artifact() {
+        let text = format!("HEAD\n{}\nTAIL", "middle ".repeat(6_000));
+        let out = truncate(text.clone());
+        let marker = out.split("full output at artifact://").nth(1).expect("the marker names an artifact");
+        let id: String = marker.chars().take_while(char::is_ascii_digit).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut read = String::new();
+        let mut offset = 0;
+        loop {
+            let page =
+                execute(dir.path(), READ_FILE, &json!({"path": format!("artifact://{id}/{offset}")}).to_string());
+            let Some((body, rest)) = page.split_once("\n[artifact ") else {
+                read.push_str(&page);
+                break;
+            };
+            read.push_str(body);
+            let link = rest.split_once("read artifact://").expect("a page marker links to the next page").1;
+            let next = link.split_once('/').expect("the link carries the next offset").1;
+            offset = next.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap();
+        }
+        assert_eq!(read, text);
     }
 
     #[test]
@@ -1080,7 +1272,7 @@ mod tests {
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
         let profiles = profiles::Catalogue::default();
-        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
         let started = Instant::now();
         // `sh` exits at once; the child it left behind inherits both pipes, so only the group kill
         // DRAIN_GRACE allows can close them.
@@ -1232,7 +1424,7 @@ mod tests {
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
         let profiles = profiles::Catalogue::default();
-        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
         let read = json!({"path": "skill://caveman"}).to_string();
         let out = execute_guarded(dir.path(), READ_FILE, &read, &file_tools(), None, &mut registry(), &context);
         assert!(out.contains("body"), "{out}");
@@ -1247,7 +1439,7 @@ mod tests {
         let skills = skills::Catalogue::in_dir(home.path(), home.path());
         let profiles = profiles::Catalogue::default();
         let mcp = mcp::Registry::load(home.path());
-        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
+        let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
         let mut conflicts = conflict::Registry::default();
         let args = ReadArgs { path: "profile://orchestrator".into() };
         let text = read_file(home.path(), &args, &mut conflicts, &context).unwrap();

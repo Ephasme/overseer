@@ -23,6 +23,8 @@ pub(crate) enum UiEvent {
     AgentThought { id: usize, text: String },
     /// A tool call, when it starts and when it ends.
     Progress { id: usize, progress: Progress },
+    /// An agent's `out://` text, shown as the agent wrote it.
+    Out { id: usize, text: String },
     /// The tree after a change.
     Agents(Vec<AgentView>),
     /// An agent turn started or finished.

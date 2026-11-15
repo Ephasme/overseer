@@ -1,15 +1,20 @@
 mod agent;
+mod artifacts;
 mod clipboard;
 mod config;
 mod conflict;
 mod event;
+mod forge;
+mod jobs;
 mod llm;
 mod mcp;
+mod memory;
 mod names;
 mod plain;
 mod profiles;
 mod prompt;
 mod repos;
+mod rules;
 mod secrets;
 mod session;
 mod skills;
@@ -18,6 +23,7 @@ mod swarm;
 mod tools;
 mod tui;
 mod url;
+mod vault;
 mod version;
 
 use anyhow::{Context, Result};

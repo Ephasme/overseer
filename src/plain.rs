@@ -33,6 +33,7 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
                     let _ = writeln!(stderr, "  {line}");
                 }
             }
+            UiEvent::Out { id, text } => out(&format!("[agent {id} · {} out]\n{text}", name(&agents, id))),
             UiEvent::Progress { id, progress } => err(&format!("[{}] {}", label(&agents, id), describe(&progress))),
             // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
             UiEvent::AgentDelta { .. }

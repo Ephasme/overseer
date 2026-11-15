@@ -22,6 +22,16 @@ const MAX_ERROR_BODY: usize = 500;
 /// Most `tools/list` pages followed before the server is called broken.
 const MAX_TOOL_PAGES: usize = 64;
 
+/// Most `resources/list` pages followed before the server is called broken.
+const MAX_RESOURCE_PAGES: usize = 64;
+
+/// One resource a server offers, as `mcp://` lists it.
+pub(crate) struct Resource {
+    pub(crate) uri: String,
+    pub(crate) name: String,
+    pub(crate) mime: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolDef {
     pub(crate) name: String,
@@ -99,6 +109,53 @@ impl Client {
         }
         let result = self.request("tools/call", &json!({"name": tool, "arguments": parsed}))?;
         Ok(render(&result))
+    }
+
+    /// `resources/list`, following `nextCursor` until the server stops offering one.
+    pub(crate) fn resources(&mut self) -> Result<Vec<Resource>, CallError> {
+        let mut resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen: HashSet<String> = HashSet::new();
+        loop {
+            let params = cursor.as_ref().map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+            let page = self.request("resources/list", &params)?;
+            for item in page.get("resources").and_then(Value::as_array).into_iter().flatten() {
+                let Some(uri) = item.get("uri").and_then(Value::as_str) else { continue };
+                resources.push(Resource {
+                    uri: uri.to_string(),
+                    name: item.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    mime: item.get("mimeType").and_then(Value::as_str).map(ToString::to_string),
+                });
+            }
+            cursor = page.get("nextCursor").and_then(Value::as_str).map(ToString::to_string);
+            match cursor {
+                None => return Ok(resources),
+                Some(next) if !seen.insert(next.clone()) => {
+                    return Err(CallError::Failed(format!("resources/list repeated cursor {next}")));
+                }
+                Some(_) if seen.len() > MAX_RESOURCE_PAGES => {
+                    return Err(CallError::Failed(format!("resources/list went past {MAX_RESOURCE_PAGES} pages")));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// `resources/read`: its `contents[]` as text, a blob named rather than inlined.
+    pub(crate) fn read_resource(&mut self, uri: &str) -> Result<String, CallError> {
+        let result = self.request("resources/read", &json!({"uri": uri}))?;
+        let mut parts: Vec<String> = Vec::new();
+        for item in result.get("contents").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+                let mime = item.get("mimeType").and_then(Value::as_str).unwrap_or("unknown");
+                parts.push(format!("[binary: {mime}, {} base64 bytes]", blob.len()));
+            } else {
+                parts.push(item.to_string());
+            }
+        }
+        Ok(parts.join("\n"))
     }
 }
 
