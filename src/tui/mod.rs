@@ -84,6 +84,9 @@ fn event_loop(
                     MouseEventKind::ScrollUp => app.wheel(true),
                     MouseEventKind::ScrollDown => app.wheel(false),
                     MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
+                    // A drag off the panel's rule resizes it; anywhere else the pointer does nothing.
+                    MouseEventKind::Drag(MouseButton::Left) => app.drag(mouse.column),
+                    MouseEventKind::Up(MouseButton::Left) => app.release(),
                     _ => {}
                 },
                 Input::Resize(..) => app.resize(),
