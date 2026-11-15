@@ -1,0 +1,906 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI coding harnesses: omp, jcode, opencode, hermes</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/basecoat-css@1.0.2/dist/basecoat.cdn.min.css">
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #111113;
+    --muted: #65656b;
+    --border: #e4e4e7;
+    --surface: #fafafa;
+    --accent: #4f46e5;
+    --ok: #15803d;
+    --warn: #b45309;
+    --bad: #b91c1c;
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(79,70,229,.28); }
+  a:hover { border-bottom-color: var(--accent); }
+  code, .mono { font-family: var(--mono); font-size: .88em; }
+  code { background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .08em .34em; }
+  h1, h2, h3, h4 { line-height: 1.22; letter-spacing: -.01em; margin: 0; }
+  h1 { font-size: clamp(26px, 3.2vw, 40px); font-weight: 640; }
+  h2 { font-size: clamp(19px, 2vw, 25px); font-weight: 620; }
+  h3 { font-size: 15px; font-weight: 620; }
+  p { margin: 0; }
+
+  /* Chrome */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(255,255,255,.94);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 10px clamp(20px, 4vw, 64px);
+    display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+  }
+  .topbar .brand { font-weight: 640; font-size: 14px; letter-spacing: -.01em; }
+  .topbar nav { display: flex; gap: 2px; flex-wrap: wrap; }
+  .topbar nav a {
+    border: 0; padding: 3px 7px; border-radius: 6px; font-size: 12.5px; color: var(--muted);
+  }
+  .topbar nav a:hover { background: var(--surface); color: var(--fg); }
+
+  header.hero {
+    padding: clamp(28px, 4vw, 56px) clamp(20px, 4vw, 64px) clamp(20px, 3vw, 32px);
+    border-bottom: 1px solid var(--border);
+  }
+  .eyebrow {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--muted); font-weight: 600; margin-bottom: 10px;
+  }
+  .hero h1 span { color: var(--muted); font-weight: 520; }
+  .lede { margin-top: 12px; max-width: 110ch; color: #2b2b31; }
+  .meta-row { margin-top: 18px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+  main { padding: clamp(8px, 2vw, 16px) clamp(20px, 4vw, 64px) 120px; }
+  section.block { padding: clamp(28px, 3.4vw, 48px) 0; border-bottom: 1px solid var(--border); scroll-margin-top: 56px; }
+  section.block:last-of-type { border-bottom: 0; }
+  .block-head { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+  .block-num {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px;
+  }
+  .block-sub { color: var(--muted); margin-bottom: 20px; max-width: 118ch; }
+
+  /* Chips */
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 560; line-height: 1;
+    padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface); color: #3f3f46; white-space: nowrap;
+  }
+  .chip.ok { color: var(--ok); border-color: #bbf7d0; background: #f0fdf4; }
+  .chip.warn { color: var(--warn); border-color: #fde68a; background: #fffbeb; }
+  .chip.bad { color: var(--bad); border-color: #fecaca; background: #fef2f2; }
+  .chip.accent { color: var(--accent); border-color: #c7d2fe; background: #eef2ff; }
+
+  /* Grids */
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 16px; }
+
+  .card {
+    background: #fff; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  .card > h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .card ul { margin: 0; padding-left: 18px; display: grid; gap: 7px; }
+  .card li { color: #2f2f35; }
+  .card li::marker { color: #a1a1aa; }
+  .card p + p { margin-top: 8px; }
+  .note { font-size: 13px; color: var(--muted); }
+
+  /* Tables */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: #fff; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th {
+    text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 620; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); background: var(--surface); white-space: nowrap;
+  }
+  tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody th {
+    padding: 11px 14px; border-bottom: 1px solid var(--border); text-align: left;
+    font-weight: 600; font-size: 13.5px; vertical-align: top; background: #fff; width: 18%;
+  }
+  tbody tr:hover td, tbody tr:hover th { background: #fcfcfd; }
+  td kbd { font-family: var(--mono); font-size: .86em; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 0 .3em; }
+
+  /* Callouts */
+  .callout {
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    background: var(--surface); padding: 14px 18px; display: grid; gap: 8px;
+  }
+  .callout.bad { border-left-color: var(--bad); }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout h3 { font-size: 14px; }
+  .callout ul { margin: 0; padding-left: 18px; display: grid; gap: 7px; font-size: 14px; }
+
+  /* Correction rows */
+  .fix { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px dashed var(--border); }
+  .fix:last-child { border-bottom: 0; padding-bottom: 0; }
+  .fix .wrong { font-size: 13px; color: var(--muted); text-decoration: line-through; text-decoration-color: rgba(185,28,28,.4); }
+  .fix .right { font-size: 14px; }
+
+  /* Thesis cards */
+  .thesis { border-top: 2px solid var(--accent); }
+  .thesis h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .thesis p { margin-top: 8px; font-size: 15.5px; line-height: 1.5; }
+
+  figure.diagram { margin: 0; border: 1px solid var(--border); border-radius: var(--radius); background: #fff; padding: 14px; }
+  figure.diagram svg { display: block; width: 100%; height: auto; }
+  figcaption { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .src { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .stack { display: grid; gap: 14px; }
+  .inline-list { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  footer { padding: 26px clamp(20px, 4vw, 64px) 80px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  footer p + p { margin-top: 6px; }
+  @media (max-width: 640px) {
+    .topbar { gap: 10px; }
+    .topbar nav { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">Harness comparison</span>
+  <nav>
+    <a href="#corrections">Corrections</a>
+    <a href="#runtime">Runtime</a>
+    <a href="#clients">Clients</a>
+    <a href="#providers">Providers</a>
+    <a href="#tools">Tools</a>
+    <a href="#safety">Safety</a>
+    <a href="#context">Context</a>
+    <a href="#agents">Multi-agent</a>
+    <a href="#ext">Extensibility</a>
+    <a href="#sessions">Sessions</a>
+    <a href="#automation">Automation</a>
+    <a href="#others">Others</a>
+    <a href="#refusals">Refusals</a>
+  </nav>
+</div>
+
+<header class="hero">
+  <div class="eyebrow">Feature comparison, themed not per-vendor</div>
+  <h1>omp <span>·</span> jcode <span>·</span> opencode <span>·</span> hermes</h1>
+  <p class="lede">
+    Everything gathered across this session, grouped by scope: runtime, clients, providers, tools, isolation,
+    context engineering, multi-agent, extensibility, sessions, automation. Every substantive claim carries its
+    source. Cells I could not source were removed rather than guessed, and the refusals are itemised at the end.
+  </p>
+  <div class="meta-row">
+    <span class="chip">checked 2026-11-14</span>
+    <span class="chip">opencode = V2 docs</span>
+    <span class="chip">jcode site numbers = v0.92.14</span>
+    <span class="chip ok">sourced</span>
+    <span class="chip warn">vendor-reported</span>
+    <span class="chip bad">refused</span>
+  </div>
+</header>
+
+<main>
+
+<!-- ============ THESIS ============ -->
+<section class="block" id="thesis">
+  <div class="block-head"><h2>One line each</h2></div>
+  <p class="block-sub">Not a ranking. Each harness optimises a different bottleneck, which is why the feature lists overlap on the coding loop and diverge everywhere else.</p>
+  <div class="grid-4">
+    <div class="card thesis">
+      <h3>omp</h3>
+      <p>Tool reach. AST surgery, LSP, DAP, browser relay, desktop computer use, JS/Python kernels, all behind one approval model.</p>
+    </div>
+    <div class="card thesis">
+      <h3>jcode</h3>
+      <p>Throughput. Rust daemon, socket clients, swarms with file-conflict notice, megabytes per extra session.</p>
+    </div>
+    <div class="card thesis">
+      <h3>opencode</h3>
+      <p>Governance. One shared server per user, a permission DSL over action × resource, plugin surfaces for desktop and TUI.</p>
+    </div>
+    <div class="card thesis">
+      <h3>hermes</h3>
+      <p>Persistence and reach. Memory plus self-written skills, cron, 21 platforms, six terminal backends.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CORRECTIONS ============ -->
+<section class="block" id="corrections">
+  <div class="block-head">
+    <span class="block-num">00</span>
+    <h2>Corrections to my earlier summary</h2>
+    <span class="chip bad">read this first</span>
+  </div>
+  <p class="block-sub">My first pass asserted omissions that the vendor docs contradict. Corrected below; treat any recall of the earlier list as stale.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>opencode does have rollback and compaction</h3>
+      <div class="fix">
+        <div class="wrong">I wrote “—” for sessions and context recovery.</div>
+        <div class="right"><code>/undo</code> and <code>/redo</code> stage a rollback of conversation and files, per model step. <a href="https://opencode.ai/docs/snapshots">Snapshots</a>. Compaction is on by default with a summary plus ~15k recent tokens. <a href="https://opencode.ai/docs/compaction">Compaction</a>.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes does have LSP</h3>
+      <div class="fix">
+        <div class="wrong">I wrote “LSP not seen”.</div>
+        <div class="right">“Real language servers (pyright, gopls, rust-analyzer, …) wired into the post-write lint check used by write_file and patch.” <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/lsp">LSP, semantic diagnostics</a>.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>jcode sandboxing is not “no”, it is “unshipped design”</h3>
+      <div class="fix">
+        <div class="wrong">I implied a missing isolation model.</div>
+        <div class="right">The safety doc is marked <code>Status: Design</code>, updated 2026-02-08, “currently the only consumer is ambient mode” <a href="https://github.com/1jehuang/jcode/blob/master/docs/SAFETY_SYSTEM.md">SAFETY_SYSTEM.md</a>. Its own HARNESS.md says session env isolation “is not a security sandbox or secret-redaction system” <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a>.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>omp citations are local, not URLs</h3>
+      <div class="fix">
+        <div class="wrong">The earlier tables cited <code>omp://…</code> as if linkable.</div>
+        <div class="right">These are documents shipped with the binary: official docs for the project, canonical for behaviour, but with no public web address. Cited by document name throughout.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 1 RUNTIME ============ -->
+<section class="block" id="runtime">
+  <div class="block-head"><span class="block-num">01</span><h2>Process and runtime architecture</h2></div>
+  <p class="block-sub">The four architectures differ more here than anywhere else: per-session process, daemon plus socket clients, one shared server per user, gateway plus channels.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 980 300" role="img" aria-label="Four process architectures: omp single session process; jcode daemon with socket clients; opencode shared server per user; hermes gateway with messaging platforms">
+      <g font-family="ui-sans-serif, system-ui, sans-serif" font-size="12" fill="currentColor">
+        <!-- panels -->
+        <g>
+          <text x="0" y="16" font-size="13" font-weight="600">omp</text>
+          <text x="0" y="33" fill="#65656b">session process owns tools</text>
+          <rect x="8" y="48" width="104" height="52" rx="8" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="24" y="70">TUI</text>
+          <text x="24" y="88" fill="#65656b" font-size="11">one process</text>
+          <rect x="132" y="48" width="96" height="52" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="146" y="70">rpc / acp</text>
+          <text x="146" y="88" fill="#65656b" font-size="11">stdio server</text>
+          <path d="M112 74 H130" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <rect x="8" y="118" width="220" height="42" rx="8" fill="#fff" stroke="#e4e4e7"/>
+          <text x="20" y="136">session JSONL per profile</text>
+          <text x="20" y="152" fill="#65656b" font-size="11">--profile isolates auth, caches</text>
+        </g>
+        <!-- jcode -->
+        <g transform="translate(252,0)">
+          <text x="0" y="16" font-size="13" font-weight="600">jcode</text>
+          <text x="0" y="33" fill="#65656b">daemon owns work</text>
+          <rect x="8" y="48" width="86" height="52" rx="8" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="20" y="70">TUI</text>
+          <text x="20" y="88" fill="#65656b" font-size="11">thin client</text>
+          <rect x="118" y="48" width="108" height="52" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="130" y="70">daemon</text>
+          <text x="130" y="88" fill="#65656b" font-size="11">tools + provider</text>
+          <path d="M96 74 H116" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <text x="118" y="118" font-size="10.5" fill="#65656b">unix socket, SSH-forwardable</text>
+          <rect x="8" y="130" width="218" height="42" rx="8" fill="#fff" stroke="#e4e4e7"/>
+          <text x="20" y="148">paired phone / web clients</text>
+          <text x="20" y="164" fill="#65656b" font-size="11">WebSocket gateway, hashed tokens</text>
+        </g>
+        <!-- opencode -->
+        <g transform="translate(504,0)">
+          <text x="0" y="16" font-size="13" font-weight="600">opencode</text>
+          <text x="0" y="33" fill="#65656b">one server per user</text>
+          <rect x="8" y="48" width="66" height="40" rx="7" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="18" y="73">TUI</text>
+          <rect x="82" y="48" width="66" height="40" rx="7" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="88" y="73">desktop</text>
+          <rect x="156" y="48" width="54" height="40" rx="7" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="164" y="73">web</text>
+          <rect x="8" y="112" width="202" height="46" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="22" y="131">shared background server</text>
+          <text x="22" y="147" fill="#65656b" font-size="11">sessions, config, permissions, tools</text>
+          <path d="M40 88 V110" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <path d="M114 88 V110" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <path d="M182 88 V110" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <text x="8" y="180" font-size="10.5" fill="#65656b">--standalone / --server opt out</text>
+        </g>
+        <!-- hermes -->
+        <g transform="translate(756,0)">
+          <text x="0" y="16" font-size="13" font-weight="600">hermes</text>
+          <text x="0" y="33" fill="#65656b">gateway plus channels</text>
+          <rect x="8" y="48" width="196" height="40" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="22" y="73">messaging gateway</text>
+          <rect x="8" y="102" width="90" height="40" rx="7" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="20" y="127">CLI / TUI</text>
+          <rect x="110" y="102" width="94" height="40" rx="7" fill="#fafafa" stroke="#e4e4e7"/>
+          <text x="120" y="127">Desktop</text>
+          <path d="M52 88 V100" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <path d="M156 88 V100" stroke="#a1a1aa" stroke-width="1.5" marker-end="url(#ar)"/>
+          <text x="8" y="166" font-size="10.5" fill="#65656b">21+ platforms, 19 native</text>
+          <text x="8" y="182" font-size="10.5" fill="#65656b">cron + background agents</text>
+        </g>
+        <defs>
+          <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L8 4 L0 8 z" fill="#a1a1aa"/>
+          </marker>
+        </defs>
+      </g>
+    </svg>
+    <figcaption>Process models as documented by each project. omp: <code>omp://cli-reference.md</code> § Output modes. jcode: docs § Remote use. opencode: docs § Background service. hermes: llms.txt gateway entries.</figcaption>
+  </figure>
+
+  <div class="grid-2" style="margin-top:16px">
+    <div class="card">
+      <h3><span class="dot"></span>omp</h3>
+      <ul>
+        <li>One process per session. <code>--mode rpc</code> / <code>rpc-ui</code> turn it into a line-delimited JSON command/response server; <code>acp</code> serves the Agent Client Protocol over stdio. <span class="src">omp://cli-reference.md</span></li>
+        <li><code>--profile</code> isolates auth, sessions, settings and caches; <code>--session-dir</code> relocates session storage. <span class="src">omp://cli-reference.md</span></li>
+        <li>Built as TypeScript plus Rust native crates behind <code>@oh-my-pi/pi-natives</code>. <span class="src">omp://user-facing-packages.md</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>jcode</h3>
+      <ul>
+        <li>“The daemon owns sessions, tools, and provider calls. The TUI is a client on a socket, so the server can live anywhere.” <a href="https://jcode.sh/docs">docs, Remote use</a></li>
+        <li><code>jcode serve</code> plus <code>--socket</code> over SSH forwarding; <code>-C</code> takes a local checkout and <code>--remote-working-dir</code> the absolute remote path where “every tool, git operation, and edit runs”. <a href="https://jcode.sh/docs">docs, Local client, remote server</a></li>
+        <li>Rust. <a href="https://jcode.sh/">jcode.sh</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>opencode</h3>
+      <ul>
+        <li>“OpenCode discovers or starts one shared background server for your user account. Every local OpenCode client connects to that server, which owns sessions, configuration, integrations, permissions, and tool execution.” <a href="https://opencode.ai/docs/cli">CLI docs, Background service</a></li>
+        <li><code>--standalone</code> runs a private server, <code>--server &lt;url&gt;</code> attaches to a given one; <code>opencode service set disabled true</code> turns the shared service off. <a href="https://opencode.ai/docs/cli">same page</a></li>
+        <li>Session database is SQLite; path printed by <code>opencode debug paths db</code>. <a href="https://opencode.ai/docs/cli">same page</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes</h3>
+      <ul>
+        <li>Gateway process routing sessions; a documented “one-gateway-for-all-profiles mode” with scope composition and inbound routing. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/multiplexing-gateway">Multiplexing Gateway Internals</a></li>
+        <li>Session database <code>state.db</code> with a documented recovery path for a corrupt FTS index or file. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/state-db-recovery">State DB Recovery</a></li>
+        <li>Python, embeddable as a library (<code>AIAgent</code>). <a href="https://hermes-agent.nousresearch.com/docs/guides/python-library">Python library guide</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2 CLIENTS ============ -->
+<section class="block" id="clients">
+  <div class="block-head"><span class="block-num">02</span><h2>Clients and surfaces</h2></div>
+  <p class="block-sub">Where the same engine shows up. This is the axis on which hermes is least like the other three.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Surface</th><th>omp</th><th>jcode</th><th>opencode</th><th>hermes</th></tr></thead>
+      <tbody>
+        <tr>
+          <th>TUI</th>
+          <td>Default interface; renderer internals documented (<code>omp://tui.md</code>) plus a deterministic <code>omp gallery</code> preview of tool/composer/status renderers.</td>
+          <td>Rust TUI: inline images, LaTeX, mermaid, clickable links, idle animation (<a href="https://jcode.sh/">jcode.sh screenshots</a>).</td>
+          <td>Full-screen TUI, separate keybind/theme docs, plus <code>opencode mini</code> for a minimal interactive interface (<a href="https://opencode.ai/docs/cli">CLI docs</a>).</td>
+          <td>Ink-based TUI, “mouse-friendly, rich overlays, non-blocking input” (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/tui">TUI guide</a>).</td>
+        </tr>
+        <tr>
+          <th>Headless</th>
+          <td><code>omp -p</code> prints the last answer; <code>--mode json</code> emits newline-delimited events; cost cap stops with exit status 3. <span class="src">omp://cli-reference.md</span></td>
+          <td><code>jcode run "…"</code>; auto-poke continues headless runs while todos are unfinished (<a href="https://jcode.sh/">jcode.sh</a>).</td>
+          <td><code>opencode run "…"</code>, “designed for scripts, CI jobs” (<a href="https://opencode.ai/docs/cli">CLI docs</a>).</td>
+          <td>Batch trajectory generation with checkpointing (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/batch-processing">Batch Processing</a>).</td>
+        </tr>
+        <tr>
+          <th>Desktop</th>
+          <td>None documented; the browser guest UI is the closest (<code>omp://collab.md</code>).</td>
+          <td>Desktop app <em>beta</em>, linked from the site (<a href="https://jcode.sh/">jcode.sh</a>).</td>
+          <td>Desktop build for macOS, Windows, Linux; plugins can add GUI panels (<a href="https://opencode.ai/docs/">Intro</a>, <a href="https://opencode.ai/docs/plugins">Plugins</a>).</td>
+          <td>Hermes Desktop: streaming tool output, side-by-side previews, file browser, voice, cron, profiles (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/desktop">Desktop</a>).</td>
+        </tr>
+        <tr>
+          <th>Phone / web</th>
+          <td>Collab guest UI in a browser: streaming transcript, tool cards, subagent views, host interruption; production client <code>my.omp.sh</code>. <span class="src">omp://user-facing-packages.md § collab-web</span></td>
+          <td>WebSocket gateway for paired thin clients over Tailscale or LAN, off by default; <code>jcode pair</code> prints a 6-digit code and QR with a 5-minute TTL, tokens stored hashed (<a href="https://jcode.sh/docs">docs, Phone and web clients</a>).</td>
+          <td><code>opencode pair</code> prints a single-use link that expires in 5 minutes (<a href="https://opencode.ai/docs/">Intro</a>).</td>
+          <td>21+ platforms: “19 native to the gateway plus IRC and Microsoft Teams via plugins” (<a href="https://hermes-agent.nousresearch.com/docs/llms.txt">llms.txt</a>).</td>
+        </tr>
+        <tr>
+          <th>ACP / editor</th>
+          <td><code>omp acp</code> server mode <span class="src">omp://cli-reference.md</span></td>
+          <td>Not documented in the pages read; <em>not</em> claimed absent.</td>
+          <td><code>/docs/cli/acp</code> exists in the V2 docs index (<a href="https://opencode.ai/docs/llms.txt">index</a>).</td>
+          <td>ACP adapter with lifecycle, sessions, event bridge, approvals (<a href="https://hermes-agent.nousresearch.com/docs/developer-guide/acp-internals">ACP internals</a>).</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 3 PROVIDERS ============ -->
+<section class="block" id="providers">
+  <div class="block-head"><span class="block-num">03</span><h2>Providers and authentication</h2></div>
+  <p class="block-sub">All four support subscription OAuth and plain API keys. What differs is what sits between the model and the session.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>omp: roles, not just models</h3>
+      <ul>
+        <li><code>--model</code> accepts a role (<code>slow</code>, <code>@slow</code>) or a fuzzy model match; <code>--smol</code>, <code>--slow</code>, <code>--plan</code> set the per-role models; <code>--models a,b,c</code> sets what <code>Ctrl+P</code> cycles. <span class="src">omp://cli-reference.md § Model selection</span></li>
+        <li>Separate <code>auth-broker</code> credential vault, and <code>auth-gateway</code>: an HTTP forward proxy backed by the broker, or JSON lines on stdio for a parent process with its own credentials. <span class="src">omp://cli-reference.md § Subcommands</span></li>
+        <li>Provider-side session id and prompt-cache key are explicit flags. <span class="src">same table</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>jcode: one login per subscription</h3>
+      <ul>
+        <li><code>jcode login --provider claude|openai|gemini|copilot|azure|ollama|lmstudio</code>. <a href="https://jcode.sh/docs">docs</a></li>
+        <li>Headless logins: <code>--no-browser</code> prints the auth URL; <code>--print-auth-url</code> now, <code>--callback-url</code> or <code>--auth-code</code> later. <a href="https://jcode.sh/docs">docs</a></li>
+        <li><code>jcode provider add</code> writes a named profile with <code>--api-key-stdin</code> so the key never lands in shell history; <code>auth-test --all-configured</code> verifies. <a href="https://jcode.sh/docs">docs</a></li>
+        <li>An account router falls back across accounts on usage limits (site screenshot caption). <a href="https://jcode.sh/">jcode.sh</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>opencode: providers plus a Console plane</h3>
+      <ul>
+        <li>Built-in provider list, <code>/connect</code> in the TUI. <a href="https://opencode.ai/docs/">Intro</a></li>
+        <li>Console adds organisations: members, SSO, SCIM, budgets, billing. <a href="https://opencode.ai/docs/llms.txt">docs index</a></li>
+        <li>Console also documents running <em>other</em> harnesses against it: Claude Code, Codex, Hermes, Pi, Raycast. <a href="https://opencode.ai/docs/llms.txt">index</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes: portal, pools, fallbacks</h3>
+      <ul>
+        <li>Nous Portal, OpenRouter, OpenAI, Anthropic, Google, any OpenAI-compatible endpoint. <a href="https://hermes-agent.nousresearch.com/docs/llms.txt">llms.txt header</a></li>
+        <li>Credential pools rotate multiple keys or OAuth tokens per provider; fallback providers take over when the primary fails. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/credential-pools">Credential Pools</a>, <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers">Fallback Providers</a></li>
+        <li>Nous Tool Gateway bundles web search, image generation, TTS and cloud browsers behind one OAuth. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway">Tool Gateway</a></li>
+        <li>Mixture of Agents presets appear as selectable models. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/mixture-of-agents">MoA</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4 TOOLS ============ -->
+<section class="block" id="tools">
+  <div class="block-head"><span class="block-num">04</span><h2>Coding tools and code intelligence</h2></div>
+  <p class="block-sub">The real differentiator. Each harness names the same five primitives, then diverges: omp adds structural tools, jcode rewrites grep for agents, opencode exposes each tool as a permission action, hermes organises tools into toolsets.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Capability</th><th>omp</th><th>jcode</th><th>opencode</th><th>hermes</th></tr></thead>
+      <tbody>
+        <tr>
+          <th>Read / edit</th>
+          <td><code>read</code> handles line ranges, images, archives, SQLite, PDFs; <code>edit</code> is hashline patching. <span class="src">omp://tools/read.md, omp://tools/edit.md</span></td>
+          <td>File read plus edit tool calls rendered as inline diffs (<a href="https://jcode.sh/">jcode.sh</a>).</td>
+          <td>Separate <code>read</code>, <code>edit</code>, <code>write</code>, <code>patch</code>, each with its own permission action (<a href="https://opencode.ai/docs/permissions">Permissions</a>).</td>
+          <td><code>write_file</code> and <code>patch</code>, both checkpoint-triggering (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">Checkpoints</a>).</td>
+        </tr>
+        <tr>
+          <th>Search</th>
+          <td><code>glob</code>, <code>grep</code>, and a semantic <code>find</code> for implementing files and line ranges (<code>omp find</code>). <span class="src">omp://cli-reference.md § Subcommands</span></td>
+          <td><code>agentgrep</code>: “matches include file structure, such as functions and their locations… Results are adaptively trimmed based on what the agent has already seen” (<a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a>).</td>
+          <td><code>glob</code>, <code>grep</code>; the grep permission resource is “the requested regular expression, not the search path” (<a href="https://opencode.ai/docs/permissions">Permissions</a>).</td>
+          <td>Tools grouped into toolsets (<a href="https://hermes-agent.nousresearch.com/docs/reference/toolsets-reference">Toolsets Reference</a>).</td>
+        </tr>
+        <tr>
+          <th>Structural</th>
+          <td><code>ast-grep</code> for patterns, <code>ast-edit</code> for codemods, both preferred over text search/edit in the harness's own policy. <span class="src">omp://tools/ast-grep.md, omp://tools/ast-edit.md</span></td>
+          <td>Nothing documented in the pages read. <span class="chip bad">not claimed absent</span></td>
+          <td>No structural tool surfaced in the V2 index (<a href="https://opencode.ai/docs/llms.txt">index</a>).</td>
+          <td>No structural tool surfaced in the docs index.</td>
+        </tr>
+        <tr>
+          <th>LSP</th>
+          <td>Definitions, references, hover, code actions via the <code>lsp</code> tool. <span class="src">omp://tools/lsp.md</span></td>
+          <td>Not found. Refused, see §12.</td>
+          <td>V1 documents 30+ servers with auto-install and “LSP is disabled by default” (<a href="https://opencode.ai/v1/docs/lsp.md">V1 page</a>). V2 says <code>lsp</code> “is not [a] current V2 Core permission action” (<a href="https://opencode.ai/docs/permissions">Permissions</a>); V2 support unverified.</td>
+          <td>Real language servers wired into the post-write lint check (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/lsp">LSP</a>).</td>
+        </tr>
+        <tr>
+          <th>Debugger</th>
+          <td>DAP client with breakpoints, stepping, inspection. <span class="src">omp://tools/debug.md</span></td>
+          <td>None documented.</td>
+          <td>None documented.</td>
+          <td>None documented.</td>
+        </tr>
+        <tr>
+          <th>Code execution</th>
+          <td><code>eval</code> with persistent Python and Bun/JS kernels; pipes, jobs and tool bridge inside the kernel. <span class="src">omp://tools/eval.md</span></td>
+          <td>Shell tool calls, batched in one message (<a href="https://jcode.sh/">site screenshot “batch tool calls”</a>).</td>
+          <td><code>execute</code> permission action: “a deny removes Code Mode and lists its tools directly” (<a href="https://opencode.ai/docs/permissions">Permissions</a>).</td>
+          <td><code>execute_code</code>: “programmatic Python execution with RPC tool access”. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/code-execution">Code Execution</a></td>
+        </tr>
+        <tr>
+          <th>Web and browser</th>
+          <td><code>browser</code> tool driving your own Chrome through a CDP relay, plus <code>computer</code> for desktop automation. <span class="src">omp://tools/browser.md, omp://tools/computer.md, omp://computer-use.md</span></td>
+          <td><code>webfetch</code> and <code>websearch</code> engines (DuckDuckGo, Bing, SearXNG, Kagi, custom) with per-session proxy routing (<a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a>).</td>
+          <td><code>webfetch</code>, <code>websearch</code> actions; a Web search doc exists in V2 (<a href="https://opencode.ai/docs/llms.txt">index</a>).</td>
+          <td><code>browser_exec</code> with Hermes-launched Chromium, cloud browsers, Lightpanda, or your own Chrome via CDP (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/browser">Browser</a>); computer use (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use">Computer Use</a>).</td>
+        </tr>
+        <tr>
+          <th>Binary / RE</th>
+          <td><code>ida</code> tool for reverse engineering. <span class="src">omp://tools/ida.md</span></td>
+          <td>None documented.</td>
+          <td>None documented.</td>
+          <td>None documented.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note" style="margin-top:10px">“None documented” means absent from the documentation set I read for that harness, not proven absent from the product.</p>
+</section>
+
+<!-- ============ 5 SAFETY ============ -->
+<section class="block" id="safety">
+  <div class="block-head"><span class="block-num">05</span><h2>Execution, isolation, approval</h2></div>
+  <p class="block-sub">Four genuinely different answers, and one of them is a design document rather than shipped behaviour.</p>
+
+  <div class="stack">
+    <div class="card">
+      <h3><span class="dot"></span>omp: tiered approval plus hard budgets</h3>
+      <ul>
+        <li><code>--approval-mode always-ask | always-ask-cached | write | yolo</code>; <code>--yolo</code> still applies “explicit tool/user policies and provider safety checks”. <span class="src">omp://cli-reference.md § Tools, approvals, and runtime; omp://approval-mode.md</span></li>
+        <li><code>--max-cost</code> stops model requests at a spend ceiling and exits with status 3; <code>--warn-cost</code> warns once; <code>--max-time</code> bounds the run. <span class="src">omp://cli-reference.md</span></li>
+        <li><code>--no-pty</code> disables PTY bash; <code>--no-lsp</code> disables LSP, formatting and diagnostics. <span class="src">omp://cli-reference.md</span></li>
+        <li>Secrets never inline in MCP config: each header runs a resolver script that reads a SOPS bundle at connect time. <span class="src">omp://secrets.md</span></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3><span class="dot"></span>jcode: two tiers, on paper</h3>
+      <ul>
+        <li>Design doc: tier 1 auto-allowed (local, reversible), tier 2 requires <code>request_permission</code> for anything leaving the sandbox or reaching “another human… no exceptions”. Review arrives by email, SMS, desktop notification, webhook or a TUI widget. <a href="https://github.com/1jehuang/jcode/blob/master/docs/SAFETY_SYSTEM.md">SAFETY_SYSTEM.md</a></li>
+        <li>Header says <code>Status: Design</code>, <code>Updated: 2026-02-08</code>, “Currently the only consumer is ambient mode”. The same doc shows a <code>[safety.rules]</code> block to promote or demote actions. <a href="https://github.com/1jehuang/jcode/blob/master/docs/SAFETY_SYSTEM.md">same doc</a></li>
+        <li>Explicit non-claim: <code>SetSessionEnv</code> “is not a security sandbox or secret-redaction system. The registry does not intentionally log or persist values, but a command can print its environment into tool output”. <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3><span class="dot"></span>opencode: a real policy language, with its own caveat</h3>
+      <ul>
+        <li>Ordered rules <code>{ action, resource, effect }</code>, last match wins, no match means <code>ask</code>; a multi-resource operation is denied if any resource denies; approvals are <code>once</code>, <code>always</code> (saves a project-scoped allow rule) or <code>reject</code>. <a href="https://opencode.ai/docs/permissions">Permissions</a></li>
+        <li>Shell commands pass through a scanner covering Bash, Zsh, POSIX <code>sh</code> and PowerShell; unanalysable syntax “returns a scanner error rather than executing unverified subcommands”. <a href="https://opencode.ai/docs/permissions">same page</a></li>
+        <li>Default base policy allows everything, then asks on <code>*.env</code> reads; <code>plan</code> denies edits except under <code>~/.opencode/plan</code>; <code>title</code>/<code>summary</code> deny all. <a href="https://opencode.ai/docs/permissions">same page</a></li>
+        <li>Same page warns: “<code>shell</code> runs with the host user's filesystem, process, and network authority”.</li>
+        <li>Two policy plugins “ignore removals so that a repository cannot switch off policy enforcement”. <a href="https://opencode.ai/docs/plugins">Plugins</a></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h3><span class="dot"></span>hermes: sandbox as a per-session choice</h3>
+      <ul>
+        <li>Six built-in terminal backends: local, Docker, SSH, Daytona, Modal, Vercel Sandbox, plus plugin backends such as Singularity. <a href="https://hermes-agent.nousresearch.com/ai-agent-platform">product page</a>, <a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">Checkpoints</a></li>
+        <li>Daytona and Modal are described as serverless-persistent, hibernating when idle. <a href="https://hermes-agent.nousresearch.com/docs/llms.txt">llms.txt</a></li>
+        <li>Dangerous-command approval, user authorization, container isolation, plus an egress proxy and Docker network allowlisting. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/security">Security</a>, <a href="https://hermes-agent.nousresearch.com/docs/user-guide/egress/network-isolation">Egress isolation</a></li>
+        <li>Secrets integration includes 1Password, Bitwarden Secrets Manager and a command helper. <a href="https://hermes-agent.nousresearch.com/docs/llms.txt">index</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 6 CONTEXT ============ -->
+<section class="block" id="context">
+  <div class="block-head"><span class="block-num">06</span><h2>Context engineering</h2></div>
+  <p class="block-sub">Instruction files are table stakes. The interesting split is memory (hermes), skills injection (jcode vector match, omp skill URIs), and compaction strategy (opencode buffer percentages, omp bitmap SnapCompact).</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Mechanism</th><th>omp</th><th>jcode</th><th>opencode</th><th>hermes</th></tr></thead>
+      <tbody>
+        <tr>
+          <th>Instructions</th>
+          <td>AGENTS.md, CLAUDE.md and rules discovery; <code>--no-rules</code>, <code>--no-context-files</code>. <span class="src">omp://cli-reference.md, omp://context-files.md</span></td>
+          <td><code>AGENTS.md</code> at the repo root, <code>~/AGENTS.md</code> machine-wide, both loaded into every session in scope. <a href="https://jcode.sh/docs">docs</a></td>
+          <td>Instruction sources documented separately from skills and references (<a href="https://opencode.ai/docs/llms.txt">index</a>).</td>
+          <td><code>.hermes.md</code>, AGENTS.md, CLAUDE.md, <code>.cursorrules</code>, global SOUL.md, injected into every conversation (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files">Context Files</a>).</td>
+        </tr>
+        <tr>
+          <th>Skills</th>
+          <td><code>skill://name</code> URIs resolved by tools; <code>--skills "git-*,docker"</code> filters; marketplace installs. <span class="src">omp://skills.md, omp://marketplace.md</span></td>
+          <td>“The conversation is embedded as a vector, and a skill is injected when the conversation matches it, the same mechanism memory recall uses.” <a href="https://jcode.sh/docs">docs, Skills</a></td>
+          <td>Skills have their own permission action and can propose a saved allow pattern by skill ID (<a href="https://opencode.ai/docs/permissions">Permissions</a>).</td>
+          <td>Progressive disclosure, agent-managed, agentskills.io compatible, Skills Hub; ~90 bundled + ~60 optional (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/skills">Skills</a>, <a href="https://hermes-agent.nousresearch.com/docs/reference/skills-catalog">catalog</a>).</td>
+        </tr>
+        <tr>
+          <th>Memory</th>
+          <td><code>mnemopi</code>: store/remember, recall/search, update, delete, <code>sleep</code>/<code>consolidate</code>, JSON export/import, scratchpad, banks; selectable as the session memory backend. <span class="src">omp://user-facing-packages.md § mnemopi, omp://mnemosyne-memory-backend.md</span></td>
+          <td><code>[features] memory = true</code> plus a memory sidecar under <code>[agents]</code> (<a href="https://jcode.sh/docs">docs, Configuration</a>).</td>
+          <td>No memory page in the V2 docs index; refused, see §12.</td>
+          <td>MEMORY.md, USER.md, session search (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/memory">Memory</a>); pluggable providers: Honcho, Mem0, Supermemory, RetainDB, Hindsight, ByteRover, OpenViking, Holographic (<a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers">Memory Providers</a>).</td>
+        </tr>
+        <tr>
+          <th>Compaction</th>
+          <td>Context compaction plus SnapCompact: “deterministic local serialization and PNG rendering of discarded conversation history for vision-model context compaction; no model call or API key is required”. <span class="src">omp://compaction.md, omp://user-facing-packages.md</span></td>
+          <td>Session compaction ceiling: “the effective budget is the smaller of the model's context window and the session ceiling”; overrides are saved with the session and restored on resume. <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a></td>
+          <td>Auto by default; summary plus <code>keep.tokens</code> (15000) and a <code>buffer</code> share of the window; optional provider-native compaction returning an opaque checkpoint; experimental background compaction. <a href="https://opencode.ai/docs/compaction">Compaction</a></td>
+          <td>ContextCompressor is a replaceable plugin seam; micro-compaction “amortizes context compression cost: triggers, tail sizing, the cached-prefix trade-off”. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/context-engine-plugin">Context Engine Plugins</a>, <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/micro-compaction">Micro-compaction</a></td>
+        </tr>
+        <tr>
+          <th>Planning / staying on task</th>
+          <td><code>todo</code> tool plus prewalk: a one-shot handoff at the first eligible edit turn, gated on a successful todo call. <span class="src">omp://prewalk.md</span></td>
+          <td>Phases → lanes → items with per-item <code>confidence</code>; <code>waiting_on</code> and <code>requires_user_auth</code> pause a single todo instead of blocking the lane. <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a></td>
+          <td><code>steps</code> caps model steps; on the final step tools are removed and the model must summarise. <a href="https://opencode.ai/docs/agents">Agents</a></td>
+          <td>Persistent Goals, “our take on the Ralph loop”; session heartbeats and recurring loops. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/goals">Goals</a>, <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/heartbeat">Heartbeat</a></td>
+        </tr>
+        <tr>
+          <th>Persona</th>
+          <td>System prompt override, Handlebars template, or append. <span class="src">omp://system-prompt-customization.md</span></td>
+          <td><code>~/.jcode/swarm-prompt.md</code> and per-project override for routing and structure policy. <a href="https://jcode.sh/docs">docs</a></td>
+          <td>Per-agent <code>system</code> prompt in frontmatter or JSONC. <a href="https://opencode.ai/docs/agents">Agents</a></td>
+          <td>Global <code>SOUL.md</code> plus built-in personalities. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/personality">Personality</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 7 MULTI-AGENT ============ -->
+<section class="block" id="agents">
+  <div class="block-head"><span class="block-num">07</span><h2>Multi-agent and unattended work</h2></div>
+  <p class="block-sub">opencode keeps agents in a permission hierarchy, jcode lets them talk to each other, hermes turns them into a roster of bots with a task board, omp steers them live.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>jcode: swarm with conflict notice</h3>
+      <ul>
+        <li>“When agent A edits a file that agent B has read… the server notifies agent B. Agent B can ignore it if it is not relevant, or it can check the diff.” <a href="https://github.com/1jehuang/jcode">README</a></li>
+        <li>Agents can “DM just one agent, broadcast to all other agents hosted by the server, or just agents working in that repo”. <a href="https://github.com/1jehuang/jcode">README</a></li>
+        <li>Agents spawn their own workers: “turning the main agent into a coordinator and the swarm agents into workers”, headless or headed. <a href="https://github.com/1jehuang/jcode">README</a></li>
+        <li>Auto-poke continues when todos remain; goals get a 0–100 hill-climbability rating and low scores trigger pushback to reframe into something measurable. <a href="https://jcode.sh/">jcode.sh</a></li>
+        <li>Ambient mode runs on a schedule with its own budget and work branches (<code>[ambient]</code>). <a href="https://jcode.sh/docs">docs</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>opencode: agents as configuration</h3>
+      <ul>
+        <li>Built-ins: <code>build</code> (full access), <code>plan</code> (read-only, may write plan files under <code>~/.opencode/plan</code>), <code>general</code> (no subagents), <code>explore</code> (read and search only); hidden <code>compaction</code>, <code>title</code>, <code>summary</code>. <a href="https://opencode.ai/docs/agents">Agents</a></li>
+        <li>Custom agents are Markdown with frontmatter or JSONC entries; modes <code>primary</code>, <code>subagent</code>, <code>all</code>. <a href="https://opencode.ai/docs/agents">Agents</a></li>
+        <li>“Subagents run with fresh context in their own child sessions. They always run in the background: the parent receives a report when a child goes idle.” <a href="https://opencode.ai/docs/agents">Agents</a></li>
+        <li><code>subagent</code> permission action gates which agents a parent may launch; a child uses its own permissions. <a href="https://opencode.ai/docs/agents">Agents</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>omp: live steering</h3>
+      <ul>
+        <li><code>task</code> fans out subagents with their own agent type, optional isolated worktree, and results that can be written back to the running session. <span class="src">omp://tools/task.md</span></li>
+        <li>Transcripts are addressable: <code>agent://&lt;id&gt;</code> for the latest output, <code>history://&lt;id&gt;</code> for a concise transcript, writes to <code>agent://&lt;id&gt;</code> delivered as a message, <code>agent://all</code> broadcast. <span class="src">omp://eval/agents</span></li>
+        <li>Async bash jobs and <code>--wait-async</code> keep a print-mode run alive while background jobs finish, each result starting another turn. <span class="src">omp://cli-reference.md § Headless / print mode</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes: roster, board, cron</h3>
+      <ul>
+        <li><code>delegate_task</code> spawns isolated child agents for parallel workstreams. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation">Delegation</a></li>
+        <li>Kanban: a durable SQLite-backed task board coordinating multiple profiles, with worker lanes. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban">Kanban</a></li>
+        <li>Bot Mode turns profiles into named bots with their own model, memory, skills, routines and chats, cooperating in group chats via <code>@mentions</code>. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/bot-mode">Bot Mode</a></li>
+        <li>Cron in natural language, delivered to any platform. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/cron">Cron</a></li>
+        <li>Git worktrees so several agents can work one repository safely. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/git-worktrees">Git Worktrees</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 8 EXTENSIBILITY ============ -->
+<section class="block" id="ext">
+  <div class="block-head"><span class="block-num">08</span><h2>Extensibility and interop</h2></div>
+  <p class="block-sub">MCP is universal. Everything above MCP differs: omp has extensions with UI, jcode deliberately stops at hooks, opencode ships three plugin runtimes, hermes has a reviewed catalog and a plugin API boundary.</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Surface</th><th>omp</th><th>jcode</th><th>opencode</th><th>hermes</th></tr></thead>
+      <tbody>
+        <tr>
+          <th>MCP</th>
+          <td>Client with several transports and a documented runtime lifecycle. <span class="src">omp://mcp-config.md, omp://mcp-protocol-transports.md, omp://mcp-runtime-lifecycle.md</span></td>
+          <td>“Only stdio servers are supported today. HTTP and SSE entries are recognized and skipped.” Imports Claude Code and Codex servers on first run. <a href="https://jcode.sh/docs">docs, MCP servers</a></td>
+          <td>MCP servers page in V2; MCP tools appear as permission actions named <code>&lt;server&gt;_&lt;tool&gt;</code>. <a href="https://opencode.ai/docs/mcp-servers">MCP</a>, <a href="https://opencode.ai/docs/permissions">Permissions</a></td>
+          <td>Connect plus “control exactly which MCP tools Hermes loads”. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp">MCP</a></td>
+        </tr>
+        <tr>
+          <th>Plugins</th>
+          <td>Extensions and hooks with a documented authoring surface (UI dialogs, <code>ctx.hasUI</code>); plugin manager, marketplace, <code>--trusted-extension</code> exact allowlist. <span class="src">omp://extensions.md, omp://hooks.md, omp://marketplace.md</span></td>
+          <td>Hooks only: shell commands at turn, session and tool boundaries. <a href="https://jcode.sh/docs">docs, Configuration</a></td>
+          <td>npm, git and local-directory plugins; server, TUI-only and desktop-GUI plugins; enable/disable patterns; hot reload; <code>opencode plugin add|list|check|update|remove</code>. <a href="https://opencode.ai/docs/plugins">Plugins</a></td>
+          <td>Plugin system with tools and hooks; reviewed catalog; documented public import surface, middleware, observer hooks, per-subsystem provider plugins. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/public-api">Public plugin API</a></td>
+        </tr>
+        <tr>
+          <th>Programmatic</th>
+          <td>RPC over stdio, ACP server, plus <code>sdk.md</code>. <span class="src">omp://rpc.md, omp://sdk.md</span></td>
+          <td>TypeScript SDK launching a private jcode or attaching through <code>jcode api-bridge</code>; works over forwarded sockets. <a href="https://jcode.sh/docs">docs, Scripted automation</a>, <a href="https://jcode.sh/sdk">SDK</a></td>
+          <td>Server API, JavaScript client, SDK, Effect variants. <a href="https://opencode.ai/docs/llms.txt">index, Build section</a></td>
+          <td>Three documented protocols: ACP, TUI gateway JSON-RPC, OpenAI-compatible HTTP API. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration">Programmatic Integration</a></td>
+        </tr>
+        <tr>
+          <th>Import from other agents</th>
+          <td><code>--from-claude</code>, <code>--from-codex</code>. <span class="src">omp://cli-reference.md</span></td>
+          <td>Reads <code>~/.claude.json</code> and <code>.mcp.json</code>; Claude Code plugin skills load unchanged. <a href="https://jcode.sh/docs">docs</a></td>
+          <td>No import path in the V2 index.</td>
+          <td>One command imports OpenClaw, Claude Code, Codex CLI, Cursor, Grok Bot or OpenBot: instructions, rules, allowlists, MCP servers, skills, memories, routines. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/import-from-other-agents">Import from other agents</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 9 SESSIONS ============ -->
+<section class="block" id="sessions">
+  <div class="block-head"><span class="block-num">09</span><h2>Sessions, rollback, self-modification</h2></div>
+  <p class="block-sub">Four different answers to “undo”. omp restores interrupted runs, jcode forks windows, opencode snapshots per model step, hermes snapshots to a shadow git store that is off by default.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>omp</h3>
+      <ul>
+        <li><code>--restore</code> resumes a session then continues “what its last process left unfinished when it crashed or was killed: the interrupted turn and the subagents it was running”. <span class="src">omp://cli-reference.md</span></li>
+        <li><code>--fork</code> copies a saved session into a new one; <code>--export</code> writes HTML. <span class="src">same page</span></li>
+        <li>Checkpoint and rewind are first-class tools with their own docs. <span class="src">omp://tools/checkpoint.md, omp://tools/rewind.md</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>jcode</h3>
+      <ul>
+        <li>Slash commands include <code>/fork</code> (fork into a new window), <code>/transfer</code> (compact context into a fresh handoff session), <code>/compact</code>, <code>/clear</code>, <code>/rewind</code>, <code>/resume</code>. <a href="https://jcode.sh/docs">docs, Slash commands</a></li>
+        <li>Self-dev: “it will start modifying its own source code… edit, build, and test its own source code, then reload its own binary and continue work in your (potentially many) sessions, fully automatically”. <a href="https://github.com/1jehuang/jcode">README</a></li>
+        <li>Forks, transfers and swarm children get independent copies of the parent's session env overrides, lost on daemon restart. <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>opencode</h3>
+      <ul>
+        <li><code>/undo</code> stages a rollback to a message boundary, restores affected files and re-seats the prompt; <code>/redo</code> cancels before you submit. <a href="https://opencode.ai/docs/snapshots">Snapshots</a></li>
+        <li>Capture is attempted before each model step and when it settles; scope is the session's active directory inside a git worktree, tracked files plus non-ignored untracked up to 2 MiB each. <a href="https://opencode.ai/docs/snapshots">Snapshots</a></li>
+        <li>Storage is “a separate internal Git object database under its data directory. Snapshot capture does not create commits, move branches, or intentionally change your repository's index.” <a href="https://opencode.ai/docs/snapshots">Snapshots</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes</h3>
+      <ul>
+        <li>Checkpoints are opt-in “as of v2”: “most users never use <code>/rollback</code>, and the shadow-store storage is non-trivial over time, so the default is off”. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">Checkpoints</a></li>
+        <li>Triggered before <code>write_file</code>/<code>patch</code> and destructive shell commands; one checkpoint per directory per turn; single shared shadow repo at <code>~/.hermes/checkpoints/store/</code>, real <code>.git</code> untouched. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">same page</a></li>
+        <li><code>/rollback &lt;N&gt;</code> preserves hand edits through an agent-write ledger; <code>--all</code> overrides. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">same page</a></li>
+        <li>Container backends get no checkpoints: “file paths belong to the sandbox rather than the host”. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/checkpoints-and-rollback">same page</a></li>
+        <li>Sessions: persistence, resume, search, per-platform tracking. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/sessions">Sessions</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 10 AUTOMATION ============ -->
+<section class="block" id="automation">
+  <div class="block-head"><span class="block-num">10</span><h2>Automation, observability, benchmarking</h2></div>
+  <p class="block-sub">Only omp and hermes ship their own service or dashboard story. jcode publishes benchmarks, and its numbers are vendor-measured.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>omp</h3>
+      <ul>
+        <li><code>omp stats</code>: local dashboard at <code>127.0.0.1:3847</code> over session JSONL, with request/token/cost, provider, model, folder, tool and frustration views; SSE events; lazy judge role for frustration scoring. <span class="src">omp://user-facing-packages.md § packages/stats</span></li>
+        <li><code>metaharness</code>: one dashboard, SQLite store and REST/SSE API normalising Harbor (Terminal-Bench), TypeScript-edit and SnapCompact runs. <span class="src">§ packages/metaharness</span></li>
+        <li><code>robomp</code>: self-hosted GitHub webhook service that “resumes an <code>omp --mode rpc</code> session per issue, comments or opens a fix PR”, with an operator dashboard. <span class="src">§ python/robomp</span></li>
+        <li><code>omp grievances</code>: view, clean or push reported tool issues from the auto-QA loop. <span class="src">omp://cli-reference.md</span></li>
+        <li><code>bench</code> (TTFT/prefill vs decode throughput), <code>if-bench</code> (instruction following), <code>cleanse</code> (weighted parallel diagnostics). <span class="src">omp://cli-reference.md</span></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>jcode <span class="chip warn">vendor-reported</span></h3>
+      <ul>
+        <li>Bench design: “uncontaminatable by construction: there is no answer to memorize”, continuous optimisation score, time recorded not capped. <a href="https://jcode.sh/">jcode.sh, Intelligence</a></li>
+        <li>Confidence stepping claim: “trials that finish in time pass more often (92% vs 88%)” on Terminal-Bench 2.1 against the comparison harness. <a href="https://jcode.sh/">same page</a></li>
+        <li>Memory claims: 3.5 MB extra headless / 10.4 MB extra interactive, measured on v0.92.14. <a href="https://jcode.sh/">same page</a></li>
+        <li>None of this is independently replicated in anything I read.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>opencode</h3>
+      <ul>
+        <li>Console plane: workspaces, members, SSO, SCIM, budgets, billing. <a href="https://opencode.ai/docs/llms.txt">index</a></li>
+        <li>Server API with session compaction endpoints, <code>session.compaction.*</code> events, idempotent request IDs. <a href="https://opencode.ai/docs/compaction">Compaction</a></li>
+        <li>No benchmark program surfaced in the docs index.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>hermes</h3>
+      <ul>
+        <li>Batch processing for trajectory generation at scale, with checkpointing and toolset distributions. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/batch-processing">Batch Processing</a></li>
+        <li>Documented trajectory format, aimed at RL training. <a href="https://hermes-agent.nousresearch.com/docs/developer-guide/trajectory-format">Trajectory Format</a></li>
+        <li>Web dashboard for config, keys, MCP, pairing, webhooks, gateway, memory, credentials, sessions, logs, analytics, cron and skills. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard">Web Dashboard</a></li>
+        <li>Session heartbeats and recurring loops re-enter an idle session. <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/heartbeat">Heartbeat</a>, <a href="https://hermes-agent.nousresearch.com/docs/user-guide/features/loops">Recurring Loops</a></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 11 OTHERS ============ -->
+<section class="block" id="others">
+  <div class="block-head"><span class="block-num">11</span><h2>The others, verified</h2></div>
+  <p class="block-sub">Short capsules, each read from its own official docs or repository this session. Gemini CLI is deliberately absent: not verified, so not asserted.</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3><span class="dot"></span>Claude Code</h3>
+      <ul>
+        <li>“Each surface connects to the same underlying Claude Code engine, so your repo's CLAUDE.md files, settings, and MCP servers work across all of them”: terminal, VS Code, JetBrains, desktop, web, plus iOS/Android. <a href="https://code.claude.com/docs/en/overview">Overview</a></li>
+        <li>Auto memory built as it works, on top of CLAUDE.md (and AGENTS.md when present). <a href="https://code.claude.com/docs/en/overview">same page</a></li>
+        <li>Subagents, background agents with a single-screen view, Agent SDK for custom orchestration. <a href="https://code.claude.com/docs/en/overview">same page</a></li>
+        <li>Scheduling on three levels: cloud scheduled tasks, desktop scheduled tasks, <code>/loop</code> inside a session. <a href="https://code.claude.com/docs/en/overview">same page</a></li>
+        <li>Hooks, skills, MCP, <code>-p</code> piping, Slack, Chrome debugging, GitHub Actions. <a href="https://code.claude.com/docs/en/overview">same page</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Codex CLI</h3>
+      <ul>
+        <li>Local coding agent from OpenAI; sign in with a ChatGPT plan or an API key. <a href="https://github.com/openai/codex">README</a></li>
+        <li>Separate surfaces: IDE extension, <code>codex app</code> desktop, Codex Web cloud. <a href="https://github.com/openai/codex">README</a></li>
+        <li>Apache-2.0. <a href="https://github.com/openai/codex">README</a></li>
+        <li>Sandbox and approval modes are not described in the README; that claim from my first list is unverified and withdrawn here.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Aider</h3>
+      <ul>
+        <li>Repo map of the whole codebase, git auto-commit with sensible messages, lint and test loop after every change. <a href="https://github.com/Aider-AI/aider">README</a></li>
+        <li>Voice-to-code, images and web pages in the chat, IDE watch mode where comments in your code become requests, copy/paste bridge to any web chat. <a href="https://github.com/Aider-AI/aider">README</a></li>
+        <li>100+ languages. <a href="https://github.com/Aider-AI/aider">README</a></li>
+        <li>Caveat: the README still names Claude 3.7 Sonnet, DeepSeek R1, o1 and GPT-4o as “works best”, so the page lags current model lineups. <a href="https://github.com/Aider-AI/aider">README</a></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="dot"></span>Gemini CLI</h3>
+      <p class="note">Omitted. I did not read its documentation in this session, and inventing a capsule from recall is exactly what the current mode forbids.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 12 REFUSALS ============ -->
+<section class="block" id="refusals">
+  <div class="block-head"><span class="block-num">12</span><h2>Refusals and conflicts</h2><span class="chip bad">do not treat as gaps in the product</span></div>
+  <p class="block-sub">Five claims I could not source, with the searches tried, and two places where two official sources disagree.</p>
+
+  <div class="stack">
+    <div class="callout bad">
+      <h3>Refused: unresolved after a real search</h3>
+      <ul>
+        <li><strong>jcode LSP and jcode sandboxing.</strong> Searched <code>site:jcode.sh LSP language server</code>, <code>jcode.sh docs sandbox isolation permission</code>; read <a href="https://jcode.sh/docs">docs</a>, <a href="https://github.com/1jehuang/jcode/blob/master/docs/HARNESS.md">HARNESS.md</a> and <a href="https://github.com/1jehuang/jcode/blob/master/docs/SAFETY_SYSTEM.md">SAFETY_SYSTEM.md</a>. HARNESS.md documents an MCP client and per-session proxies, no LSP. Next step: <code>grep -ri lsp crates/</code>, or ask the maintainer.</li>
+        <li><strong>opencode memory.</strong> The V2 docs index has no memory page; that is not evidence of absence. Persisted state is documented for sessions, snapshots and compaction only. Next step: read <code>packages/opencode/src/session</code> in the <a href="https://github.com/sst/opencode">repository</a>.</li>
+        <li><strong>opencode LSP in V2.</strong> V1 is explicit (<a href="https://opencode.ai/v1/docs/lsp.md">V1 LSP page</a>); V2's permissions page says <code>lsp</code> “is not [a] current V2 Core permission action”, which implies a change but not whether language servers survive.</li>
+        <li><strong>omp public documentation.</strong> <code>omp://</code> is the shipped doc set; there is no public URL. License, repository and release channel are unchecked.</li>
+        <li><strong>Why omp's standalone memory CLI defaults to a hermes-named path.</strong> <code>omp://user-facing-packages.md</code> gives <code>~/.hermes/mnemopi/data/mnemopi.db</code> as the store. Unexplained, not guessed at.</li>
+      </ul>
+    </div>
+
+    <div class="callout warn">
+      <h3>Conflicting official sources</h3>
+      <ul>
+        <li><strong>jcode memory per session.</strong> README table says first session 71.3 MB, about 3.3 MB per additional. <a href="https://github.com/1jehuang/jcode">README</a>. Site says 3.5 MB extra headless and 10.4 MB extra interactive, “Measured: jcode v0.92.14”. <a href="https://jcode.sh/">jcode.sh</a>. Same vendor, different builds and methods; the headline ratio is the most favourable pairing. Treat every such number as vendor-measured.</li>
+        <li><strong>hermes platform count.</strong> “20+ platforms” on the <a href="https://hermes-agent.nousresearch.com/ai-agent-platform">product page</a> versus “21+ … 19 native to the gateway plus IRC and Microsoft Teams via plugins” in <a href="https://hermes-agent.nousresearch.com/docs/llms.txt">llms.txt</a>. Neither matches the enumeration in the <a href="https://hermes-agent.nousresearch.com/docs/user-guide/messaging">messaging overview</a>, which adds LINE, Raft, Webhooks, BlueBubbles and others. The plugin split in llms.txt is the more precise reading.</li>
+      </ul>
+    </div>
+
+    <div class="callout">
+      <h3>How to read every cell in this artifact</h3>
+      <ul>
+        <li>Public doc, source repo or vendor site: linked inline, read this session.</li>
+        <li><code>omp://…</code>: document shipped with the binary. Official and canonical, not web-linkable.</li>
+        <li>“None documented” and “no page surfaced”: an observation about a documentation set, never a claim about the product.</li>
+        <li>Anything marked vendor-reported is a vendor's own measurement.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p>Compiled 2026-11-14 from official documentation, source repositories and vendor sites for omp (local <code>omp://</code> docs), jcode (jcode.sh and github.com/1jehuang/jcode), opencode (opencode.ai, V2 docs) and hermes (hermes-agent.nousresearch.com).</p>
+  <p>Design direction: shadcn/ui via Basecoat, per project instruction. Annotate any cell and send it back.</p>
+</footer>
+
+</body>
+</html>
