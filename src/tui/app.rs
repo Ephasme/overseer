@@ -178,12 +178,12 @@ impl Entry {
             }
             // Prose is Markdown: headings, lists, emphasis and fences render; the gutter stays plain.
             Role::Model => markdown(&self.body, "  ", Style::new(), width),
-            // The reasoning is the same model's: marked as not the answer, and cooler than one.
+            // The reasoning is the same model's: marked as not the answer, and quieter than one.
             Role::Thinking => block(
                 "✻ ",
-                Style::new().fg(theme::thought()),
+                Style::new().fg(theme::muted()),
                 &self.body,
-                Style::new().fg(theme::thought()).add_modifier(Modifier::ITALIC),
+                Style::new().fg(theme::muted()).add_modifier(Modifier::ITALIC),
                 width,
             ),
             Role::Tool => self.tool_lines(width, spinning, expand),
@@ -1734,7 +1734,7 @@ impl App {
         let mut spans = vec![Span::raw("  ")];
         if self.busy {
             let glyph = SPINNER.get(self.spinning % SPINNER.len()).copied().unwrap_or("⠋");
-            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::thought())));
+            spans.push(Span::styled(format!("{glyph} thinking "), Style::new().fg(theme::muted())));
             let secs = self.busy_since.elapsed().as_secs_f32();
             spans.push(Span::styled(format!("{secs:.0}s"), Style::new().fg(theme::muted())));
         } else if self.draining {
