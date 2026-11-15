@@ -3,6 +3,8 @@ mod artifacts;
 mod clipboard;
 mod config;
 mod conflict;
+mod diff;
+mod edit;
 mod event;
 mod forge;
 mod jobs;

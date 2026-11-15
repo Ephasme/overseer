@@ -23,6 +23,7 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     tools::BASH,
     tools::READ_FILE,
     tools::WRITE_FILE,
+    tools::EDIT,
     SPAWN_AGENT,
     MESSAGE_AGENT,
     CONTROL_AGENT,
@@ -274,6 +275,11 @@ If you need a decision to continue, end your turn with the question as your fina
     );
     let defs = agent_tool_definitions(facts.mcp, &policy, remaining);
     out.push_str(&tool_section(&defs));
+    if tools::grants(&policy.allow_tools, tools::EDIT) {
+        out.push_str(
+            "Editing files: read a file with `read_file` before you change it — the numbers in that output are the anchors `edit` takes, and `edit` refuses a file this agent has not read or one that changed since. Use `edit` for every change to an existing file and `write_file` to create one. Do not rewrite source through `bash` (`sed -i`, `tee`, `>`, heredocs, `git apply`): those leave no record of what changed. A refusal telling you to read a range again means read that range, then edit.\n",
+        );
+    }
     // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
     let counts = facts.mcp.tool_counts();
     if !policy.read_only && !counts.is_empty() {
@@ -423,5 +429,38 @@ mod tests {
         assert!(prompt.contains("You never change anything"), "{prompt}");
         assert!(!prompt.contains("Do the work yourself"), "{prompt}");
         assert!(!prompt.contains("- write_file:"), "the tool is not offered: {prompt}");
+    }
+
+    /// The edit paragraph reaches an agent that may call the tool, and the tool list names it.
+    #[test]
+    fn the_prompt_teaches_the_numbered_edit() {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = profiles::Catalogue::default();
+        let policy = tools::Policy {
+            allow_tools: vec![tools::READ_FILE.into(), tools::WRITE_FILE.into(), tools::EDIT.into()],
+            ..tools::Policy::default()
+        };
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let facts = AgentFacts {
+            id: 2,
+            parent: Some(1),
+            depth: 1,
+            max_depth: 3,
+            dir: home.path(),
+            policy: &policy,
+            children: Vec::new(),
+            skills: &skills,
+            mcp: &mcp,
+            root: false,
+            profile: None,
+            profiles: &profiles,
+            role: profiles::Role::Worker,
+        };
+        let prompt = agent_prompt(&facts);
+        assert!(prompt.contains("read a file with `read_file` before you change it"), "{prompt}");
+        assert!(prompt.contains("Do not rewrite source through `bash`"), "{prompt}");
+        assert!(prompt.contains("- edit: Change an existing file"), "{prompt}");
+        assert!(prompt.contains("- read_file:"), "{prompt}");
     }
 }

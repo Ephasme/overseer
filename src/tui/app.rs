@@ -56,6 +56,9 @@ const HINTS: [&str; 8] = [
     "ctrl+d quit",
 ];
 
+/// Diff rows a collapsed edit card keeps, before the row that counts what it hid.
+const DIFF_ROWS: usize = 10;
+
 /// Said instead of attaching, when the clipboard has neither an image nor text.
 const NO_CLIPBOARD: &str = "the clipboard holds no image or text";
 
@@ -227,6 +230,9 @@ impl Entry {
 
     /// A tool call: its whole command, and what it returned once expanded.
     fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
+        if self.title == tools::EDIT && self.output.is_some() && !self.failed {
+            return self.diff_lines(width, spinning, expand);
+        }
         let (glyph, colour) = if self.output.is_none() {
             (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::warning())
         } else if self.failed {
@@ -301,6 +307,87 @@ impl Entry {
         }
         lines
     }
+
+    /// An edit card: the verdict with its counts, then diff rows over an aligned gutter.
+    fn diff_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
+        let (glyph, colour) = if self.output.is_none() {
+            (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::warning())
+        } else if self.failed {
+            ("✕", theme::error())
+        } else {
+            ("✓", theme::success())
+        };
+        let mut header = vec![
+            Span::styled(format!("{glyph} "), Style::new().fg(colour)),
+            Span::styled("edit".to_string(), Style::new().fg(theme::muted())),
+        ];
+        if !self.body.is_empty() {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(self.body.clone(), Style::new().fg(theme::text())));
+        }
+        if let Some((added, removed)) = self.status.split_once('/') {
+            header.push(Span::styled(" ( ".to_string(), Style::new().fg(theme::faint())));
+            header.push(Span::styled(added.to_string(), Style::new().fg(theme::success())));
+            header.push(Span::styled("/".to_string(), Style::new().fg(theme::faint())));
+            header.push(Span::styled(removed.to_string(), Style::new().fg(theme::error())));
+            header.push(Span::styled(" )".to_string(), Style::new().fg(theme::faint())));
+        } else if !self.status.is_empty() {
+            header.push(Span::styled(format!(" · {}", self.status), Style::new().fg(theme::faint())));
+        }
+        let mut lines = vec![Line::from(header)];
+        let Some(output) = &self.output else { return lines };
+        let rows = diff_rows(output);
+        let numbers = rows.iter().map(|(_, number, _)| number.len()).max().unwrap_or(0);
+        let lead = numbers.saturating_add(1);
+        let room = width.saturating_sub(lead + 1).max(8);
+        let visible = if expand { rows.len() } else { rows.len().min(DIFF_ROWS) };
+        for (marker, number, text) in rows.iter().take(visible) {
+            let style = match marker {
+                '+' => Style::new().fg(theme::success()),
+                '-' => Style::new().fg(theme::error()),
+                _ => Style::new().fg(theme::muted()),
+            };
+            let gutter = format!("{marker}{number:>numbers$}");
+            for (index, row) in wrap(text, room).into_iter().enumerate() {
+                let prefix = if index == 0 { gutter.clone() } else { " ".repeat(lead) };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(theme::faint())),
+                    Span::styled("│", Style::new().fg(theme::rule())),
+                    Span::styled(row, style),
+                ]));
+            }
+        }
+        let hidden = self.more.saturating_add(rows.len().saturating_sub(visible));
+        if hidden > 0 {
+            let plural = if hidden == 1 { "line" } else { "lines" };
+            let suffix = if expand { "" } else { " (ctrl+o to expand)" };
+            lines.push(Line::from(Span::styled(
+                format!("… {hidden} more {plural}{suffix}"),
+                Style::new().fg(theme::faint()),
+            )));
+        }
+        lines
+    }
+}
+
+/// Parses `^([ +-])(\d*)\|(.*)$`; a row that does not parse keeps a blank gutter.
+fn diff_rows(output: &str) -> Vec<(char, String, String)> {
+    output
+        .trim_end()
+        .lines()
+        .map(|line| {
+            let mut chars = line.chars();
+            let marker = chars.next().unwrap_or(' ');
+            let rest = chars.as_str();
+            if matches!(marker, ' ' | '+' | '-')
+                && let Some((number, text)) = rest.split_once('|')
+                && number.chars().all(|char| char.is_ascii_digit())
+            {
+                return (marker, number.to_string(), text.to_string());
+            }
+            (' ', String::new(), line.to_string())
+        })
+        .collect()
 }
 
 /// How a tool call reads: a shell command is `$`, the file tools say what they do.
@@ -309,6 +396,7 @@ fn verb(tool: &str) -> &str {
         tools::BASH => "$",
         tools::READ_FILE => "read",
         tools::WRITE_FILE => "write",
+        tools::EDIT => "edit",
         other => other,
     }
 }
@@ -2626,6 +2714,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
 
     /// One frame drawn into a real backend, for the tests that read cells rather than text.
@@ -2799,6 +2888,56 @@ mod tests {
         assert!(text.contains("… 2 more lines"), "{text}");
         assert!(!text.contains("stdout:"), "the result's scaffolding is not output: {text}");
         assert_eq!(worker_entries(&app, 2)[0].lines(80, 0, false).len(), 1, "a compact card is one row per call");
+    }
+
+    #[test]
+    fn an_edit_card_aligns_its_gutter_and_colours_each_side() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, tools::EDIT, "src/main.rs");
+        tool_result(&mut app, 0, tools::EDIT, "edit: +1/-1\n-2|old\n+2|new\n 12|context", 0.4);
+        let lines = app.lead.entries[0].lines(80, 0, true);
+        let joined = row_text(&lines);
+        assert!(joined.contains("✓ edit src/main.rs ( +1/-1 )"), "{joined}");
+        assert!(joined.contains("- 2│old"), "the removal keeps its line: {joined}");
+        assert!(joined.contains("+ 2│new"), "the addition keeps its line: {joined}");
+        assert!(joined.contains(" 12│context"), "a context row is numbered but unmarked: {joined}");
+        assert_eq!(lines[1].spans[2].style.fg, Some(theme::error()), "a removal is red");
+        assert_eq!(lines[2].spans[2].style.fg, Some(theme::success()), "an addition is green");
+        assert_eq!(lines[3].spans[2].style.fg, Some(theme::muted()), "context is muted");
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains("✓ edit src/main.rs ( +1/-1 )"), "{rendered}");
+        assert!(rendered.contains("- 2│old"), "{rendered}");
+    }
+
+    #[test]
+    fn a_collapsed_edit_card_stops_at_ten_rows_and_counts_the_rest() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, tools::EDIT, "t.rs");
+        let mut output = String::from("edit: +15/-0\n");
+        for number in 1..=15 {
+            let _ = writeln!(output, "+{number}|row {number}");
+        }
+        tool_result(&mut app, 0, tools::EDIT, &output, 0.1);
+        let collapsed = app.lead.entries[0].lines(80, 0, false);
+        assert_eq!(collapsed.len(), 12, "a header, ten rows and the count: {collapsed:?}");
+        assert!(row_text(&collapsed).contains("… 5 more lines (ctrl+o to expand)"), "{}", row_text(&collapsed));
+        let expanded = app.lead.entries[0].lines(80, 0, true);
+        assert_eq!(expanded.len(), 16, "a header and every row: {}", expanded.len());
+    }
+
+    #[test]
+    fn an_edit_card_renders_a_trailer_and_a_numberless_row() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, tools::EDIT, "t.rs");
+        tool_result(&mut app, 0, tools::EDIT, "edit: +0/-2\n-1|a\n-2|b\nremoved t.rs", 0.1);
+        let joined = row_text(&app.lead.entries[0].lines(80, 0, true));
+        assert!(joined.contains("│removed t.rs"), "a trailer keeps the gutter: {joined}");
+
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, tools::EDIT, "t.rs");
+        tool_result(&mut app, 0, tools::EDIT, "edit: +1/-0\n+|bad", 0.1);
+        let joined = row_text(&app.lead.entries[0].lines(80, 0, true));
+        assert!(joined.contains("+│bad"), "a numberless addition does not panic: {joined}");
     }
 
     #[test]

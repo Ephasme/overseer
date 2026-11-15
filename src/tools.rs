@@ -1,6 +1,8 @@
 use crate::artifacts;
 use crate::config;
 use crate::conflict;
+use crate::diff;
+use crate::edit;
 use crate::jobs;
 use crate::mcp;
 use crate::profiles;
@@ -24,9 +26,6 @@ use std::{
 };
 
 const MAX_OUTPUT_BYTES: usize = 30_000;
-
-/// Longest file body `read_file` returns, leaving room for its truncation note.
-const MAX_READ_BYTES: usize = 28_000;
 
 /// Largest file `read_file`'s `:conflicts` selector scans whole, so listing blocks cannot exhaust memory.
 const MAX_SCAN_BYTES: u64 = 8 << 20;
@@ -75,6 +74,7 @@ pub(crate) fn kill_running() {
 pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
+pub(crate) const EDIT: &str = "edit";
 /// The progress-note tool an agent writes to its owner with.
 pub(crate) const REPLY: &str = "reply";
 /// The tool an agent ends its turn and reports with.
@@ -223,7 +223,7 @@ impl Policy {
         }
         if self.read_only {
             lines.push(format!(
-                "- read-only: write_file is refused, and bash runs only {} (git only: {}).",
+                "- read-only: write_file and edit are refused, and bash runs only {} (git only: {}).",
                 READ_ONLY_PROGRAMS.join(" "),
                 READ_ONLY_GIT.join(" ")
             ));
@@ -252,8 +252,8 @@ impl Policy {
                 format!("tool {name} is not granted to this agent; it may call {}", self.allow_tools.join(" "))
             });
         }
-        if name == WRITE_FILE && self.read_only {
-            return Some("this agent is read-only: write_file is refused".into());
+        if (name == WRITE_FILE || name == EDIT) && self.read_only {
+            return Some(format!("this agent is read-only: {name} is refused"));
         }
         // The tool list already hides these from a read-only worker, but a policy is re-read on
         // every call and a model may still call a tool it was shown in an earlier turn.
@@ -395,6 +395,9 @@ pub(crate) struct Preview {
 
 /// Distils a tool result for display, so a chatty command does not flood the transcript.
 pub(crate) fn preview(name: &str, output: &str) -> Preview {
+    if name == EDIT {
+        return edit_preview(output);
+    }
     let mut failed = output.starts_with("error:");
     let mut status = String::new();
     let mut rows: Vec<&str> = Vec::new();
@@ -428,6 +431,22 @@ pub(crate) fn preview(name: &str, output: &str) -> Preview {
     Preview { status, head: head.join("\n"), more: rows.len().saturating_sub(PREVIEW_LINES), failed }
 }
 
+/// An edit result: the verdict row, then whole diff rows, counted past what the card previews.
+fn edit_preview(output: &str) -> Preview {
+    let mut rows: Vec<&str> = output.trim_end().lines().collect();
+    let status = rows.first().and_then(|row| row.strip_prefix("edit: ")).map(str::to_string);
+    if status.is_some() {
+        rows.remove(0);
+    }
+    let head: Vec<String> = rows.iter().take(edit::DIFF_PREVIEW_LINES).map(|row| (*row).to_string()).collect();
+    Preview {
+        status: status.unwrap_or_default(),
+        head: head.join("\n"),
+        more: rows.len().saturating_sub(edit::DIFF_PREVIEW_LINES),
+        failed: output.starts_with("error:"),
+    }
+}
+
 /// `text` in at most `width` characters, the cut marked with an ellipsis.
 pub(crate) fn shorten(text: &str, width: usize) -> String {
     let mut short: String = text.chars().take(width).collect();
@@ -447,7 +466,7 @@ pub(crate) fn definitions() -> Value {
     json!([
         {"type": "function", "function": {
             "name": BASH,
-            "description": format!("Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after {} seconds. With `background`, it keeps running and its output is read through `proc://`.", BASH_TIMEOUT.as_secs()),
+            "description": format!("Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after {} seconds. With `background`, it keeps running and its output is read through `proc://`. Use it for programs, tests and git, never to change a file's contents: `edit` and `write_file` are the audited ways, and the only ones that record what changed.", BASH_TIMEOUT.as_secs()),
             "parameters": {"type": "object", "properties": {
                 "command": {"type": "string"},
                 "background": {"type": "boolean", "description": "Start the command as a background job and return its proc:// id instead of waiting."}
@@ -455,13 +474,18 @@ pub(crate) fn definitions() -> Value {
         }},
         {"type": "function", "function": {
             "name": READ_FILE,
-            "description": format!("Read a UTF-8 text file. Relative paths resolve against the working directory. A file holding merge-conflict markers gets every block an id, listed after the text. `<path>:conflicts` registers and lists every block of a file.{uris}"),
+            "description": format!("Read a UTF-8 text file. Relative paths resolve against the working directory. Lines are numbered `N:text`; append `:N`, `:N-M`, `:N-` or `:-N` to read a range and `:raw` to drop the numbers. A file holding merge-conflict markers gets every block an id, listed after the text. `<path>:conflicts` registers and lists every block of a file.{uris}"),
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
         }},
         {"type": "function", "function": {
             "name": WRITE_FILE,
             "description": format!("Create or overwrite a file with the given content. Creates missing parent directories. Relative paths resolve against the working directory.{uris}"),
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
+        }},
+        {"type": "function", "function": {
+            "name": EDIT,
+            "description": "Change an existing file by line ranges taken from a numbered `read_file`. This agent must have read the file and the file must be unchanged since. Patch rows: `PUT N.=M:` replaces lines N..M with the `+TEXT` rows that follow, `PUT <N:` / `PUT >N:` / `PUT >$:` inserts, `CUT N.=M` deletes, `REM` deletes the file, `MV DEST` renames. Anchors are the original line numbers. Returns a compact diff. Use `write_file` to create a file.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "patch": {"type": "string"}}, "required": ["path", "patch"]}
         }}
     ])
 }
@@ -489,6 +513,13 @@ struct WriteArgs {
     content: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditArgs {
+    path: String,
+    patch: String,
+}
+
 /// Parses tool arguments, turning a serde failure into the text the model reads.
 pub(crate) fn parse_args<'a, T: Deserialize<'a>>(arguments: &'a str) -> Result<T, String> {
     serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))
@@ -509,6 +540,7 @@ pub(crate) struct Context<'a> {
 }
 
 /// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_guarded(
     working_dir: &Path,
     name: &str,
@@ -516,19 +548,22 @@ pub(crate) fn execute_guarded(
     policy: &Policy,
     cancel: Option<&AtomicBool>,
     conflicts: &mut conflict::Registry,
+    seen: &mut edit::Store,
     context: &Context<'_>,
 ) -> String {
     match policy.refuse(name, arguments) {
         Some(refusal) => outcome(Err(refusal)),
-        None => outcome(run(working_dir, name, arguments, conflicts, BASH_TIMEOUT, cancel, context)),
+        None => outcome(run(working_dir, name, arguments, conflicts, seen, BASH_TIMEOUT, cancel, context)),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     working_dir: &Path,
     name: &str,
     arguments: &str,
     conflicts: &mut conflict::Registry,
+    seen: &mut edit::Store,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
     context: &Context<'_>,
@@ -536,10 +571,13 @@ fn run(
     match name {
         BASH => parse_args::<BashArgs>(arguments).and_then(|args| bash(working_dir, &args, timeout, cancel)),
         READ_FILE => {
-            parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts, context))
+            parse_args::<ReadArgs>(arguments).and_then(|args| read_file(working_dir, &args, conflicts, seen, context))
         }
         WRITE_FILE => {
-            parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts, context))
+            parse_args::<WriteArgs>(arguments).and_then(|args| write_file(working_dir, &args, conflicts, seen, context))
+        }
+        EDIT => {
+            parse_args::<EditArgs>(arguments).and_then(|args| edit::apply(working_dir, &args.path, &args.patch, seen))
         }
         // An MCP server reports its own failures as text, which is what the model reads.
         _ if name.starts_with(mcp::PREFIX) => Ok(context.mcp.call(name, arguments)),
@@ -741,13 +779,24 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>, cap: usize) -> Drain {
     }))
 }
 
-/// Reads a UTF-8 file, keeping the head of a file larger than the read budget.
+/// What a `read_file` path's line selector asks for.
+struct Selector {
+    /// First line, 1-based; `None` for the head.
+    from: Option<usize>,
+    /// Last line, 1-based; `None` for the tail.
+    to: Option<usize>,
+    /// Drop the line numbers, returning the rows as they are.
+    raw: bool,
+}
+
+/// Reads a UTF-8 file, numbered by line, and records what this agent saw.
 ///
 /// Every conflict block the read shows is registered, so a later write can address it by id.
 fn read_file(
     working_dir: &Path,
     args: &ReadArgs,
     conflicts: &mut conflict::Registry,
+    seen: &mut edit::Store,
     context: &Context<'_>,
 ) -> Result<String, String> {
     if url::is_url(&args.path) {
@@ -764,11 +813,21 @@ fn read_file(
     if let Some(display) = args.path.strip_suffix(conflict::LIST_SUFFIX) {
         return list_conflicts(working_dir, display, conflicts);
     }
-    let full = working_dir.join(&args.path);
-    let (text, cut) = read_limited(&full, &args.path)?;
-    let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(&args.path, &e))?;
-    conflicts.reconcile(&absolute, &args.path, &text);
-    let mut out = with_note(text, cut);
+    let (path, selector) = split_selector(working_dir, &args.path);
+    let full = working_dir.join(path);
+    let (text, read_cut) = read_limited(&full, path)?;
+    let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(path, &e))?;
+    conflicts.reconcile(&absolute, path, &text);
+    let rows = diff::split_lines(&text);
+    let total = rows.len();
+    let (from, _to, selected) = select(&rows, selector.as_ref(), path, total)?;
+    let raw = selector.as_ref().is_some_and(|selector| selector.raw);
+    let (mut body, number_cut, emitted) = numbered(selected, from, raw);
+    if selector.is_none() && text.ends_with('\n') && !body.is_empty() && body.len() < edit::MAX_READ_BYTES {
+        body.push('\n');
+    }
+    let cut = read_cut || number_cut;
+    let mut out = with_note(body, cut);
     let summary = conflicts.summary(&absolute);
     if !summary.is_empty() {
         out.push('\n');
@@ -781,7 +840,131 @@ fn read_file(
             );
         }
     }
+    if total == 0 {
+        seen.record(absolute, edit::hash_file(&full)?, 0, 0, 0);
+    } else if emitted > 0 {
+        let first = if selector.is_none() && !cut { 1 } else { from };
+        let last = first.saturating_add(emitted).saturating_sub(1);
+        seen.record(absolute, edit::hash_file(&full)?, total, first, last);
+    }
     Ok(out)
+}
+
+/// Splits a selector off a path, unless a file of that exact name exists.
+fn split_selector<'a>(working_dir: &Path, path: &'a str) -> (&'a str, Option<Selector>) {
+    if working_dir.join(path).exists() {
+        return (path, None);
+    }
+    let mut base = path;
+    let mut raw = false;
+    let mut range = None;
+    if let Some(stripped) = base.strip_suffix(":raw") {
+        raw = true;
+        base = stripped;
+    }
+    if let Some((head, tail)) = base.rsplit_once(':')
+        && let Some(parsed) = parse_range(tail)
+    {
+        range = Some(parsed);
+        base = head;
+        if let Some(stripped) = base.strip_suffix(":raw") {
+            raw = true;
+            base = stripped;
+        }
+    }
+    if !raw && range.is_none() {
+        return (path, None);
+    }
+    let (from, to) = range.unwrap_or((None, None));
+    (base, Some(Selector { from, to, raw }))
+}
+
+/// `N`, `N-M`, `N-`, `-N` as `(from, to)`, each side optional.
+fn parse_range(text: &str) -> Option<(Option<usize>, Option<usize>)> {
+    if let Some((from, to)) = text.split_once('-') {
+        if from.is_empty() {
+            return Some((None, Some(to.parse().ok()?)));
+        }
+        let from = from.parse().ok()?;
+        if to.is_empty() {
+            return Some((Some(from), None));
+        }
+        return Some((Some(from), Some(to.parse().ok()?)));
+    }
+    Some((Some(text.parse().ok()?), Some(text.parse().ok()?)))
+}
+
+/// The rows a selector names, and the 1-based range it names.
+fn select<'a>(
+    rows: &'a [&'a str],
+    selector: Option<&Selector>,
+    path: &str,
+    total: usize,
+) -> Result<(usize, usize, &'a [&'a str]), String> {
+    let Some(selector) = selector else {
+        return Ok((1, total, rows));
+    };
+    let from = selector.from.unwrap_or(1);
+    let to = selector.to.unwrap_or(total.max(from));
+    if from == 0 || to == 0 {
+        return Err("line 0 is not a line: ranges start at 1".into());
+    }
+    if from > to {
+        return Err(format!("range {from}-{to} is reversed"));
+    }
+    if from > total || (selector.to.is_some() && to > total) {
+        return Err(format!("range {from}-{to} is past {path} ({total} lines)"));
+    }
+    let to = to.min(total);
+    let selected = rows.get(from.saturating_sub(1)..to).unwrap_or_default();
+    Ok((from, to, selected))
+}
+
+/// Numbers `rows` from `first`, spending the read budget; returns what it showed and how many rows.
+fn numbered(rows: &[&str], first: usize, raw: bool) -> (String, bool, usize) {
+    let mut out = String::new();
+    let mut cut = false;
+    let mut emitted: usize = 0;
+    for (offset, row) in rows.iter().enumerate() {
+        let number = first.saturating_add(offset);
+        let prefix = if raw { String::new() } else { format!("{number}:") };
+        let separator = usize::from(!out.is_empty());
+        let needed = prefix.len().saturating_add(row.len()).saturating_add(separator);
+        let remaining = edit::MAX_READ_BYTES.saturating_sub(out.len());
+        if needed <= remaining {
+            if separator == 1 {
+                out.push('\n');
+            }
+            out.push_str(&prefix);
+            out.push_str(row);
+            emitted = emitted.saturating_add(1);
+            continue;
+        }
+        cut = true;
+        let room = remaining.saturating_sub(prefix.len().saturating_add(separator));
+        if room > 0 {
+            if separator == 1 {
+                out.push('\n');
+            }
+            out.push_str(&prefix);
+            out.push_str(shorten_bytes(row, room));
+            emitted = emitted.saturating_add(1);
+        }
+        break;
+    }
+    (out, cut, emitted)
+}
+
+/// The longest valid UTF-8 prefix of `text` that fits in `room` bytes.
+fn shorten_bytes(text: &str, room: usize) -> &str {
+    if text.len() <= room {
+        return text;
+    }
+    let mut end = room;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default()
 }
 
 /// Reads a UTF-8 file, keeping the head of a file larger than the read budget, and says whether it
@@ -791,14 +974,14 @@ fn read_file(
 /// and naming it as one would send the model to the wrong place.
 pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), String> {
     let file = fs::File::open(path).map_err(|e| config::io_error(label, &e))?;
-    let limit = u64::try_from(MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
+    let limit = u64::try_from(edit::MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
     let mut bytes = Vec::with_capacity(8 * 1024);
     file.take(limit).read_to_end(&mut bytes).map_err(|e| config::io_error(label, &e))?;
-    let cut = bytes.len() > MAX_READ_BYTES;
+    let cut = bytes.len() > edit::MAX_READ_BYTES;
     if cut {
         // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
         let end = bytes
-            .get(..MAX_READ_BYTES)
+            .get(..edit::MAX_READ_BYTES)
             .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
         bytes.truncate(end);
     }
@@ -812,7 +995,8 @@ pub(crate) fn with_note(text: String, cut: bool) -> String {
         return text;
     }
     let shown = text.len();
-    format!("{text}\n[truncated: first {shown} bytes shown; {MAX_READ_BYTES} is the read budget, not the file size]")
+    let budget = edit::MAX_READ_BYTES;
+    format!("{text}\n[truncated: first {shown} bytes shown; {budget} is the read budget, not the file size]")
 }
 
 /// Registers every block of a file, past the read budget, and lists them.
@@ -836,6 +1020,7 @@ fn write_file(
     working_dir: &Path,
     args: &WriteArgs,
     conflicts: &mut conflict::Registry,
+    seen: &mut edit::Store,
     context: &Context<'_>,
 ) -> Result<String, String> {
     if url::is_url(&args.path) {
@@ -850,6 +1035,10 @@ fn write_file(
         fs::create_dir_all(parent).map_err(|e| config::io_error(parent.display(), &e))?;
     }
     fs::write(&full, &args.content).map_err(|e| config::io_error(&args.path, &e))?;
+    let absolute = fs::canonicalize(&full).map_err(|e| config::io_error(&args.path, &e))?;
+    let lines = diff::line_count(&args.content);
+    let (from, to) = if lines == 0 { (0, 0) } else { (1, lines) };
+    seen.record(absolute, edit::hash(args.content.as_bytes()), lines, from, to);
     Ok(format!("wrote {} bytes to {}", args.content.len(), args.path))
 }
 
@@ -891,13 +1080,29 @@ fn ceil_boundary(s: &str, at: usize) -> usize {
 mod tests {
     use super::*;
 
-    /// A registry per call: a policy test never resolves a conflict.
-    fn registry() -> conflict::Registry {
-        conflict::Registry::default()
+    /// One tool call's per-agent state: conflicts to resolve and files seen.
+    #[derive(Default)]
+    struct Sandbox {
+        conflicts: conflict::Registry,
+        seen: edit::Store,
     }
     /// A policy granting every file tool, so a test about one of them is not about the allow list.
     fn file_tools() -> Policy {
-        Policy { allow_tools: vec![BASH.into(), READ_FILE.into(), WRITE_FILE.into()], ..Policy::default() }
+        Policy { allow_tools: vec![BASH.into(), READ_FILE.into(), WRITE_FILE.into(), EDIT.into()], ..Policy::default() }
+    }
+
+    fn sandbox() -> Sandbox {
+        Sandbox::default()
+    }
+
+    /// A tool call with no policy, no cancellation and a fresh sandbox: each test sees its own ids.
+    fn execute(dir: &Path, name: &str, arguments: &str) -> String {
+        guarded(dir, name, arguments, &file_tools(), None, &mut sandbox())
+    }
+
+    /// One tool call against a sandbox the caller keeps, for a read a later edit builds on.
+    fn with_sandbox(dir: &Path, name: &str, arguments: &str, state: &mut Sandbox) -> String {
+        guarded(dir, name, arguments, &file_tools(), None, state)
     }
 
     /// The configuration a scoped call runs under: one root, one model, one base URL.
@@ -923,7 +1128,8 @@ mod tests {
             url::Scope { caller: 1, swarm: None, config: cfg, working_dir: dir, policy, mcp: &mcp, remaining_depth: 3 };
         let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: Some(&scope) };
         let args = json!({"path": path}).to_string();
-        execute_guarded(dir, READ_FILE, &args, policy, None, &mut registry(), &context)
+        let mut state = Sandbox::default();
+        execute_guarded(dir, READ_FILE, &args, policy, None, &mut state.conflicts, &mut state.seen, &context)
     }
 
     #[test]
@@ -977,17 +1183,8 @@ mod tests {
         assert_eq!(scoped(dir.path(), &cfg, &open, "overseer://"), "topics: schemes, config, tools, agents");
         assert!(scoped(dir.path(), &cfg, &open, "overseer://schemes").contains("internal URIs:"));
         assert!(scoped(dir.path(), &cfg, &open, "overseer://config").starts_with("roots = "));
-        assert!(scoped(dir.path(), &cfg, &open, "overseer://tools").lines().any(|line| line == "bash: Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after 300 seconds. With `background`, it keeps running and its output is read through `proc://`."));
+        assert!(scoped(dir.path(), &cfg, &open, "overseer://tools").lines().any(|line| line == "bash: Run a shell command with `sh -c` in the working directory. Returns exit code, stdout and stderr. Stdin is closed; the command is killed after 300 seconds. With `background`, it keeps running and its output is read through `proc://`. Use it for programs, tests and git, never to change a file's contents: `edit` and `write_file` are the audited ways, and the only ones that record what changed."));
         assert!(scoped(dir.path(), &cfg, &open, "overseer://x").starts_with("error: unknown topic x; topics are "));
-    }
-    /// A tool call under `file_tools`, no cancellation and a fresh registry: each test sees its own ids.
-    fn execute(dir: &Path, name: &str, arguments: &str) -> String {
-        guarded(dir, name, arguments, &file_tools(), None, &mut registry())
-    }
-
-    /// One tool call against a registry the caller keeps, for a read that a later write resolves.
-    fn with_registry(dir: &Path, name: &str, arguments: &str, conflicts: &mut conflict::Registry) -> String {
-        guarded(dir, name, arguments, &file_tools(), None, conflicts)
     }
 
     /// The same call, with the empty skills and servers a plain tool test has.
@@ -997,7 +1194,7 @@ mod tests {
         arguments: &str,
         policy: &Policy,
         cancel: Option<&AtomicBool>,
-        conflicts: &mut conflict::Registry,
+        state: &mut Sandbox,
     ) -> String {
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
@@ -1009,7 +1206,8 @@ mod tests {
             arguments,
             policy,
             cancel,
-            conflicts,
+            &mut state.conflicts,
+            &mut state.seen,
             &Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None },
         )
     }
@@ -1071,7 +1269,7 @@ mod tests {
         assert_eq!(inherited.allow_commands, Vec::<String>::new());
         let dir = tempfile::tempdir().unwrap();
         let command = json!({"command": "git status"}).to_string();
-        let out = guarded(dir.path(), BASH, &command, &inherited, None, &mut registry());
+        let out = guarded(dir.path(), BASH, &command, &inherited, None, &mut sandbox());
         assert!(out.starts_with("error: this agent runs no bash command"), "{out}");
         // A child of a deny-all agent stays deny-all, whatever allow list it asks for.
         let looser = inherited.inherit(&Policy { allow_commands: vec!["ls".into()], ..file_tools() });
@@ -1083,7 +1281,7 @@ mod tests {
         let policy = Policy::default();
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            guarded(dir.path(), BASH, r#"{"command":"ls"}"#, &policy, None, &mut registry()),
+            guarded(dir.path(), BASH, r#"{"command":"ls"}"#, &policy, None, &mut sandbox()),
             "error: this agent may call no tool: it can only think and answer"
         );
         assert!(policy.refuse(REPLY, "{}").is_none(), "reporting home is never a right to ask for");
@@ -1110,13 +1308,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let command = r#"{"command":"echo before; sleep 30"}"#;
-        let mut conflicts = conflict::Registry::default();
+        let mut state = sandbox();
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
         let profiles = profiles::Catalogue::default();
         let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
-        let out = outcome(run(dir.path(), BASH, command, &mut conflicts, Duration::from_millis(200), None, &context));
+        let out = outcome(run(
+            dir.path(),
+            BASH,
+            command,
+            &mut state.conflicts,
+            &mut state.seen,
+            Duration::from_millis(200),
+            None,
+            &context,
+        ));
         assert!(out.starts_with("killed after 0s"), "{out}");
         assert!(out.contains("stdout:\nbefore\n"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1128,7 +1335,7 @@ mod tests {
         let write = json!({"path": "a/b/note.txt", "content": "héllo"}).to_string();
         assert_eq!(execute(dir.path(), WRITE_FILE, &write), "wrote 6 bytes to a/b/note.txt");
         assert_eq!(fs::read_to_string(dir.path().join("a/b/note.txt")).unwrap(), "héllo");
-        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"a/b/note.txt"}"#), "héllo");
+        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"a/b/note.txt"}"#), "1:héllo");
     }
 
     #[test]
@@ -1143,7 +1350,7 @@ mod tests {
         );
         assert_eq!(
             execute(root, "nope", "{}"),
-            "error: tool nope is not granted to this agent; it may call bash read_file write_file"
+            "error: tool nope is not granted to this agent; it may call bash read_file write_file edit"
         );
     }
 
@@ -1163,12 +1370,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("src.rs");
         fs::write(&file, "<<<<<<< HEAD\nlet x = 1;\n=======\nlet x = 2;\n>>>>>>> other\n").unwrap();
-        let mut conflicts = conflict::Registry::default();
-        let read = with_registry(dir.path(), READ_FILE, r#"{"path":"src.rs"}"#, &mut conflicts);
+        let mut state = sandbox();
+        let read = with_sandbox(dir.path(), READ_FILE, r#"{"path":"src.rs"}"#, &mut state);
         assert!(read.contains("⚠ 1 unresolved conflict in src.rs"), "{read}");
         assert!(read.contains("- #1: lines 1–5 (ours \"HEAD\", theirs \"other\")"), "{read}");
         let write = json!({"path": "conflict://1", "content": "@theirs"}).to_string();
-        let out = with_registry(dir.path(), WRITE_FILE, &write, &mut conflicts);
+        let out = with_sandbox(dir.path(), WRITE_FILE, &write, &mut state);
         assert!(out.starts_with("resolved conflict #1 at lines 1–5 in src.rs"), "{out}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "let x = 2;\n");
         assert!(!out.contains("error"), "{out}");
@@ -1198,7 +1405,7 @@ mod tests {
     fn a_plain_file_read_carries_no_conflict_notice() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("plain.rs"), "fn main() {}\n").unwrap();
-        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"plain.rs"}"#), "fn main() {}\n");
+        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"plain.rs"}"#), "1:fn main() {}\n");
         assert_eq!(
             execute(dir.path(), READ_FILE, r#"{"path":"plain.rs:conflicts"}"#),
             "no conflict markers in plain.rs"
@@ -1221,6 +1428,11 @@ mod tests {
         assert_eq!(read.status, "9 lines");
         assert_eq!(read.head.lines().count(), PREVIEW_LINES);
         assert_eq!(read.more, 9 - PREVIEW_LINES);
+        let edit = preview(EDIT, "edit: +1/-1\n-2|b\n+2|B\n");
+        assert_eq!(edit.status, "+1/-1");
+        assert_eq!(edit.head, "-2|b\n+2|B");
+        assert_eq!(edit.more, 0);
+        assert!(!edit.failed);
     }
 
     #[test]
@@ -1267,7 +1479,7 @@ mod tests {
     #[test]
     fn a_backgrounded_child_does_not_hold_the_call_open() {
         let dir = tempfile::tempdir().unwrap();
-        let mut conflicts = conflict::Registry::default();
+        let mut state = sandbox();
         let home = tempfile::tempdir().unwrap();
         let skills = skills::Catalogue::user(home.path());
         let mcp = mcp::Registry::load(home.path());
@@ -1280,7 +1492,8 @@ mod tests {
             dir.path(),
             BASH,
             r#"{"command":"sleep 300 &"}"#,
-            &mut conflicts,
+            &mut state.conflicts,
+            &mut state.seen,
             Duration::from_millis(200),
             None,
             &context,
@@ -1322,17 +1535,23 @@ mod tests {
         let policy = Policy { read_only: true, ..file_tools() };
         let write = json!({"path": "x", "content": "y"}).to_string();
         assert!(
-            guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
+            guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut sandbox())
                 .starts_with("error: this agent is read-only"),
             "write_file ran in a read-only agent"
         );
+        let patch = json!({"path": "x", "patch": "PUT 1.=1:\n+y\n"}).to_string();
+        assert!(
+            guarded(dir.path(), EDIT, &patch, &policy, None, &mut sandbox())
+                .starts_with("error: this agent is read-only"),
+            "edit ran in a read-only worker"
+        );
         for command in ["rm x", "ls > x", "echo $(rm x)", "git commit -m x", "sed -i s/a/b/ x"] {
             let args = json!({"command": command}).to_string();
-            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut sandbox());
             assert!(out.starts_with("error: this agent is read-only"), "`{command}` ran: {out}");
         }
         let read = json!({"command": "ls | head -5"}).to_string();
-        let out = guarded(dir.path(), BASH, &read, &policy, None, &mut registry());
+        let out = guarded(dir.path(), BASH, &read, &policy, None, &mut sandbox());
         assert!(!out.starts_with("error:"), "a read-only pipeline was refused: {out}");
     }
 
@@ -1354,12 +1573,12 @@ mod tests {
             "tree -o out.md",
         ] {
             let args = json!({"command": command}).to_string();
-            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut sandbox());
             assert!(out.starts_with("error: this agent is read-only"), "`{command}` ran: {out}");
         }
         for command in ["git branch --merged", "git remote -v", "git tag -l", "git log --oneline -5"] {
             let args = json!({"command": command}).to_string();
-            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &policy, None, &mut sandbox());
             assert!(!out.starts_with("error: this agent is read-only"), "`{command}` was refused: {out}");
         }
     }
@@ -1375,21 +1594,21 @@ mod tests {
         };
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
-            guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
+            guarded(dir.path(), READ_FILE, &read, &policy, None, &mut sandbox()),
             "error: tool read_file is not granted to this agent; it may call bash write_file"
         );
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
-            guarded(dir.path(), BASH, &denied, &policy, None, &mut registry()),
+            guarded(dir.path(), BASH, &denied, &policy, None, &mut sandbox()),
             "error: this agent may not run `echo secret`"
         );
         let outside = json!({"command": "pwd"}).to_string();
         assert_eq!(
-            guarded(dir.path(), BASH, &outside, &policy, None, &mut registry()),
+            guarded(dir.path(), BASH, &outside, &policy, None, &mut sandbox()),
             "error: this agent runs only: ls · echo"
         );
         let allowed = json!({"command": "ls"}).to_string();
-        assert!(!guarded(dir.path(), BASH, &allowed, &policy, None, &mut registry()).starts_with("error:"));
+        assert!(!guarded(dir.path(), BASH, &allowed, &policy, None, &mut sandbox()).starts_with("error:"));
     }
 
     /// A rule names words: what a text prefix would let through must be refused, and what hides the
@@ -1400,16 +1619,16 @@ mod tests {
         let only_ls = Policy { allow_commands: vec!["ls".into()], ..file_tools() };
         for command in ["lsof", "ls; rm -rf x", "ls | sh", "ls && id"] {
             let args = json!({"command": command}).to_string();
-            let out = guarded(dir.path(), BASH, &args, &only_ls, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &only_ls, None, &mut sandbox());
             assert!(out.starts_with("error:"), "`{command}` passed an `ls` rule: {out}");
         }
         let wrapped = json!({"command": "env ls"}).to_string();
-        assert!(!guarded(dir.path(), BASH, &wrapped, &only_ls, None, &mut registry()).starts_with("error:"));
+        assert!(!guarded(dir.path(), BASH, &wrapped, &only_ls, None, &mut sandbox()).starts_with("error:"));
 
         let no_rm = Policy { deny_commands: vec!["rm".into()], ..file_tools() };
         for command in ["env rm -rf x", "/bin/rm -rf x", "X=1 rm -rf x"] {
             let args = json!({"command": command}).to_string();
-            let out = guarded(dir.path(), BASH, &args, &no_rm, None, &mut registry());
+            let out = guarded(dir.path(), BASH, &args, &no_rm, None, &mut sandbox());
             assert!(out.starts_with("error: this agent may not run `rm`"), "`{command}` ran: {out}");
         }
     }
@@ -1425,11 +1644,30 @@ mod tests {
         let mcp = mcp::Registry::load(home.path());
         let profiles = profiles::Catalogue::default();
         let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
+        let mut state = sandbox();
         let read = json!({"path": "skill://caveman"}).to_string();
-        let out = execute_guarded(dir.path(), READ_FILE, &read, &file_tools(), None, &mut registry(), &context);
+        let out = execute_guarded(
+            dir.path(),
+            READ_FILE,
+            &read,
+            &file_tools(),
+            None,
+            &mut state.conflicts,
+            &mut state.seen,
+            &context,
+        );
         assert!(out.contains("body"), "{out}");
         let missing = json!({"path": "skill://nope"}).to_string();
-        let out = execute_guarded(dir.path(), READ_FILE, &missing, &file_tools(), None, &mut registry(), &context);
+        let out = execute_guarded(
+            dir.path(),
+            READ_FILE,
+            &missing,
+            &file_tools(),
+            None,
+            &mut state.conflicts,
+            &mut state.seen,
+            &context,
+        );
         assert!(out.starts_with("error: unknown skill nope"), "{out}");
     }
 
@@ -1441,12 +1679,97 @@ mod tests {
         let mcp = mcp::Registry::load(home.path());
         let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp, scope: None };
         let mut conflicts = conflict::Registry::default();
+        let mut seen = edit::Store::default();
         let args = ReadArgs { path: "profile://orchestrator".into() };
-        let text = read_file(home.path(), &args, &mut conflicts, &context).unwrap();
+        let text = read_file(home.path(), &args, &mut conflicts, &mut seen, &context).unwrap();
         assert!(text.contains("You own one task from the brief"), "{text}");
         let missing = ReadArgs { path: "profile://ghost".into() };
-        let text = read_file(home.path(), &missing, &mut conflicts, &context).unwrap_err();
+        let text = read_file(home.path(), &missing, &mut conflicts, &mut seen, &context).unwrap_err();
         assert!(text.contains("unknown profile ghost"), "{text}");
+    }
+
+    #[test]
+    fn a_read_selector_numbers_only_what_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("t.rs"), "a\nb\nc\nd\ne\n").unwrap();
+        let read = |path: &str| execute(dir.path(), READ_FILE, &json!({"path": path}).to_string());
+        assert_eq!(read("t.rs:2-4"), "2:b\n3:c\n4:d");
+        assert_eq!(read("t.rs:2-"), "2:b\n3:c\n4:d\n5:e");
+        assert_eq!(read("t.rs:-2"), "1:a\n2:b");
+        assert_eq!(read("t.rs:3"), "3:c");
+        assert_eq!(read("t.rs:2-3:raw"), "b\nc");
+        assert_eq!(read("t.rs:raw:2-3"), "b\nc");
+        assert_eq!(read("t.rs:0"), "error: line 0 is not a line: ranges start at 1");
+        assert_eq!(read("t.rs:4-2"), "error: range 4-2 is reversed");
+        assert_eq!(read("t.rs:4-9"), "error: range 4-9 is past t.rs (5 lines)");
+    }
+
+    #[test]
+    fn a_literal_file_named_like_a_selector_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes:12"), "literal\n").unwrap();
+        assert_eq!(execute(dir.path(), READ_FILE, r#"{"path":"notes:12"}"#), "1:literal\n");
+    }
+
+    #[test]
+    fn a_read_numbers_and_an_edit_anchors_on_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sandbox();
+        let write = json!({"path": "t.rs", "content": "a\nb\nc\n"}).to_string();
+        assert_eq!(with_sandbox(dir.path(), WRITE_FILE, &write, &mut state), "wrote 6 bytes to t.rs");
+        assert_eq!(with_sandbox(dir.path(), READ_FILE, r#"{"path":"t.rs"}"#, &mut state), "1:a\n2:b\n3:c\n");
+        let patch = json!({"path": "t.rs", "patch": "PUT 2.=2:\n+B\n"}).to_string();
+        assert_eq!(with_sandbox(dir.path(), EDIT, &patch, &mut state), "edit: +1/-1\n-2|b\n+2|B");
+        assert_eq!(fs::read_to_string(dir.path().join("t.rs")).unwrap(), "a\nB\nc\n");
+        // A partial read licenses only the range it showed.
+        assert_eq!(with_sandbox(dir.path(), READ_FILE, r#"{"path":"t.rs:2-3"}"#, &mut state), "2:B\n3:c");
+        let outside = json!({"path": "t.rs", "patch": "PUT 1.=1:\n+Z\n"}).to_string();
+        assert_eq!(
+            with_sandbox(dir.path(), EDIT, &outside, &mut state),
+            "error: line 1 is outside what you read (you saw 2-3); read the range first"
+        );
+        let inside = json!({"path": "t.rs", "patch": "PUT 3.=3:\n+C\n"}).to_string();
+        assert_eq!(with_sandbox(dir.path(), EDIT, &inside, &mut state), "edit: +1/-1\n-3|c\n+3|C");
+        // An edit leaves the whole file seen.
+        assert_eq!(with_sandbox(dir.path(), READ_FILE, r#"{"path":"t.rs"}"#, &mut state), "1:a\n2:B\n3:C\n");
+    }
+
+    #[test]
+    fn an_edit_after_a_concurrent_change_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sandbox();
+        let write = json!({"path": "t.rs", "content": "a\n"}).to_string();
+        with_sandbox(dir.path(), WRITE_FILE, &write, &mut state);
+        with_sandbox(dir.path(), READ_FILE, r#"{"path":"t.rs"}"#, &mut state);
+        fs::write(dir.path().join("t.rs"), "a\nb\n").unwrap();
+        let patch = json!({"path": "t.rs", "patch": "PUT 1.=1:\n+z\n"}).to_string();
+        assert_eq!(
+            with_sandbox(dir.path(), EDIT, &patch, &mut state),
+            "error: t.rs changed since you read it; read it again"
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("t.rs")).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn an_edit_of_an_unread_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("t.rs"), "a\n").unwrap();
+        let patch = json!({"path": "t.rs", "patch": "PUT 1.=1:\n+z\n"}).to_string();
+        assert_eq!(with_sandbox(dir.path(), EDIT, &patch, &mut sandbox()), "error: read t.rs before editing it");
+    }
+
+    #[test]
+    fn a_no_op_edit_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sandbox();
+        let write = json!({"path": "t.rs", "content": "a\n"}).to_string();
+        with_sandbox(dir.path(), WRITE_FILE, &write, &mut state);
+        let patch = json!({"path": "t.rs", "patch": "PUT 1.=1:\n+a\n"}).to_string();
+        assert_eq!(
+            with_sandbox(dir.path(), EDIT, &patch, &mut state),
+            "error: no change: the patch leaves t.rs as it is"
+        );
+        assert_eq!(fs::read_to_string(dir.path().join("t.rs")).unwrap(), "a\n");
     }
 
     #[test]
@@ -1454,7 +1777,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
-        let out = guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &file_tools(), Some(&cancel), &mut registry());
+        let out = guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &file_tools(), Some(&cancel), &mut sandbox());
         assert!(out.contains("interrupted by overseer"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
