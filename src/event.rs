@@ -9,16 +9,22 @@ pub(crate) enum UiEvent {
     Error(String),
     /// `OVERSEER_DEBUG` output.
     Debug(String),
-    /// The root began a new model call: the transcript starts a new paragraph.
-    TurnBoundary,
+    /// An agent began a new model call: its stream starts a new paragraph.
+    Boundary { id: usize },
+    /// The instruction an agent is about to work on.
+    Instruction { id: usize, text: String },
     /// The root's final answer for one turn.
     Answer(String),
     /// An agent's reply, final answer or failure.
     Agent { id: usize, kind: AgentEvent, text: String },
     /// An agent's model output, as it streams.
     AgentDelta { id: usize, text: String },
+    /// An agent's model reasoning, as it streams. Shown, never fed back.
+    AgentThought { id: usize, text: String },
     /// A tool call, when it starts and when it ends.
     Progress { id: usize, progress: Progress },
+    /// An agent's `out://` text, shown as the agent wrote it.
+    Out { id: usize, text: String },
     /// The tree after a change.
     Agents(Vec<AgentView>),
     /// An agent turn started or finished.

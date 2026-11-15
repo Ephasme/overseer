@@ -34,6 +34,7 @@
 | `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
+| `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
@@ -42,8 +43,16 @@
 | `src/diff.rs` | Myers over interned line ids, and the compact `-N|…` / `+N|…` rows both the model and the transcript read |
 | `src/edit.rs` | the line-anchored `edit` patch engine and the per-agent `Store` of files read |
 | `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
+| `src/slash.rs` | the slash-command table the composer's completion popup reads |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
+| `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in profiles, the `Role` that narrows one, and the text `profile://` reads |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
+| `src/artifacts.rs` | tool output too large for one result, kept per process and read back by `artifact://` |
+| `src/jobs.rs` | background `bash` commands, their pipes and process groups, behind `proc://` |
+| `src/memory.rs` | per-project notes under the state directory, behind `memory://` |
+| `src/vault.rs` | the `.env` credential file, behind `vault://` |
+| `src/rules.rs` | the instruction files that govern a directory, behind `rule://` |
+| `src/forge.rs` | `gh` and `glab` invocations, behind `issue://`, `pr://` and `mr://` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
 | `src/config.rs` | `config.toml`, roots, `max_depth`, the root's `dir`, `home`, `resolve_dir`, state directory, `io_error` |
@@ -60,15 +69,21 @@
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
-- `Control::set_policy` has exactly one caller, `Swarm::spawn`, before the thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- The root always runs the built-in `supervisor` profile and `Role::Supervisor`; a `~/.overseer/agent/profiles/supervisor.md` replaces its text, model, effort and tool list, never its role or its read-only restriction.
+- A profile's `allow_tools` is the whole right: tools are granted one by one, `mcp__<server>` grants one server's tools, and an empty list leaves an agent able to think and answer only. No tool changes a policy after the agent starts.
+- A worker's child gets the intersection of the two tool lists; a supervisor is exempt, so it can start agents with more rights than itself.
+- `spawn_agent` requires a profile, so every agent's rights have one place to be read; `worker` is the generalist (code, configuration, commands).
+- `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
-- A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
-- Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build` or an MCP server outlives the process.
+- A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
+- `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
+- Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build`, a background `bash` job or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
-- Agent model text streams through `llm::StreamLlm` into `Event::Delta`, which the TUI shows in the agent panel and the core never feeds back up the tree.
+- A model call reaches a view one way: `llm::StreamLlm` turns its pieces into `Event::Thought` and `Event::Delta`, and each becomes one entry appended to that agent's own `Stream`, in the order the call produced them. `Event::Instruction` opens a worker's stream, `Event::TurnStart` breaks it into paragraphs, and `Event::Progress` adds the tool card; nothing rewrites an entry already written, and a finished turn whose answer streamed is not written again. The core never feeds any of it back up the tree.
 - A `UiEvent` carrying a non-root agent id goes to that agent's `Stream` only; the lead's stream (`App::lead`) gets one lifecycle line per agent event and never an agent's tool call or message. The root's own events go straight into the lead's stream. `Stream` holds the entries, the flatten cache and the scroll position, so switching views loses neither buffer nor position. F3 is the one verbosity flag: it re-flows every stream.
-- An agent's view owns the keys while it is open (`tui::app::App::worker_key`): `esc` leaves it and never quits, and no key typed there reaches the root's prompt. Quitting stays on ctrl+c and ctrl+d.
+- An agent's view owns the keys while it is open (`tui::app::App::worker_key`): `esc` stops that agent and its subtree while it has work, leaves the view otherwise, and never quits; no key typed there reaches the root's prompt. The stop travels as `Event::Stop` into `Swarm::stop`, which the root refuses, so no key can end the user's only voice. Quitting stays on ctrl+c and ctrl+d.
 - Tool calls emit `Event::Progress` (start, then elapsed) for every agent, the root's included; it wakes nothing.
 - Debugging a real run: `OVERSEER_DEBUG=1` echoes each model request and every tool result. Prefer `just run`: an interactive shell may hash Homebrew's `overseer` under the same name and silently run the released binary.
 - Code, comments, commits and PRs in English.

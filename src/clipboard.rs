@@ -47,7 +47,7 @@ end run";
 ///
 /// The caller runs this off its own thread: the image path spawns `osascript` and copies every byte
 /// of the picture, far too slow for the frame that drew the chip.
-pub(crate) fn read() -> Paste {
+pub(crate) fn paste() -> Paste {
     match text() {
         Ok(Some(text)) => Paste::Text(text),
         Ok(None) => image(),
@@ -84,7 +84,7 @@ const WAIT: Duration = Duration::from_millis(20);
 /// byte of the image, far too slow for a keystroke. The script writes one short word to its pipes,
 /// so the poll loop does not need to drain them before the child exits.
 pub(crate) fn image() -> Paste {
-    let dir = attachments();
+    let dir = dir();
     if let Err(e) = ensure_dir(&dir) {
         return Paste::Failed(config::io_error(dir.display(), &e));
     }
@@ -214,7 +214,7 @@ fn pixels(path: &Path) -> Option<(u32, u32)> {
 ///
 /// Only files this module wrote are removed: any other path belongs to the user.
 pub(crate) fn discard(path: &Path) {
-    let dir = attachments();
+    let dir = dir();
     let prefix = format!("paste-{}-", std::process::id());
     let ours = path.parent().is_some_and(|parent| parent == dir.as_path());
     let prefixed = path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_str()));
@@ -225,14 +225,61 @@ pub(crate) fn discard(path: &Path) {
 
 /// The directory this run writes pastes to: its own, so another user's files cannot be read or
 /// swapped for a symlink.
-fn attachments() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     std::env::temp_dir().join(format!("{DIR}-{}", std::process::id()))
+}
+
+/// What `attachment://` lists: one chip line per file this session pasted, or that it holds none.
+pub(crate) fn listing() -> String {
+    let dir = dir();
+    let Ok(entries) = fs::read_dir(&dir) else { return "no attachments in this session".to_string() };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return "no attachments in this session".to_string();
+    }
+    names.iter().map(|name| info(&dir.join(name)).chip()).collect::<Vec<String>>().join("\n")
+}
+
+/// Reads one pasted file through `attachment://`: its text, or what a binary image is.
+///
+/// Only files this run wrote into its own directory are readable: a name carrying a separator or a
+/// `..` is refused, and the resolved path must still sit under that directory.
+pub(crate) fn read(name: &str) -> Result<String, String> {
+    let missing = || format!("{name}: no such attachment");
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".." {
+        return Err(missing());
+    }
+    let dir = dir();
+    let root = dir.canonicalize().map_err(|_| missing())?;
+    let resolved = dir
+        .join(name)
+        .canonicalize()
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { missing() } else { config::io_error(name, &e) })?;
+    if !resolved.starts_with(&root) {
+        return Err(missing());
+    }
+    if is_png(&resolved) {
+        return Ok(format!("{}\n[binary image: {}]", info(&resolved).chip(), resolved.display()));
+    }
+    let (text, cut) = crate::tools::read_limited(&resolved, name)?;
+    Ok(crate::tools::with_note(text, cut))
+}
+
+/// Whether the file starts with the PNG signature: a pasted screenshot is not text to read.
+fn is_png(path: &Path) -> bool {
+    let mut head = [0_u8; 8];
+    File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok() && head == *b"\x89PNG\r\n\x1a\n"
 }
 
 /// A path `discard` accepts, for a test that needs its image to be dropped afterwards.
 #[cfg(test)]
 pub(crate) fn pasted(name: &str) -> PathBuf {
-    let dir = attachments();
+    let dir = dir();
     let _ = fs::create_dir_all(&dir);
     dir.join(format!("paste-{}-{name}", std::process::id()))
 }
@@ -397,12 +444,27 @@ mod tests {
 
     #[test]
     fn discard_removes_a_pasted_image() {
-        let dir = attachments();
+        let dir = dir();
         ensure_dir(&dir).unwrap();
         let path = dir.join(format!("paste-{}-1.png", std::process::id()));
         fs::write(&path, b"x").unwrap();
         discard(&path);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_pasted_text_is_listed_and_read_through_its_uri() {
+        let dir = dir();
+        ensure_dir(&dir).unwrap();
+        let name = format!("paste-{}-a.txt", std::process::id());
+        let path = dir.join(&name);
+        fs::write(&path, "hello paste").unwrap();
+        assert!(listing().contains(&name), "{}", listing());
+        assert_eq!(read(&name).unwrap(), "hello paste");
+        for refused in ["", "../x", "a/b", "missing.txt"] {
+            assert!(read(refused).unwrap_err().ends_with("no such attachment"), "{refused} was read");
+        }
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -418,7 +480,7 @@ mod tests {
 
     #[test]
     fn discard_leaves_a_file_without_this_run_prefix() {
-        let dir = attachments();
+        let dir = dir();
         ensure_dir(&dir).unwrap();
         let path = dir.join("notes.png");
         fs::write(&path, b"x").unwrap();

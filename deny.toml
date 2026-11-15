@@ -22,8 +22,8 @@ allow = [
 
 [bans]
 multiple-versions = "deny"
-# Split across two majors by upstream dependency chains, so not resolvable here; any other duplicate fails.
-skip = ["base64", "core-foundation", "foldhash", "hashbrown", "syn"]
+# Split by upstream dependency chains, so not resolvable here; any other duplicate fails.
+skip = ["base64", "core-foundation", "foldhash", "hashbrown", "itertools", "syn"]
 wildcards = "deny"
 
 [sources]

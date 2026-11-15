@@ -19,7 +19,7 @@ struct RawConfig {
     dir: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     /// Directories scanned for repositories by `list_repos` and listed in the overseer prompt; not a sandbox.
     pub(crate) roots: Vec<PathBuf>,
@@ -58,6 +58,50 @@ impl Theme {
             other => bail!("theme {other:?} is not auto, dark, light or mono"),
         }
     }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Mono => "mono",
+        }
+    }
+}
+
+/// The settings one key at a time, in the order [`value`] accepts them; `base_url` is redacted.
+pub(crate) fn describe(cfg: &Config) -> String {
+    SETTINGS
+        .iter()
+        .map(|key| format!("{key} = {}", value(cfg, key).unwrap_or_default()))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
+pub(crate) const SETTINGS: &[&str] = &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir"];
+
+/// One effective setting, or why the key names none.
+pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
+    let text = match key {
+        "roots" => cfg.roots.iter().map(|root| root.display().to_string()).collect::<Vec<String>>().join(", "),
+        "base_url" => redact(&cfg.base_url),
+        "model" => cfg.model.clone(),
+        "theme" => cfg.theme.name().to_string(),
+        "max_depth" => cfg.max_depth.to_string(),
+        "dir" => cfg.dir.display().to_string(),
+        "home" => cfg.home.display().to_string(),
+        "state_dir" => state_dir(&cfg.home).display().to_string(),
+        other => return Err(format!("unknown setting {other}; settings are {}", SETTINGS.join(", "))),
+    };
+    Ok(text)
+}
+
+/// `url` with the userinfo of its authority replaced by `***`: a base URL is shown, its secret is not.
+fn redact(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let (authority, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let Some((_, host)) = authority.rsplit_once('@') else { return url.to_string() };
+    format!("{scheme}://***@{host}{tail}")
 }
 
 /// The user's home directory; an unset or empty `HOME` is an error, not a relative path.
@@ -71,6 +115,36 @@ pub(crate) fn path(home: &Path) -> PathBuf {
 
 pub(crate) fn state_dir(home: &Path) -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state", home).join("overseer")
+}
+
+/// Where the TUI remembers how the user left its layout between runs.
+pub(crate) fn tui_state(home: &Path) -> PathBuf {
+    state_dir(home).join("tui.toml")
+}
+
+/// What one run of the TUI carries over to the next.
+#[derive(Default, Deserialize, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+struct RawTui {
+    panel_width: Option<u16>,
+}
+
+/// The agent panel's width as the last run left it, if it was ever dragged.
+pub(crate) fn panel_width(home: &Path) -> Option<u16> {
+    let text = fs::read_to_string(tui_state(home)).ok()?;
+    toml::from_str::<RawTui>(&text).ok()?.panel_width
+}
+
+/// Remembers the agent panel's width for the next run.
+///
+/// A drag is not worth failing over: a state directory that cannot be written costs the next run
+/// its layout, not this one its panel.
+pub(crate) fn save_panel_width(home: &Path, width: u16) {
+    let path = tui_state(home);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, format!("panel_width = {width}\n"));
 }
 
 /// The `<path>: <os error>` shape every tool, log and path error uses.
@@ -161,6 +235,17 @@ fn canonical_dir(path: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel width survives a run and a malformed or absent file leaves it at the launch width.
+    #[test]
+    fn the_panel_width_is_remembered_between_runs() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(panel_width(home.path()), None, "a first run has nothing to restore");
+        save_panel_width(home.path(), 52);
+        assert_eq!(panel_width(home.path()), Some(52));
+        fs::write(tui_state(home.path()), "panel_width = \"wide\"").unwrap();
+        assert_eq!(panel_width(home.path()), None, "a file this run cannot read is no width at all");
+    }
 
     #[test]
     fn parse_expands_home() {

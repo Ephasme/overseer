@@ -1,5 +1,6 @@
 use crate::event::UiEvent;
-use crate::swarm::{Event, Progress};
+use crate::names;
+use crate::swarm::{AgentView, Event, Progress};
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
@@ -9,6 +10,8 @@ use std::thread;
 /// Used when no terminal is attached, so a pipe or a script still drives the overseer.
 pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
     spawn_stdin_reader(input);
+    // The roster, for the one thing line mode needs from it: the name of an agent it reports on.
+    let mut agents: Vec<AgentView> = Vec::new();
     for event in ui {
         match event {
             UiEvent::Notice(line) => err(&format!("overseer: {line}")),
@@ -18,16 +21,40 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
             UiEvent::Agent { id, kind, text } => {
                 let mut stderr = io::stderr().lock();
                 let mut lines = text.lines();
-                let _ = writeln!(stderr, "agent {id} {}: {}", kind.verb(), lines.next().unwrap_or_default());
+                // The id comes first, as in the transcript; the name follows it because a person reads this too.
+                let _ = writeln!(
+                    stderr,
+                    "agent {id} · {} {}: {}",
+                    name(&agents, id),
+                    kind.verb(),
+                    lines.next().unwrap_or_default()
+                );
                 for line in lines {
                     let _ = writeln!(stderr, "  {line}");
                 }
             }
-            UiEvent::Progress { id, progress } => err(&format!("[agent {id}] {}", describe(&progress))),
-            UiEvent::AgentDelta { .. } | UiEvent::TurnBoundary | UiEvent::Agents(_) | UiEvent::Busy(_) => {}
+            UiEvent::Out { id, text } => out(&format!("[agent {id} · {} out]\n{text}", name(&agents, id))),
+            UiEvent::Progress { id, progress } => err(&format!("[{}] {}", label(&agents, id), describe(&progress))),
+            // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
+            UiEvent::AgentDelta { .. }
+            | UiEvent::AgentThought { .. }
+            | UiEvent::Boundary { .. }
+            | UiEvent::Instruction { .. }
+            | UiEvent::Busy(_) => {}
+            UiEvent::Agents(roster) => agents = roster,
             UiEvent::Done => break,
         }
     }
+}
+
+/// An agent's name alone, for a line that already carries its id.
+fn name(agents: &[AgentView], id: usize) -> String {
+    agents.iter().find(|agent| agent.id == id).map_or_else(|| names::name(id, None), |agent| agent.name.clone())
+}
+
+/// How an agent reads in a prefixed line: its name and the id it answers to.
+fn label(agents: &[AgentView], id: usize) -> String {
+    agents.iter().find(|agent| agent.id == id).map_or_else(|| names::label(id, None), |agent| agent.label.clone())
 }
 
 /// A pipe may close before the overseer is done writing: `EPIPE` ends the output, never a panic.

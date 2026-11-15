@@ -1,7 +1,8 @@
 use crate::config;
 use crate::event::UiEvent;
-use crate::llm::Llm;
+use crate::llm::Models;
 use crate::mcp;
+use crate::profiles;
 use crate::swarm::{AgentEvent, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
@@ -21,7 +22,8 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// Blocking by design: the model client and every agent are blocking, so a frontend keeps this on its own thread.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(crate) fn run(
-    llm: Arc<dyn Llm>,
+    models: Arc<dyn Models>,
+    profiles: Arc<profiles::Catalogue>,
     cfg: &config::Config,
     log_dir: PathBuf,
     input: Sender<Event>,
@@ -31,15 +33,8 @@ pub(crate) fn run(
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
-    let swarm = Arc::new(Mutex::new(Swarm::new(
-        llm,
-        cfg.roots.clone(),
-        cfg.home.clone(),
-        log_dir,
-        input,
-        cfg.max_depth,
-        Arc::clone(&mcp),
-    )));
+    let swarm =
+        Arc::new(Mutex::new(Swarm::new(models, profiles, Arc::new(cfg.clone()), log_dir, input, Arc::clone(&mcp))));
     if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
         let _ = ui.send(UiEvent::Error(e.clone()));
         tools::kill_running();
@@ -93,21 +88,57 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
             }
+            Event::Stop { id } => {
+                let (result, agents, busy) = {
+                    let mut tree = lock(&swarm);
+                    let result = tree.stop(id);
+                    (result, tree.snapshot(), tree.busy())
+                };
+                let _ = ui.send(match result {
+                    Ok(line) => UiEvent::Notice(line),
+                    Err(line) => UiEvent::Error(line),
+                });
+                let _ = ui.send(UiEvent::Agents(agents));
+                let _ = ui.send(UiEvent::Busy(busy));
+                if draining && !busy {
+                    break;
+                }
+            }
+            Event::Rename { id, name } => {
+                let (line, agents) = {
+                    let mut tree = lock(&swarm);
+                    let line = tree.rename(id, &name);
+                    (line, tree.snapshot())
+                };
+                let _ = ui.send(UiEvent::Notice(line));
+                let _ = ui.send(UiEvent::Agents(agents));
+            }
             Event::Progress { id, progress } => {
                 let _ = ui.send(UiEvent::Progress { id, progress });
             }
             Event::Delta { id, text } => {
                 let _ = ui.send(UiEvent::AgentDelta { id, text });
             }
+            Event::Thought { id, text } => {
+                let _ = ui.send(UiEvent::AgentThought { id, text });
+            }
+            Event::Out { id, text } => {
+                let _ = ui.send(UiEvent::Out { id, text });
+            }
             Event::TurnStart { id } => {
-                if id == Swarm::ROOT {
-                    let _ = ui.send(UiEvent::TurnBoundary);
+                let _ = ui.send(UiEvent::Boundary { id });
+            }
+            Event::Instruction { id, text } => {
+                // The lead shows the user's own prompts as they are typed; a worker's instruction
+                // arrives here, from the thread that is about to work on it.
+                if id != Swarm::ROOT {
+                    let _ = ui.send(UiEvent::Instruction { id, text });
                 }
             }
             Event::Agent { id, kind, text } => {
                 let (agents, busy) = {
                     let mut tree = lock(&swarm);
-                    tree.finish_turn(id, kind);
+                    tree.finish_turn(id, kind, &text);
                     tree.deliver(id, kind, &text);
                     (tree.snapshot(), tree.busy())
                 };
@@ -180,7 +211,8 @@ mod tests {
         let frontend = input.clone();
         let handle = thread::spawn(move || {
             run(
-                Arc::new(Scripted::new(vec![text("hello back")])),
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("hello back")])))),
+                Arc::new(profiles::Catalogue::default()),
                 &cfg,
                 logs.path().to_path_buf(),
                 input,
@@ -227,7 +259,8 @@ mod tests {
         let logs = root.path().join("missing");
         let handle = thread::spawn(move || {
             run(
-                Arc::new(Scripted::new(vec![text("unused")])),
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("unused")])))),
+                Arc::new(profiles::Catalogue::default()),
                 &cfg,
                 logs,
                 input,

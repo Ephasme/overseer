@@ -264,6 +264,61 @@ impl Registry {
         defs
     }
 
+    /// Every resource the connected servers offer, one line each; a server without resources is
+    /// simply absent, and one whose `resources/list` fails contributes nothing to the listing.
+    pub(crate) fn resource_listing(&self) -> String {
+        let slots = self.client_slots();
+        let mut lines: Vec<String> = Vec::new();
+        for (name, slot) in slots {
+            let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(client) = guard.as_mut() else { continue };
+            let Ok(resources) = client.resources() else { continue };
+            for resource in resources {
+                let mime = resource.mime.as_deref().unwrap_or("no mime");
+                lines.push(format!("mcp://{} — {} ({name}, {mime})", resource.uri, resource.name));
+            }
+        }
+        if lines.is_empty() { "no MCP resources".to_string() } else { lines.join("\n") }
+    }
+
+    /// One resource's text, or why no server serves it: each server's error is kept, so a missing
+    /// resource and a broken server do not read the same.
+    pub(crate) fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let slots = self.client_slots();
+        let mut errors: Vec<String> = Vec::new();
+        for (name, slot) in slots {
+            let outcome = {
+                let mut guard = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                match guard.as_mut() {
+                    Some(client) => client
+                        .read_resource(uri)
+                        .map_err(|e| match e {
+                            CallError::Unauthorized => format!("{name}: needs a login (/login {name})"),
+                            CallError::Failed(why) => format!("{name}: {why}"),
+                        })
+                        .map(Some),
+                    None => Ok(None),
+                }
+            };
+            match outcome {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {}
+                Err(why) => errors.push(why),
+            }
+        }
+        if errors.is_empty() {
+            Err(format!("no MCP server serves {uri}: none is connected"))
+        } else {
+            Err(format!("no MCP server serves {uri}: {}", errors.join("; ")))
+        }
+    }
+
+    /// Each server's name and client slot, so a reader locks one connection at a time.
+    fn client_slots(&self) -> Vec<(String, Arc<Mutex<Option<Client>>>)> {
+        let state = self.guard();
+        state.servers.iter().map(|server| (server.name.clone(), Arc::clone(&server.client))).collect()
+    }
+
     /// One entry per server that has tools, for the line the prompt shows instead of the schemas.
     pub(crate) fn tool_counts(&self) -> Vec<(String, usize)> {
         self.guard()
@@ -547,6 +602,15 @@ fn sanitise(part: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_without_servers_offers_no_resource_and_names_the_uri_it_could_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = Registry::load(home.path());
+        assert_eq!(registry.resource_listing(), "no MCP resources");
+        let refused = registry.read_resource("x").unwrap_err();
+        assert_eq!(refused, "no MCP server serves x: none is connected");
+    }
 
     #[test]
     fn a_runtime_name_is_the_server_and_tool_sanitised() {

@@ -34,13 +34,19 @@ impl Turn<'_> {
                 history.truncate(base);
                 bail!(INTERRUPTED);
             }
-            let reply = match self.llm.chat(history, self.tool_defs) {
+            let reply = match self.llm.chat(history, self.tool_defs, self.cancel) {
                 Ok(reply) => reply,
                 Err(e) => {
                     history.truncate(base);
                     return Err(e);
                 }
             };
+            // An order that landed while the call was in flight still owns the outcome: the
+            // answer it raced is not the one that was asked for.
+            if cancelled(self.cancel) {
+                history.truncate(base);
+                bail!(INTERRUPTED);
+            }
             let text = reply.content.clone().unwrap_or_default();
             let asks = reply.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
             // A reply with neither text nor calls is a truncated or filtered answer, not an empty one.
@@ -78,7 +84,7 @@ impl Turn<'_> {
 }
 
 /// Whether an overseer order cut this turn short.
-fn cancelled(flag: Option<&AtomicBool>) -> bool {
+pub(crate) fn cancelled(flag: Option<&AtomicBool>) -> bool {
     flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
@@ -117,7 +123,7 @@ mod tests {
     fn failed_chat_leaves_history_untouched() {
         struct Failing;
         impl Llm for Failing {
-            fn chat(&self, _: &[Message], _: &Value) -> Result<Message> {
+            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
                 bail!("boom")
             }
         }

@@ -1,6 +1,10 @@
+use crate::agent::{INTERRUPTED, cancelled};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Longest response body echoed into an error: a proxy's error page must not land in the transcript.
@@ -66,44 +70,136 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
+/// One piece of a streamed model call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Piece<'a> {
+    /// The answer: shown to the user and kept in the history.
+    Text(&'a str),
+    /// The model's reasoning: shown to the user, never kept.
+    Reasoning(&'a str),
+}
+
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message>;
+    /// `cancel` is the owner's interrupt flag, read between streamed lines.
+    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message>;
 
-    /// The same call, reporting content as it arrives. A backend without streaming reports it once.
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
-        let message = self.chat(messages, tools)?;
-        on_delta(message.content.as_deref().unwrap_or_default());
+    /// The same call, reporting pieces as they arrive. A backend without streaming reports them once.
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
+        let message = self.chat(messages, tools, cancel)?;
+        report(&message, on_piece);
         Ok(message)
+    }
+}
+
+/// Reports a whole message as the piece streaming it would have produced.
+fn report(message: &Message, on_piece: &mut dyn FnMut(Piece<'_>)) {
+    if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
+        on_piece(Piece::Text(content));
     }
 }
 
 /// Where `OVERSEER_DEBUG` output goes: stderr in line mode, the transcript in the TUI.
 pub(crate) type DebugSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Builds the client for one agent: a backend's default, or the model and effort a profile names.
+pub(crate) trait Models: Send + Sync {
+    fn get(&self, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm>;
+}
+
+/// One client per `(model, effort)` pair, shared rather than rebuilt: a pair costs a pool.
+type Clients = Mutex<HashMap<(String, Option<String>), Arc<dyn Llm>>>;
+
+/// The real backend: one cheap client per `(model, effort)` pair, shared by every agent that asks.
+pub(crate) struct Backend {
+    http: reqwest::blocking::Client,
+    base_url: String,
+    api_key: String,
+    default_model: String,
+    debug: Option<DebugSink>,
+    clients: Clients,
+}
+
+impl Backend {
+    pub(crate) fn new(
+        base_url: &str,
+        api_key: String,
+        default_model: String,
+        debug: Option<DebugSink>,
+    ) -> Result<Self> {
+        // reqwest's 30 s default is shorter than a long model answer.
+        let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            default_model,
+            debug,
+            clients: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl Models for Backend {
+    fn get(&self, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm> {
+        let model = model.unwrap_or(&self.default_model).to_string();
+        let key = (model.clone(), effort.map(str::to_string));
+        let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(clients.entry(key).or_insert_with(move || {
+            Arc::new(OpenAiClient::new(
+                self.http.clone(),
+                &self.base_url,
+                self.api_key.clone(),
+                model,
+                effort.map(str::to_string),
+                self.debug.clone(),
+            ))
+        }))
+    }
+}
+
 pub(crate) struct OpenAiClient {
     http: reqwest::blocking::Client,
     base_url: String,
     api_key: String,
     model: String,
+    /// Sent as `reasoning_effort`; `None` leaves the provider's own default.
+    effort: Option<String>,
     debug: Option<DebugSink>,
 }
 
 impl OpenAiClient {
-    pub(crate) fn new(base_url: &str, api_key: String, model: String, debug: Option<DebugSink>) -> Result<Self> {
-        // reqwest's 30 s default is shorter than a long model answer.
-        let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
-        Ok(Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, debug })
+    pub(crate) fn new(
+        http: reqwest::blocking::Client,
+        base_url: &str,
+        api_key: String,
+        model: String,
+        effort: Option<String>,
+        debug: Option<DebugSink>,
+    ) -> Self {
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug }
     }
 }
 
 impl Llm for OpenAiClient {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
+    fn chat(&self, messages: &[Message], tools: &Value, _cancel: Option<&AtomicBool>) -> Result<Message> {
         let body = self.post(messages, tools, false)?;
         parse_response(&body)
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
         let response = self.send(messages, tools, true)?;
         let streamed = response
             .headers()
@@ -114,10 +210,10 @@ impl Llm for OpenAiClient {
             // A provider that ignored `stream` sends one whole response instead.
             let body = response.text().context("reading model response failed")?;
             let message = parse_response(&body)?;
-            on_delta(message.content.as_deref().unwrap_or_default());
+            report(&message, on_piece);
             return Ok(message);
         }
-        read_stream(std::io::BufReader::new(response), on_delta)
+        read_stream(std::io::BufReader::new(response), cancel, on_piece)
     }
 }
 
@@ -132,8 +228,19 @@ impl OpenAiClient {
         Ok(body)
     }
 
+    fn payload(&self, messages: &[Message], tools: &Value, stream: bool) -> Value {
+        let mut payload =
+            json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
+        if let Some(effort) = &self.effort
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        }
+        payload
+    }
+
     fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
+        let payload = self.payload(messages, tools, stream);
         if let Some(sink) = &self.debug {
             sink(&payload.to_string());
         }
@@ -191,6 +298,12 @@ struct StreamChoice {
 #[derive(Deserialize, Default)]
 struct Delta {
     content: Option<String>,
+    /// The reasoning a thinking model streams before its answer. Providers disagree on the name,
+    /// and one of them sends both keys with the same text, so each is read into its own field.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     tool_calls: Option<Vec<Fragment>>,
 }
 
@@ -208,12 +321,19 @@ struct FragmentFunction {
     arguments: Option<String>,
 }
 
-/// Rebuilds the assistant message from `data:` lines, reporting each content delta as it arrives.
-fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+/// Rebuilds the assistant message from `data:` lines, reporting each piece as it arrives.
+fn read_stream(
+    reader: impl std::io::BufRead,
+    cancel: Option<&AtomicBool>,
+    on_piece: &mut dyn FnMut(Piece<'_>),
+) -> Result<Message> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut complete = false;
     for line in reader.lines() {
+        if cancelled(cancel) {
+            bail!(INTERRUPTED);
+        }
         let line = line.context("reading model stream failed")?;
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
@@ -238,11 +358,17 @@ fn read_stream(reader: impl std::io::BufRead, on_delta: &mut dyn FnMut(&str)) ->
             if choice.finish_reason.is_some() {
                 complete = true;
             }
-            if let Some(text) = choice.delta.content {
-                content.push_str(&text);
-                on_delta(&text);
+            let Delta { content: text, reasoning_content, reasoning: alias, tool_calls } = choice.delta;
+            // A provider sends an empty `content` beside each reasoning delta and an empty
+            // `reasoning` beside the answer; an empty piece would open an entry of its own.
+            if let Some(thought) = reasoning_content.or(alias).filter(|text| !text.is_empty()) {
+                on_piece(Piece::Reasoning(&thought));
             }
-            for fragment in choice.delta.tool_calls.unwrap_or_default() {
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                on_piece(Piece::Text(&text));
+                content.push_str(&text);
+            }
+            for fragment in tool_calls.unwrap_or_default() {
                 merge_fragment(&mut calls, fragment)?;
             }
         }
@@ -294,10 +420,11 @@ fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
     Ok(())
 }
 
-/// One step of a stream: a new model call, or text from the current one.
+/// One step of a stream: a new model call, or a piece of the current one.
 pub(crate) enum StreamStep<'a> {
     Start,
     Text(&'a str),
+    Reasoning(&'a str),
 }
 
 /// Forwards the model's streaming output to a sink while `Turn` keeps its blocking interface.
@@ -316,16 +443,25 @@ impl StreamLlm {
 }
 
 impl Llm for StreamLlm {
-    fn chat(&self, messages: &[Message], tools: &Value) -> Result<Message> {
-        self.chat_stream(messages, tools, &mut |_| ())
+    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+        self.chat_stream(messages, tools, cancel, &mut |_| ())
     }
 
-    fn chat_stream(&self, messages: &[Message], tools: &Value, on_delta: &mut dyn FnMut(&str)) -> Result<Message> {
+    fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
-        self.inner.chat_stream(messages, tools, &mut |delta| {
-            (self.sink)(StreamStep::Text(delta));
-            on_delta(delta);
+        self.inner.chat_stream(messages, tools, cancel, &mut |piece| {
+            (self.sink)(match piece {
+                Piece::Text(text) => StreamStep::Text(text),
+                Piece::Reasoning(text) => StreamStep::Reasoning(text),
+            });
+            on_piece(piece);
         })
     }
 }
@@ -366,12 +502,21 @@ pub(crate) mod testing {
     }
 
     impl Llm for Scripted {
-        fn chat(&self, _: &[Message], _: &Value) -> Result<Message> {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
             let mut replies = self.0.lock().unwrap();
             if replies.is_empty() {
                 bail!("script exhausted");
             }
             Ok(replies.remove(0))
+        }
+    }
+
+    /// One scripted client for every model and effort: a test sees no provider.
+    pub(crate) struct Fixed(pub(crate) Arc<dyn Llm>);
+
+    impl Models for Fixed {
+        fn get(&self, _: Option<&str>, _: Option<&str>) -> Arc<dyn Llm> {
+            Arc::clone(&self.0)
         }
     }
 }
@@ -392,7 +537,12 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = String::new();
-        let message = read_stream(std::io::Cursor::new(sse), &mut |delta| seen.push_str(delta)).unwrap();
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+            if let Piece::Text(text) = piece {
+                seen.push_str(text);
+            }
+        })
+        .unwrap();
         assert_eq!(seen, "Looking now.");
         assert_eq!(message.content.as_deref(), Some("Looking now."));
         let calls = message.tool_calls.unwrap();
@@ -410,7 +560,7 @@ mod tests {
             "\"function\":{\"name\":\"file\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let message = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap();
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
         assert_eq!(message.tool_calls.unwrap()[0].function.name, "read_file");
     }
 
@@ -421,7 +571,7 @@ mod tests {
             "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("no function name"), "{err}");
     }
 
@@ -435,35 +585,85 @@ mod tests {
                 let seen = std::sync::Arc::clone(&seen);
                 move |step: StreamStep<'_>| {
                     seen.lock().unwrap().push_str(match step {
-                        StreamStep::Text(text) => text,
+                        StreamStep::Text(text) | StreamStep::Reasoning(text) => text,
                         StreamStep::Start => "|",
                     });
                 }
             }),
         );
         let mut reported = String::new();
-        llm.chat_stream(&[], &json!([]), &mut |delta| reported.push_str(delta)).unwrap();
+        llm.chat_stream(&[], &json!([]), None, &mut |piece| {
+            if let Piece::Text(text) = piece {
+                reported.push_str(text);
+            }
+        })
+        .unwrap();
         assert_eq!(reported, "hi");
         assert_eq!(*seen.lock().unwrap(), "|hi");
     }
 
     #[test]
+    fn reasoning_streams_before_the_answer_and_never_goes_back() {
+        // Chunk shapes copied from the provider this project runs against: it sends both reasoning
+        // keys with the same text, and an empty `content` beside them.
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\"weigh it\",",
+            "\"reasoning_content\":\"weigh it\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\" twice\",",
+            "\"reasoning_content\":\" twice\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\",\"role\":\"assistant\",\"reasoning\":null}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut seen = Vec::new();
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+            seen.push(match piece {
+                Piece::Text(text) => format!("text {text}"),
+                Piece::Reasoning(text) => format!("think {text}"),
+            });
+        })
+        .unwrap();
+        assert_eq!(seen, ["think weigh it", "think  twice", "text done"]);
+        assert_eq!(message.content.as_deref(), Some("done"), "the answer holds only the answer");
+        assert_eq!(message.tool_calls, None);
+    }
+
+    #[test]
     fn stream_without_text_or_tools_is_an_error() {
         let sse = "data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
-        assert!(read_stream(std::io::Cursor::new(sse), &mut |_| ()).is_err());
+        assert!(read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).is_err());
     }
     #[test]
     fn stream_reports_a_provider_error_chunk() {
         let sse = "data: {\"error\":{\"message\":\"overloaded\"}}\n\n";
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("overloaded"), "{err}");
     }
 
     #[test]
     fn stream_truncated_before_finish_is_an_error() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n";
-        let err = read_stream(std::io::Cursor::new(sse), &mut |_| ()).unwrap_err();
+        let err = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap_err();
         assert!(err.to_string().contains("before it finished"), "{err}");
+    }
+
+    #[test]
+    fn a_cancelled_stream_stops_at_the_next_line() {
+        let cancel = AtomicBool::new(false);
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut seen = String::new();
+        let err = read_stream(std::io::Cursor::new(sse), Some(&cancel), &mut |piece| {
+            if let Piece::Text(text) = piece {
+                seen.push_str(text);
+            }
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), INTERRUPTED);
+        assert_eq!(seen, "one", "the rest of the answer is never read");
     }
 
     #[test]
@@ -476,14 +676,14 @@ mod tests {
                 let seen = std::sync::Arc::clone(&seen);
                 move |step: StreamStep<'_>| {
                     let text = match step {
-                        StreamStep::Text(text) => text,
+                        StreamStep::Text(text) | StreamStep::Reasoning(text) => text,
                         StreamStep::Start => "|",
                     };
                     seen.lock().unwrap().push_str(text);
                 }
             }),
         );
-        llm.chat(&[], &json!([])).unwrap();
+        llm.chat(&[], &json!([]), None).unwrap();
         assert_eq!(*seen.lock().unwrap(), "|hi");
     }
 
@@ -514,5 +714,26 @@ mod tests {
         // Some providers reject `"tool_calls": null` on non-assistant messages.
         let v = serde_json::to_value(Message::tool("c1", "out".into())).unwrap();
         assert_eq!(v, json!({"role":"tool","content":"out","tool_call_id":"c1"}));
+    }
+
+    #[test]
+    fn a_request_carries_the_effort_only_when_one_is_set() {
+        let http = reqwest::blocking::Client::new();
+        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None);
+        let body = plain.payload(&[], &json!([]), false);
+        assert!(body.get("reasoning_effort").is_none());
+        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None);
+        let body = effortful.payload(&[], &json!([]), false);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["model"], "m");
+    }
+
+    #[test]
+    fn the_backend_reuses_one_client_per_pair() {
+        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None).unwrap();
+        let first = backend.get(None, None);
+        assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
+        assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
+        assert!(!Arc::ptr_eq(&first, &backend.get(None, Some("high"))));
     }
 }
