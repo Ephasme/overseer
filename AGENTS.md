@@ -2,6 +2,7 @@
 
 ## Critical constraints
 
+- In a git repository, an agent never works in the primary checkout: every change goes through a git worktree created from the base branch, and the primary checkout holds no work in progress — no modified files, no stashes, no in-flight rebases.
 - Every agent is the same implementation with the same tools: `swarm::AgentRun` runs one turn for the root and for the deepest child alike, and `prompt::agent_tool_definitions` is the only tool set. An agent may `spawn_agent`, `message_agent`, `control_agent` and `list_agents` only for agents strictly below it in the tree (`Swarm::owns`); the root is agent 1, the one the user talks to.
 - An agent's `Policy` is merged once, before its thread starts, and never changes: there is no tool that restricts a running agent, and `control_agent` has no `restart`. Changing rights means stopping an agent (which stops its whole subtree) and spawning a new one.
 - `max_depth` in `config.toml` counts delegations below the root and defaults to 3; a spawn past it is refused, never clamped.
