@@ -13,27 +13,30 @@ pub(crate) const CONTROL_AGENT: &str = "control_agent";
 pub(crate) const LIST_AGENTS: &str = "list_agents";
 pub(crate) const LIST_REPOS: &str = "list_repos";
 
-/// Name of the progress-note tool an agent writes to its owner with.
-pub(crate) const REPLY: &str = "reply";
+/// The progress-note and closing tools live with the file tools: a policy refuses calls, and the
+/// policy must not depend on this module.
+pub(crate) use crate::tools::{CLOSE, REPLY};
 
-/// Every tool an owner may ban by name: the file tools, `reply`, and the tree tools.
-const DENIABLE_TOOLS: &[&str] = &[
+/// Tools a profile may grant by name; `mcp__<server>` is accepted by `Profile::tools` separately.
+/// `REPLY` and `CLOSE` are always granted, so listing them is allowed but unnecessary.
+pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     tools::BASH,
     tools::READ_FILE,
     tools::WRITE_FILE,
-    REPLY,
     SPAWN_AGENT,
     MESSAGE_AGENT,
     CONTROL_AGENT,
     LIST_AGENTS,
     LIST_REPOS,
+    tools::REPLY,
+    tools::CLOSE,
 ];
 
 /// Longest repository list `list_repos` shows.
 pub(crate) const MAX_REPOS: usize = 300;
 
-/// The tools an agent is offered: the file tools, `reply` and the tree tools, less what its policy
-/// bans and what `remaining_depth` rules out, plus the servers' unless it is read-only.
+/// The tools an agent is offered: what its policy grants, less what `remaining_depth` rules out,
+/// plus the servers' when it may call them.
 ///
 /// The array must match what `Policy::refuse` and the dispatcher will run: a tool shown but
 /// impossible to call teaches the model to waste turns on it.
@@ -50,14 +53,14 @@ pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy
     functions.extend(swarm_tool_definitions());
     // A read-only agent is offered none of the MCP tools: their side effects are the server's,
     // not something the policy can predict.
-    if !policy.read_only {
+    if !policy.read_only && policy.allow_tools.iter().any(|entry| entry.starts_with(mcp::PREFIX)) {
         functions.extend(mcp.tool_defs());
     }
     functions.retain(|tool| {
         let Some(name) = function_name(tool) else { return true };
-        let banned = policy.deny_tools.iter().any(|tool| tool == name);
+        let always = tools::ALWAYS_GRANTED.contains(&name);
         let too_deep = name == SPAWN_AGENT && remaining_depth == 0;
-        !banned && !too_deep
+        (always || tools::grants(&policy.allow_tools, name)) && !too_deep
     });
     defs
 }
@@ -67,21 +70,21 @@ fn function_name(tool: &Value) -> Option<&str> {
     tool.get("function")?.get("name")?.as_str()
 }
 
-/// The tools an agent commands the tree with, below the file tools.
+/// The tools an agent commands the tree with, and the two that end its own turn.
 fn swarm_tool_definitions() -> Vec<Value> {
-    let spawn = with_policy(json!({
+    let spawn = json!({
         "type": "object",
         "properties": {
-            "profile": {"type": "string", "description": "Flavor for the new agent, from the profiles your prompt lists. It fixes that profile's model and reasoning effort and adds its restrictions to yours; it can never take one back."},
+            "profile": {"type": "string", "description": "The profile the new agent runs, from the catalogue your prompt lists. It fixes its model, its effort and its rights."},
             "path": {"type": "string", "description": "Directory the agent works in; relative paths resolve there. Defaults to your own directory."},
             "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
         },
-        "required": ["task"]
-    }));
+        "required": ["task", "profile"]
+    });
     vec![
         json!({"type": "function", "function": {
             "name": SPAWN_AGENT,
-            "description": "Start a new agent below you, in a directory, under the rights you give it. A profile gives it a flavor and, when the profile names one, a different model. Returns the agent id at once; its final answer arrives later as an [agent N · <name> finished] message. Its rights are fixed for its lifetime: deny `spawn_agent` in `deny_tools` and it can never start sub-agents. To change a running agent's rights, stop it (which stops everything below it) and spawn a new one.",
+            "description": "Start a new agent below you, in a directory, with a profile from the catalogue. The profile fixes its model, its effort and its rights; the call cannot add or remove one. Returns the agent id at once; its final answer arrives later as an [agent N · <name> finished] message. To change a running agent's rights, stop it (which stops everything below it) and spawn a new one.",
             "parameters": spawn
         }}),
         json!({"type": "function", "function": {
@@ -95,10 +98,10 @@ fn swarm_tool_definitions() -> Vec<Value> {
         }}),
         json!({"type": "function", "function": {
             "name": CONTROL_AGENT,
-            "description": "Administer an agent you own. pause: it finishes the current instruction, then holds every queued one. resume: it takes work again. stop: its running turn is killed, it takes no more work, and everything below it is stopped too.",
+            "description": "Administer an agent you own. pause: it finishes the current instruction, then holds every queued one. resume: it takes work again. stop: its running turn is killed, it takes no more work, and everything below it is stopped too. archive: a settled agent leaves the user's view; its entry and log stay.",
             "parameters": {"type": "object", "properties": {
                 "id": {"type": "integer"},
-                "action": {"type": "string", "enum": ["pause", "resume", "stop"]}
+                "action": {"type": "string", "enum": ["pause", "resume", "stop", "archive"]}
             }, "required": ["id", "action"]}
         }}),
         json!({"type": "function", "function": {
@@ -111,28 +114,12 @@ fn swarm_tool_definitions() -> Vec<Value> {
             "description": "List the git repositories that already exist under the configured roots, so an agent can start in one. Never ask the user for a path.",
             "parameters": {"type": "object", "properties": {}}
         }}),
+        json!({"type": "function", "function": {
+            "name": CLOSE,
+            "description": "End your turn with your final report and close yourself. Your owner re-opens you by sending another instruction; only your owner can archive you.",
+            "parameters": {"type": "object", "properties": {"report": {"type": "string", "description": "The complete report for your owner."}}, "required": ["report"]}
+        }}),
     ]
-}
-
-/// The restrictions `spawn_agent` may set, as the schema states them.
-fn policy_properties() -> Value {
-    json!({
-        "read_only": {"type": "boolean", "description": format!("Refuse write_file, and refuse any bash command that is not a read-only program ({}) or a read-only git subcommand ({}); a writing flag or argument is refused too.", tools::READ_ONLY_PROGRAMS.join(" "), tools::READ_ONLY_GIT.join(" "))},
-        "deny_tools": {"type": "array", "items": {"type": "string"}, "description": format!("Tools this agent may never call: {}. Denying {SPAWN_AGENT} stops it from ever starting sub-agents.", DENIABLE_TOOLS.join(", "))},
-        "allow_commands": {"type": "array", "items": {"type": "string"}, "description": "When non-empty, a bash command's program word (a path and an `env`/`sudo` wrapper stripped, `VAR=x` skipped) must match one of these. A command carrying shell syntax (`;`, `|`, `&`, `>`) is refused, so this guards one program per call, not a shell."},
-        "deny_commands": {"type": "array", "items": {"type": "string"}, "description": "A bash command whose program word matches one of these never runs, whatever its path or wrapper (`/bin/rm`, `env rm`). Deny beats allow."}
-    })
-}
-
-/// A tool's parameters with the policy fields added.
-fn with_policy(mut parameters: Value) -> Value {
-    let Some(properties) = parameters.get_mut("properties").and_then(Value::as_object_mut) else {
-        return parameters;
-    };
-    if let Some(policy) = policy_properties().as_object() {
-        properties.extend(policy.clone());
-    }
-    parameters
 }
 
 /// What one agent is told about itself and its place in the tree.
@@ -152,12 +139,36 @@ pub(crate) struct AgentFacts<'a> {
     pub(crate) profile: Option<&'a profiles::Profile>,
     /// Every profile a spawner may pick from.
     pub(crate) profiles: &'a profiles::Catalogue,
+    /// Whether it runs the tree or does the work.
+    pub(crate) role: profiles::Role,
     /// The agent the user talks to.
     pub(crate) root: bool,
 }
 
+/// What a supervisor is for. It never changes anything itself: every change belongs to an agent it
+/// starts, and its own instruments are the tree tools, `read_file` and read-only commands.
+const SUPERVISOR_PROMPT: &str = "You are the supervisor. You never change anything: you do not write files, you do not run a command that changes anything, and you do not merge. Everything that changes the repository belongs to an agent you start. Your instruments are spawn_agent, message_agent, control_agent, list_agents, list_repos, read_file and read-only commands. Answering a question from what you can read is your job too: do not spawn an agent to tell you what a file says.\n\
+A request that needs work is not answered, it is run. One task gets one orchestrator: spawn an `orchestrator` with the request rewritten as a complete brief — goal, directory, base branch, constraints, what \"done\" means, which profiles it may use, and the evidence you will demand. The orchestrator owns the execution; you own the outcome.\n\
+The loop:\n\
+1. Brief before spawn. Never send a brief you would not accept as an outsider: no context the agent cannot read, no branch it must guess, no acceptance you cannot check.\n\
+2. Plan before code. No worker starts before a written plan exists at a path you can read. Read it yourself and attack it: vague slices, claims about the code nobody verified, a slice with no test, a \"done\" with no command.\n\
+3. Second opinion. For every contested, irreversible or expensive decision, spawn two `researcher` agents at the same time, the same question asked from two angles (the code as it is; the ecosystem, the docs, the prior art). Compare; where they disagree, get a third or make the orchestrator settle it with evidence. Decide, and tell the orchestrator why.\n\
+4. Push. list_agents before every message: idle with nothing queued means stopped or closed, not finished. Short specific objections, not restatements. `urgent` only to cut a turn that is heading wrong — it kills the running command.\n\
+5. Challenge every \"done\". Which commands ran, what did they print, which files changed, what is still untested. A claim without a command and its output is not evidence.\n\
+6. Review every build. A slice is reviewed by a `build-reviewer` that did not write it, and a report that names neither the commands nor their result is sent back.\n\
+7. Integrate through an agent. The integrator merges in dependency order, rebases between merges, and leaves the base green. You verify with read-only commands and read the diff; you never merge, rebase or commit.\n\
+8. Archive. When an agent has closed or stopped and you have read its report, archive it with control_agent `archive`. Its entry and log stay; only the user's default view forgets it.\n\
+9. Answer the user. What is now true, the evidence that proves it, what remains open, and each decision you took on their behalf. Your agents' reports are not the answer; your judgement is.\n\
+A wrong report is a briefing failure first: say what you now know and re-task. Stop what is redundant; pause what you are about to correct. A closed agent you need again is re-opened by sending it an instruction. If you need a decision from the user, end your turn with that one question.\n";
+
+/// What a worker is for: the task in its instruction, and a report its owner can act on.
+const WORKER_PROMPT: &str = "You do the job your instruction names, and you answer for it. A report is what your owner reads: say what you changed, the commands you ran and what they printed, what you checked, and what remains untested. If your profile grants spawn_agent and the task splits into parts one agent can own alone, delegate those parts with complete instructions; otherwise do the work. Call `close` with your report as your last tool call when the task is finished: your owner can re-open you, and only your owner can archive you.\n";
+
 pub(crate) fn agent_prompt(facts: &AgentFacts<'_>) -> String {
     let remaining = facts.max_depth.saturating_sub(facts.depth);
+    // What the agent may actually call: a supervisor's role narrows its profile before anything is
+    // offered, so it never reads about a tool it cannot use.
+    let policy = facts.role.restrict(facts.policy);
     let mut out = format!(
         "You are agent {} of a tree of identical agents, working in {}; relative paths resolve there.\n\
 Depth: you are at depth {} and agents may be nested to depth {} (config `max_depth`), so you can start {} more level(s) of agents with `spawn_agent`.\n",
@@ -183,15 +194,19 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
         let listed: Vec<String> = facts.children.iter().map(|id| format!("agent {id}")).collect();
         let _ = writeln!(out, "Agents you own right now: {}.", listed.join(", "));
     }
-    out.push_str(facts.policy.describe().as_str());
+    out.push_str(match facts.role {
+        profiles::Role::Supervisor => SUPERVISOR_PROMPT,
+        profiles::Role::Worker => WORKER_PROMPT,
+    });
     if let Some(profile) = facts.profile {
         let _ = writeln!(out, "Profile {}: {}", profile.name, profile.body);
     }
-    let may_spawn = remaining > 0 && !facts.policy.deny_tools.iter().any(|tool| tool == SPAWN_AGENT);
+    out.push_str(facts.role.describe(&policy).as_str());
+    let may_spawn = remaining > 0 && tools::grants(&policy.allow_tools, SPAWN_AGENT);
     if may_spawn {
         let _ = write!(
             out,
-            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. Their restrictions add to yours.\n<profiles>\n{}\n</profiles>\n",
+            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. A worker's child keeps only the tools its owner also has; a supervisor's child gets its profile's rights alone.\n<profiles>\n{}\n</profiles>\n",
             facts.profiles.catalogue()
         );
     }
@@ -204,7 +219,7 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
     }
     // A read-only agent is offered no MCP tool, so notes about them would describe calls it cannot
     // make. The servers' prose is fenced: it is theirs, not an instruction of yours.
-    if !facts.policy.read_only {
+    if !policy.read_only {
         for (server, notes) in facts.mcp.instructions() {
             let _ = write!(out, "MCP server notes ({server}):\n<mcp server=\"{server}\">\n{notes}\n</mcp>\n");
         }
@@ -213,16 +228,14 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
         "Ownership is one way: you may message, pause, resume or stop any agent below you, and nobody below you may do any of that to you. You cannot command your parent, your siblings, or any agent outside your own subtree.\n\
 Your rights are fixed: nothing can widen or narrow them while you run, and the same holds for the agents you own.\n\
 Messages that start with [agent N · <name> ...] come from an agent you own, and a renamed agent shows its new name there: \"says\" is a progress note or a question, \"finished\" carries its final report, \"failed\" an error, \"interrupted\" a turn you cut short. Answer a question yourself when you can.\n\
-Do the work yourself when it is yours to do; delegate when a task splits into independent parts, one agent per part, each with complete instructions because it sees nothing of your context except what you write. Parallel work in one repository means one worktree per agent on its own branch: `git worktree add ../<repo>-<slug> -b <type>/<slug> <base-branch>`. Two agents editing the same checkout is a dispatch bug, not a merge problem to fix later. Base every worktree on the branch whose build is actually deployed or installed, not on whatever HEAD happens to be, and state that base branch in each agent's instructions.\n\
-Orchestration is not done when agents report: integrate their branches into the main repository one at a time, in dependency order, with a PR where the repository has a remote and a review flow and with a rebase (or rebase-then-fast-forward) where it is local only, so history stays linear and never merge-commit soup. Agents never merge or rebase each other's branches: an agent pushes its branch and opens a PR against the agreed base branch when it finishes, or leaves a local branch and says so when the repository has no remote. The orchestrator owns integration: merge in dependency order, ask the next agent to rebase onto the updated base between merges when the branches touch the same code, and verify build and tests green on the integrated result before announcing completion. If branches conflict, rebase the offending branch onto the updated base and re-run build and tests instead of hand-resolving in the shared checkout. Remove integrated worktrees with `git worktree remove` and report the final branch state to the user. Verify the reconciliation yourself before declaring the job done: build and tests green on the integrated result, and the deployed artifact rebuilt from the integrated branch if the user runs an installed binary.\n\
 Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
 If you need a decision to continue, end your turn with the question as your final answer.\n",
     );
-    let defs = agent_tool_definitions(facts.mcp, facts.policy, remaining);
+    let defs = agent_tool_definitions(facts.mcp, &policy, remaining);
     out.push_str(&tool_section(&defs));
     // The schemas of MCP tools are in the `tools` array already; the prompt only says where they are.
     let counts = facts.mcp.tool_counts();
-    if !facts.policy.read_only && !counts.is_empty() {
+    if !policy.read_only && !counts.is_empty() {
         let lines: Vec<String> = counts
             .iter()
             .map(|(server, count)| {
@@ -267,11 +280,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("reviewer.md"),
-            "---\ndescription: Reviews a diff.\nkeywords: [review, audit]\nread_only: true\n---\nYou review. Never edit.\n",
+            "---\ndescription: Reviews a diff.\nkeywords: [review, audit]\nread_only: true\nallow_tools: [read_file]\n---\nYou review. Never edit.\n",
         )
         .unwrap();
         let profiles = profiles::Catalogue::load(home.path());
-        let policy = tools::Policy::default();
+        let policy =
+            tools::Policy::default().set(None, Some(vec![tools::READ_FILE.into(), SPAWN_AGENT.into()]), None, None);
         let skills = skills::Catalogue::in_dir(home.path(), home.path());
         let mcp = mcp::Registry::load(home.path());
         let reviewer = profiles.get("reviewer").unwrap();
@@ -288,25 +302,30 @@ mod tests {
             root: false,
             profile: Some(reviewer),
             profiles: &profiles,
+            role: profiles::Role::Worker,
         };
         let prompt = agent_prompt(&facts);
         assert!(prompt.contains("You are agent 2 of a tree of identical agents"), "the base prompt stays");
         assert!(prompt.contains("Profile reviewer: You review. Never edit."), "{prompt}");
-        assert!(prompt.contains("- reviewer: Reviews a diff. (keywords: review, audit) [read-only]"), "{prompt}");
+        assert!(
+            prompt.contains("- reviewer: Reviews a diff. (keywords: review, audit) [tools: read_file; read-only]"),
+            "{prompt}"
+        );
         assert!(prompt.contains("profile://<name>"), "the detail path is named: {prompt}");
+        assert!(prompt.contains("- tools you may call: read_file spawn_agent."), "the grant is stated: {prompt}");
     }
 
     #[test]
     fn an_agent_that_cannot_spawn_reads_no_catalogue() {
         let home = tempfile::tempdir().unwrap();
         let profiles = profiles::Catalogue::default();
-        let policy = tools::Policy::default().set(None, Some(vec![SPAWN_AGENT.into()]), None, None);
+        let policy = tools::Policy::default().set(None, Some(vec![tools::READ_FILE.into()]), None, None);
         let skills = skills::Catalogue::in_dir(home.path(), home.path());
         let mcp = mcp::Registry::load(home.path());
         let facts = AgentFacts {
             id: 2,
             parent: Some(1),
-            depth: 3,
+            depth: 1,
             max_depth: 3,
             dir: home.path(),
             policy: &policy,
@@ -316,9 +335,52 @@ mod tests {
             root: false,
             profile: None,
             profiles: &profiles,
+            role: profiles::Role::Worker,
         };
         let prompt = agent_prompt(&facts);
         assert!(!prompt.contains("Profiles for your sub-agents"), "{prompt}");
         assert!(!prompt.contains("<profiles>"), "{prompt}");
+    }
+
+    #[test]
+    fn an_empty_allow_list_offers_only_reply_and_close() {
+        let mcp = mcp::Registry::load(Path::new("/nonexistent"));
+        let policy = tools::Policy::default();
+        let names: Vec<String> = agent_tool_definitions(&mcp, &policy, 3)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("function")?.get("name")?.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names, [REPLY, CLOSE]);
+    }
+
+    #[test]
+    fn the_supervisor_prompt_forbids_changing_anything() {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = profiles::Catalogue::default();
+        let policy = profiles.get(profiles::SUPERVISOR).unwrap().policy.clone();
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let facts = AgentFacts {
+            id: 1,
+            parent: None,
+            depth: 0,
+            max_depth: 3,
+            dir: home.path(),
+            policy: &policy,
+            children: Vec::new(),
+            skills: &skills,
+            mcp: &mcp,
+            root: true,
+            profile: profiles.get(profiles::SUPERVISOR),
+            profiles: &profiles,
+            role: profiles::Role::Supervisor,
+        };
+        let prompt = agent_prompt(&facts);
+        assert!(prompt.contains("You are the supervisor"), "{prompt}");
+        assert!(prompt.contains("You never change anything"), "{prompt}");
+        assert!(!prompt.contains("Do the work yourself"), "{prompt}");
+        assert!(!prompt.contains("- write_file:"), "the tool is not offered: {prompt}");
     }
 }

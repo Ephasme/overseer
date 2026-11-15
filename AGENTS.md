@@ -43,7 +43,7 @@
 | `src/skills.rs` | the skill catalogue discovered from the user's and the project's roots, read through `skill://` |
 | `src/slash.rs` | the slash-command table the composer's completion popup reads |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
-| `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in orchestrator, and the text `profile://` reads |
+| `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in profiles, the `Role` that narrows one, and the text `profile://` reads |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
@@ -61,8 +61,11 @@
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
 - `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
-- The root agent always runs the built-in `orchestrator` profile; a `~/.overseer/agent/profiles/orchestrator.md` replaces its text, model and effort, never its role.
-- A profile can only tighten: its rights merge through `Policy::inherit`, so `spawn_agent` arguments can add restrictions but never take one back.
+- The root always runs the built-in `supervisor` profile and `Role::Supervisor`; a `~/.overseer/agent/profiles/supervisor.md` replaces its text, model, effort and tool list, never its role or its read-only restriction.
+- A profile's `allow_tools` is the whole right: tools are granted one by one, `mcp__<server>` grants one server's tools, and an empty list leaves an agent able to think and answer only. No tool changes a policy after the agent starts.
+- A worker's child gets the intersection of the two tool lists; a supervisor is exempt, so it can start agents with more rights than itself.
+- `spawn_agent` requires a profile, so every agent's rights have one place to be read; `worker` is the generalist (code, configuration, commands).
+- `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.

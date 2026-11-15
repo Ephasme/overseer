@@ -4,7 +4,7 @@ use crate::event::UiEvent;
 use crate::names;
 use crate::prompt;
 use crate::slash::{self, RESUME};
-use crate::swarm::{AgentEvent, AgentView, Event, Progress, Swarm};
+use crate::swarm::{AgentEvent, AgentView, Event, Progress, State, Swarm};
 use crate::tools;
 use crate::version;
 use ratatui::Frame;
@@ -1311,11 +1311,11 @@ impl App {
 
     /// A worker that stopped mid-call leaves a call that will never return; it closes as failed.
     fn close_dead_calls(&mut self) {
-        while let Some(slot) = self
-            .calls
-            .iter()
-            .position(|(worker, _, _)| self.workers.iter().any(|view| view.id == *worker && view.finished))
-        {
+        while let Some(slot) = self.calls.iter().position(|(worker, _, _)| {
+            self.workers
+                .iter()
+                .any(|view| view.id == *worker && matches!(view.state, State::Done | State::Failed | State::Stopped))
+        }) {
             let (worker, _, index) = self.calls.swap_remove(slot);
             let stream = self.worker_stream_mut(worker);
             if let Some(entry) = stream.entries.get_mut(index) {
@@ -1715,7 +1715,7 @@ impl App {
                         Style::new().fg(if self.selected == Some(worker.id) { theme::text() } else { theme::info() }),
                     ),
                     Span::styled(
-                        worker.profile.as_deref().map_or(String::new(), |name| format!(" {name}")),
+                        if worker.profile.is_empty() { String::new() } else { format!(" {}", worker.profile) },
                         Style::new().fg(theme::faint()),
                     ),
                     Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
@@ -1788,8 +1788,8 @@ impl App {
         } else {
             spans.push(Span::styled("● idle", Style::new().fg(theme::muted())));
         }
-        let working = self.workers.iter().filter(|w| w.pending > 0 && !w.finished).count();
-        let paused = self.workers.iter().filter(|w| w.paused).count();
+        let working = self.workers.iter().filter(|w| w.state == State::Working).count();
+        let paused = self.workers.iter().filter(|w| w.state == State::Paused).count();
         let idle = self.workers.len().saturating_sub(working + paused);
         let paused = if paused == 0 { String::new() } else { format!("{paused} paused · ") };
         spans
@@ -1880,7 +1880,7 @@ impl App {
     pub(super) fn stop_target(&self) -> Option<usize> {
         let id = self.viewed().filter(|id| *id != Swarm::ROOT)?;
         let worker = self.workers.iter().find(|worker| worker.id == id)?;
-        (worker.pending > 0 && !worker.finished && !worker.stopped).then_some(id)
+        matches!(worker.state, State::Working | State::Paused).then_some(id)
     }
 
     /// Acknowledges the stop key before the core reports it: a model call already in flight cannot
@@ -2004,8 +2004,8 @@ impl App {
             Span::styled("› ", Style::new().fg(theme::faint())),
             Span::styled(worker.label.clone(), Style::new().fg(theme::info())),
         ];
-        if let Some(name) = &worker.profile {
-            crumb.push(Span::styled(format!(" · {name}"), Style::new().fg(theme::faint())));
+        if !worker.profile.is_empty() {
+            crumb.push(Span::styled(format!(" · {}", worker.profile), Style::new().fg(theme::faint())));
         }
         let crumb = Line::from(crumb);
         let mut line = vec![
@@ -2406,22 +2406,27 @@ impl App {
 }
 
 fn worker_state(worker: &AgentView) -> (&'static str, Color, String) {
-    if worker.stopped {
-        return ("■", theme::faint(), "stopped".into());
+    // The rights ride on the state word: a supervisor never writes and a read-only worker never
+    // does either, so the panel spends one line on both.
+    let rights = if worker.supervisor {
+        " · supervisor"
+    } else if worker.read_only {
+        " · read-only"
+    } else {
+        ""
+    };
+    match worker.state {
+        State::Stopped => ("■", theme::faint(), "stopped".into()),
+        State::Archived => ("·", theme::faint(), "archived".into()),
+        State::Closed => ("◼", theme::muted(), format!("closed{rights}")),
+        State::Paused => ("❚❚", theme::info(), format!("paused{rights}")),
+        State::Working => {
+            let secs = worker.busy_for.unwrap_or_default().as_secs();
+            ("●", theme::warning(), format!("working {secs}s{rights}"))
+        }
+        State::Failed => ("✕", theme::error(), "failed".into()),
+        State::Idle | State::Done => ("○", theme::faint(), format!("idle{rights}")),
     }
-    if worker.paused {
-        return ("❚❚", theme::info(), "paused".into());
-    }
-    if worker.pending > 0 && !worker.finished {
-        let secs = worker.busy_for.unwrap_or_default().as_secs();
-        let read_only = if worker.read_only { " · read-only" } else { "" };
-        return ("●", theme::warning(), format!("working {secs}s{read_only}"));
-    }
-    if worker.failed || worker.pending > 0 {
-        return ("✕", theme::error(), "failed".into());
-    }
-    let read_only = if worker.read_only { " · read-only" } else { "" };
-    ("○", theme::faint(), format!("idle{read_only}"))
 }
 
 /// The last component of the worker's directory, so a narrow panel stays readable.
@@ -2801,8 +2806,7 @@ mod tests {
         let started = Progress::Started { call: 0, tool: tools::BASH.into(), summary: "sleep 900".into() };
         app.apply(UiEvent::Progress { id: 2, progress: started });
         let mut dead = agent_view(2, "wait");
-        dead.pending = 1;
-        dead.finished = true;
+        dead.state = State::Failed;
         dead.busy_for = Some(Duration::from_secs(9));
         app.apply(UiEvent::Agents(vec![dead]));
         assert!(app.calls.is_empty(), "a call that can never return is unpaired");
@@ -2897,7 +2901,7 @@ mod tests {
         delta(&mut app, "spawned ");
         delta(&mut app, "two agents");
         let mut child = agent_view(2, "run the tests");
-        child.finished = true;
+        child.state = State::Done;
         child.dir = PathBuf::from("/tmp/overseer");
         app.apply(UiEvent::Agents(vec![child]));
         app.apply(UiEvent::Agent { id: 2, kind: AgentEvent::Finished, text: "tests pass".into() });
@@ -3060,8 +3064,7 @@ mod tests {
     fn a_dead_agent_shows_as_failed() {
         let mut app = App::new("m");
         let mut dead = agent_view(2, "long job");
-        dead.pending = 1;
-        dead.finished = true;
+        dead.state = State::Failed;
         dead.busy_for = Some(Duration::from_secs(3));
         app.apply(UiEvent::Agents(vec![dead]));
         let screen = screen(&mut app, 100, 24);
@@ -3135,12 +3138,9 @@ mod tests {
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: task.into(),
-            profile: None,
-            pending: 0,
-            failed: false,
-            finished: false,
-            stopped: false,
-            paused: false,
+            profile: String::new(),
+            supervisor: false,
+            state: State::Idle,
             read_only: false,
             busy_for: None,
         }
@@ -3209,7 +3209,7 @@ mod tests {
     fn the_worker_panel_names_the_profile() {
         let mut app = App::new("m");
         let mut reviewer = agent_view(2, "review");
-        reviewer.profile = Some("reviewer".into());
+        reviewer.profile = "reviewer".into();
         app.apply(UiEvent::Agents(vec![root_view(), reviewer]));
         let screen = screen(&mut app, 120, 30);
         assert!(screen.contains("(2) reviewer"), "the panel shows the flavor: {screen}");
@@ -3644,7 +3644,7 @@ mod tests {
     fn resume_completes_the_agent_ids_the_panel_shows() {
         let mut app = App::new("m");
         let mut stopped = agent_view(4, "gone quiet");
-        stopped.stopped = true;
+        stopped.state = State::Stopped;
         stopped.dir = PathBuf::from("/tmp/other");
         app.apply(UiEvent::Agents(vec![root_view(), agent_view(3, "fix the nav"), stopped]));
         app.paste("/resume ");

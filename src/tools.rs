@@ -72,6 +72,13 @@ pub(crate) fn kill_running() {
 pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
+/// The progress-note tool an agent writes to its owner with.
+pub(crate) const REPLY: &str = "reply";
+/// The tool an agent ends its turn and reports with.
+pub(crate) const CLOSE: &str = "close";
+/// Tools every agent keeps whatever its profile grants: they reach only the owner's inbox and the
+/// agent's own lifecycle, so an empty allow list can still report and end.
+pub(crate) const ALWAYS_GRANTED: &[&str] = &[REPLY, CLOSE];
 /// Programs a read-only worker may still run.
 pub(crate) const READ_ONLY_PROGRAMS: &[&str] =
     &["ls", "cat", "head", "tail", "wc", "stat", "file", "tree", "pwd", "rg", "grep", "diff", "jq", "git"];
@@ -123,10 +130,11 @@ const WRAPPERS: &[&str] = &["env", "command", "exec", "nohup", "nice", "time", "
 /// as they are tight. Workers already run unsandboxed, with the user's own rights.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Policy {
-    /// `write_file` is refused and `bash` runs only `READ_ONLY_PROGRAMS`.
+    /// Tools this agent may call. An exact tool name, or `mcp__<server>` for that server's tools.
+    /// Empty grants nothing. A profile that declares no list at all is refused at spawn.
+    pub(crate) allow_tools: Vec<String>,
+    /// `bash` runs only `READ_ONLY_PROGRAMS`, and `write_file` and MCP tools are refused.
     pub(crate) read_only: bool,
-    /// Tool names this worker may never call.
-    pub(crate) deny_tools: Vec<String>,
     /// When non-empty, a `bash` command's program word must match one of these.
     pub(crate) allow_commands: Vec<String>,
     /// A `bash` command whose program word matches one of these never runs. Deny beats allow.
@@ -136,18 +144,28 @@ pub(crate) struct Policy {
     pub(crate) deny_all_commands: bool,
 }
 
+/// Whether `allow_tools` grants `name`: an exact name, or `mcp__<server>` for every tool of that
+/// server. The trailing `_` keeps `mcp__slack` from granting `mcp__slackbot_x`.
+pub(crate) fn grants(allow_tools: &[String], name: &str) -> bool {
+    allow_tools.iter().any(|entry| {
+        entry == name
+            || (name.starts_with(mcp::PREFIX)
+                && name.strip_prefix(entry.as_str()).is_some_and(|rest| rest.starts_with('_')))
+    })
+}
+
 impl Policy {
     /// This policy with the fields that are given replaced; an omitted field keeps its value.
     pub(crate) fn set(
         &self,
         read_only: Option<bool>,
-        deny_tools: Option<Vec<String>>,
+        allow_tools: Option<Vec<String>>,
         allow_commands: Option<Vec<String>>,
         deny_commands: Option<Vec<String>>,
     ) -> Self {
         Self {
+            allow_tools: allow_tools.unwrap_or_else(|| self.allow_tools.clone()),
             read_only: read_only.unwrap_or(self.read_only),
-            deny_tools: deny_tools.unwrap_or_else(|| self.deny_tools.clone()),
             allow_commands: allow_commands.unwrap_or_else(|| self.allow_commands.clone()),
             deny_commands: deny_commands.unwrap_or_else(|| self.deny_commands.clone()),
             deny_all_commands: self.deny_all_commands,
@@ -156,17 +174,15 @@ impl Policy {
 
     /// The policy a spawned agent is born with: this one, tightened by `given` and never loosened.
     ///
-    /// `read_only` sticks, deny lists are unioned, and two allow lists intersect — a child of a
-    /// restricted agent cannot be handed back a capability the owner refused. An intersection that
+    /// `read_only` sticks, deny lists are unioned, and the two allow lists intersect — a child of a
+    /// restricted worker cannot be handed back a capability its owner lacks. An intersection that
     /// leaves nothing allows nothing, rather than reading as an absent allow list. Called once, on
     /// the spawn path: an agent's policy never changes after that.
     pub(crate) fn inherit(&self, given: &Self) -> Self {
-        let mut deny_tools = self.deny_tools.clone();
-        for tool in &given.deny_tools {
-            if !deny_tools.contains(tool) {
-                deny_tools.push(tool.clone());
-            }
-        }
+        // A child keeps only the entries its owner's list already covers, so `mcp__slack` in the
+        // parent still covers a narrower `mcp__slack_feedback` in the child.
+        let allow_tools: Vec<String> =
+            given.allow_tools.iter().filter(|tool| grants(&self.allow_tools, tool.as_str())).cloned().collect();
         let allow_commands = if self.deny_all_commands || given.deny_all_commands {
             Vec::new()
         } else if self.allow_commands.is_empty() {
@@ -186,26 +202,28 @@ impl Policy {
             }
         }
         Self {
+            allow_tools,
             read_only: self.read_only || given.read_only,
-            deny_tools,
             allow_commands,
             deny_commands,
             deny_all_commands,
         }
     }
 
-    /// The restriction lines a worker reads in its prompt; empty when nothing is restricted.
+    /// The rights paragraph an agent reads in its prompt.
     pub(crate) fn describe(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
+        if self.allow_tools.is_empty() {
+            lines.push("- tools you may call: none — you can only think and answer.".into());
+        } else {
+            lines.push(format!("- tools you may call: {}.", self.allow_tools.join(" ")));
+        }
         if self.read_only {
             lines.push(format!(
                 "- read-only: write_file is refused, and bash runs only {} (git only: {}).",
                 READ_ONLY_PROGRAMS.join(" "),
                 READ_ONLY_GIT.join(" ")
             ));
-        }
-        if !self.deny_tools.is_empty() {
-            lines.push(format!("- banned tools: {}.", self.deny_tools.join(" ")));
         }
         if self.deny_all_commands {
             lines.push("- bash runs nothing: your allow list and your owner's share no command.".into());
@@ -216,19 +234,20 @@ impl Policy {
         if !self.deny_commands.is_empty() {
             lines.push(format!("- banned bash commands: {}.", self.deny_commands.join(" · ")));
         }
-        if lines.is_empty() {
-            return String::new();
-        }
         format!(
-            "Rights your owner gave you when it started you; they are fixed for your lifetime and a call that breaks one comes back as an error:\n{}\n",
+            "Rights set by your profile; no agent, yourself included, can change them while you run:\n{}\n",
             lines.join("\n")
         )
     }
 
     /// Why this call may not run, or `None` when it may.
     pub(crate) fn refuse(&self, name: &str, arguments: &str) -> Option<String> {
-        if self.deny_tools.iter().any(|tool| tool == name) {
-            return Some(format!("tool {name} is banned for this agent"));
+        if !ALWAYS_GRANTED.contains(&name) && !grants(&self.allow_tools, name) {
+            return Some(if self.allow_tools.is_empty() {
+                "this agent may call no tool: it can only think and answer".to_string()
+            } else {
+                format!("tool {name} is not granted to this agent; it may call {}", self.allow_tools.join(" "))
+            });
         }
         if name == WRITE_FILE && self.read_only {
             return Some("this agent is read-only: write_file is refused".into());
@@ -789,15 +808,19 @@ mod tests {
     fn registry() -> conflict::Registry {
         conflict::Registry::default()
     }
+    /// A policy granting every file tool, so a test about one of them is not about the allow list.
+    fn file_tools() -> Policy {
+        Policy { allow_tools: vec![BASH.into(), READ_FILE.into(), WRITE_FILE.into()], ..Policy::default() }
+    }
 
-    /// A tool call with no policy, no cancellation and a fresh registry: each test sees its own ids.
+    /// A tool call under `file_tools`, no cancellation and a fresh registry: each test sees its own ids.
     fn execute(dir: &Path, name: &str, arguments: &str) -> String {
-        guarded(dir, name, arguments, &Policy::default(), None, &mut registry())
+        guarded(dir, name, arguments, &file_tools(), None, &mut registry())
     }
 
     /// One tool call against a registry the caller keeps, for a read that a later write resolves.
     fn with_registry(dir: &Path, name: &str, arguments: &str, conflicts: &mut conflict::Registry) -> String {
-        guarded(dir, name, arguments, &Policy::default(), None, conflicts)
+        guarded(dir, name, arguments, &file_tools(), None, conflicts)
     }
 
     /// The same call, with the empty skills and servers a plain tool test has.
@@ -826,18 +849,32 @@ mod tests {
 
     #[test]
     fn a_child_cannot_be_looser_than_its_owner() {
-        let owner = Policy { read_only: true, deny_tools: vec!["bash".into()], ..Policy::default() };
-        let asked = Policy::default();
+        let owner = Policy { allow_tools: vec![BASH.into()], read_only: true, ..Policy::default() };
+        let asked = Policy { allow_tools: vec![BASH.into(), WRITE_FILE.into()], ..Policy::default() };
         let inherited = owner.inherit(&asked);
         assert!(inherited.read_only, "a read-only owner born a writing agent");
-        assert_eq!(inherited.deny_tools, ["bash"]);
+        assert_eq!(inherited.allow_tools, ["bash"], "the owner's list bounds its child's");
     }
 
     #[test]
     fn a_child_may_be_tighter_than_its_owner() {
-        let owner = Policy::default();
-        let asked = Policy { read_only: true, deny_tools: vec!["bash".into()], ..Policy::default() };
+        let owner = Policy { allow_tools: vec![BASH.into(), READ_FILE.into()], ..Policy::default() };
+        let asked = Policy { allow_tools: vec![READ_FILE.into()], read_only: true, ..Policy::default() };
         assert_eq!(owner.inherit(&asked), asked);
+    }
+
+    #[test]
+    fn a_server_grant_covers_its_own_tools_only() {
+        let owner = Policy { allow_tools: vec!["mcp__slack".into(), BASH.into()], ..Policy::default() };
+        let asked = Policy {
+            allow_tools: vec!["mcp__slack_feedback".into(), "mcp__slackbot_x".into(), BASH.into()],
+            ..Policy::default()
+        };
+        let inherited = owner.inherit(&asked);
+        assert_eq!(inherited.allow_tools, ["mcp__slack_feedback", "bash"]);
+        assert!(grants(&owner.allow_tools, "mcp__slack_msg"));
+        assert!(!grants(&owner.allow_tools, "mcp__slackbot_x"), "a prefix is not a grant");
+        assert!(grants(&owner.allow_tools, "mcp__slack"), "the server entry grants the server's tools");
     }
 
     #[test]
@@ -845,22 +882,23 @@ mod tests {
         let owner = Policy {
             deny_commands: vec!["rm".into()],
             allow_commands: vec!["git".into(), "cargo".into()],
-            ..Policy::default()
+            ..file_tools()
         };
         let asked = Policy {
             deny_commands: vec!["curl".into(), "rm".into()],
             allow_commands: vec!["cargo".into()],
-            ..Policy::default()
+            ..file_tools()
         };
         let inherited = owner.inherit(&asked);
         assert_eq!(inherited.deny_commands, ["rm", "curl"]);
         assert_eq!(inherited.allow_commands, ["cargo"]);
+        assert_eq!(inherited.allow_tools, file_tools().allow_tools);
     }
 
     #[test]
     fn allow_lists_that_share_nothing_refuse_every_command() {
-        let owner = Policy { allow_commands: vec!["git".into()], ..Policy::default() };
-        let asked = Policy { allow_commands: vec!["cargo".into()], ..Policy::default() };
+        let owner = Policy { allow_commands: vec!["git".into()], ..file_tools() };
+        let asked = Policy { allow_commands: vec!["cargo".into()], ..file_tools() };
         let inherited = owner.inherit(&asked);
         assert!(inherited.deny_all_commands, "an empty intersection read as an absent allow list");
         assert_eq!(inherited.allow_commands, Vec::<String>::new());
@@ -869,15 +907,25 @@ mod tests {
         let out = guarded(dir.path(), BASH, &command, &inherited, None, &mut registry());
         assert!(out.starts_with("error: this agent runs no bash command"), "{out}");
         // A child of a deny-all agent stays deny-all, whatever allow list it asks for.
-        let looser = inherited.inherit(&Policy { allow_commands: vec!["ls".into()], ..Policy::default() });
+        let looser = inherited.inherit(&Policy { allow_commands: vec!["ls".into()], ..file_tools() });
         assert!(looser.deny_all_commands);
     }
 
     #[test]
-    fn a_denied_spawn_agent_survives_inheritance() {
-        let owner = Policy { deny_tools: vec!["spawn_agent".into()], ..Policy::default() };
-        let inherited = owner.inherit(&Policy::default());
-        assert_eq!(inherited.deny_tools, ["spawn_agent"]);
+    fn an_empty_allow_list_can_call_nothing() {
+        let policy = Policy::default();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            guarded(dir.path(), BASH, r#"{"command":"ls"}"#, &policy, None, &mut registry()),
+            "error: this agent may call no tool: it can only think and answer"
+        );
+        assert!(policy.refuse(REPLY, "{}").is_none(), "reporting home is never a right to ask for");
+        assert!(policy.refuse(CLOSE, &json!({"report": "x"}).to_string()).is_none());
+        let refused = Policy { allow_tools: vec![READ_FILE.into()], ..Policy::default() };
+        assert_eq!(
+            refused.refuse(BASH, r#"{"command":"ls"}"#),
+            Some("tool bash is not granted to this agent; it may call read_file".to_string())
+        );
     }
 
     #[test]
@@ -926,7 +974,10 @@ mod tests {
             execute(root, BASH, r#"{"command":"ls","path":"x"}"#)
                 .starts_with("error: invalid arguments: unknown field `path`, expected `command`")
         );
-        assert_eq!(execute(root, "nope", "{}"), "error: unknown tool nope");
+        assert_eq!(
+            execute(root, "nope", "{}"),
+            "error: tool nope is not granted to this agent; it may call bash read_file write_file"
+        );
     }
 
     #[test]
@@ -1076,7 +1127,7 @@ mod tests {
     #[test]
     fn read_only_refuses_writes_and_writing_commands() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = Policy { read_only: true, ..Policy::default() };
+        let policy = Policy { read_only: true, ..file_tools() };
         let write = json!({"path": "x", "content": "y"}).to_string();
         assert!(
             guarded(dir.path(), WRITE_FILE, &write, &policy, None, &mut registry())
@@ -1098,7 +1149,7 @@ mod tests {
     #[test]
     fn read_only_refuses_writing_subcommands_and_flags() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = Policy { read_only: true, ..Policy::default() };
+        let policy = Policy { read_only: true, ..file_tools() };
         for command in [
             "git branch -D feature",
             "git branch topic",
@@ -1125,16 +1176,15 @@ mod tests {
     fn denied_tools_and_commands_never_run() {
         let dir = tempfile::tempdir().unwrap();
         let policy = Policy {
-            read_only: false,
-            deny_tools: vec![READ_FILE.into()],
+            allow_tools: vec![BASH.into(), WRITE_FILE.into()],
             allow_commands: vec!["ls".into(), "echo".into()],
             deny_commands: vec!["echo secret".into()],
-            deny_all_commands: false,
+            ..Policy::default()
         };
         let read = json!({"path": "f"}).to_string();
         assert_eq!(
             guarded(dir.path(), READ_FILE, &read, &policy, None, &mut registry()),
-            "error: tool read_file is banned for this agent"
+            "error: tool read_file is not granted to this agent; it may call bash write_file"
         );
         let denied = json!({"command": "echo secret"}).to_string();
         assert_eq!(
@@ -1155,7 +1205,7 @@ mod tests {
     #[test]
     fn a_command_rule_matches_words_not_text() {
         let dir = tempfile::tempdir().unwrap();
-        let only_ls = Policy { allow_commands: vec!["ls".into()], ..Policy::default() };
+        let only_ls = Policy { allow_commands: vec!["ls".into()], ..file_tools() };
         for command in ["lsof", "ls; rm -rf x", "ls | sh", "ls && id"] {
             let args = json!({"command": command}).to_string();
             let out = guarded(dir.path(), BASH, &args, &only_ls, None, &mut registry());
@@ -1164,7 +1214,7 @@ mod tests {
         let wrapped = json!({"command": "env ls"}).to_string();
         assert!(!guarded(dir.path(), BASH, &wrapped, &only_ls, None, &mut registry()).starts_with("error:"));
 
-        let no_rm = Policy { deny_commands: vec!["rm".into()], ..Policy::default() };
+        let no_rm = Policy { deny_commands: vec!["rm".into()], ..file_tools() };
         for command in ["env rm -rf x", "/bin/rm -rf x", "X=1 rm -rf x"] {
             let args = json!({"command": command}).to_string();
             let out = guarded(dir.path(), BASH, &args, &no_rm, None, &mut registry());
@@ -1184,10 +1234,10 @@ mod tests {
         let profiles = profiles::Catalogue::default();
         let context = Context { skills: &skills, profiles: &profiles, mcp: &mcp };
         let read = json!({"path": "skill://caveman"}).to_string();
-        let out = execute_guarded(dir.path(), READ_FILE, &read, &Policy::default(), None, &mut registry(), &context);
+        let out = execute_guarded(dir.path(), READ_FILE, &read, &file_tools(), None, &mut registry(), &context);
         assert!(out.contains("body"), "{out}");
         let missing = json!({"path": "skill://nope"}).to_string();
-        let out = execute_guarded(dir.path(), READ_FILE, &missing, &Policy::default(), None, &mut registry(), &context);
+        let out = execute_guarded(dir.path(), READ_FILE, &missing, &file_tools(), None, &mut registry(), &context);
         assert!(out.starts_with("error: unknown skill nope"), "{out}");
     }
 
@@ -1201,7 +1251,7 @@ mod tests {
         let mut conflicts = conflict::Registry::default();
         let args = ReadArgs { path: "profile://orchestrator".into() };
         let text = read_file(home.path(), &args, &mut conflicts, &context).unwrap();
-        assert!(text.contains("You coordinate."), "{text}");
+        assert!(text.contains("You own one task from the brief"), "{text}");
         let missing = ReadArgs { path: "profile://ghost".into() };
         let text = read_file(home.path(), &missing, &mut conflicts, &context).unwrap_err();
         assert!(text.contains("unknown profile ghost"), "{text}");
@@ -1212,8 +1262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
-        let out =
-            guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &Policy::default(), Some(&cancel), &mut registry());
+        let out = guarded(dir.path(), BASH, r#"{"command":"sleep 30"}"#, &file_tools(), Some(&cancel), &mut registry());
         assert!(out.contains("interrupted by overseer"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }

@@ -280,24 +280,8 @@ mod tests {
     /// Esc inside an agent view returns to the tree: it neither types into the prompt nor quits.
     #[test]
     fn escape_leaves_an_agent_view_without_quitting() {
+        let agent = AgentView { id: 2, state: crate::swarm::State::Idle, busy_for: None, ..working(2) };
         let mut app = App::new("m");
-        let agent = AgentView {
-            id: 2,
-            name: crate::names::name(2, None),
-            label: crate::names::label(2, None),
-            parent: Some(crate::swarm::Swarm::ROOT),
-            depth: 1,
-            dir: PathBuf::from("/tmp/repo"),
-            task: "do it".into(),
-            profile: None,
-            pending: 0,
-            failed: false,
-            finished: false,
-            stopped: false,
-            paused: false,
-            read_only: false,
-            busy_for: None,
-        };
         app.apply(UiEvent::Agents(vec![agent]));
         press(&mut app, KeyCode::F(4));
         assert!(app.in_worker_view(), "F4 opens an agent's view");
@@ -320,12 +304,9 @@ mod tests {
             depth: 1,
             dir: PathBuf::from("/tmp/repo"),
             task: "do it".into(),
-            profile: None,
-            pending: 1,
-            failed: false,
-            finished: false,
-            stopped: false,
-            paused: false,
+            profile: "worker".into(),
+            supervisor: false,
+            state: crate::swarm::State::Working,
             read_only: false,
             busy_for: Some(Duration::from_secs(3)),
         }
@@ -346,7 +327,7 @@ mod tests {
         assert!(drawn.contains("stopping agent 2…"), "the key is acknowledged at once: {drawn}");
         assert!(app.in_worker_view(), "the view stays open to show the stop land");
         // The core reports it: the agent is stopped, so the next esc is the way out.
-        let stopped = AgentView { stopped: true, pending: 0, busy_for: None, ..working(2) };
+        let stopped = AgentView { state: crate::swarm::State::Stopped, busy_for: None, ..working(2) };
         app.apply(UiEvent::Agents(vec![stopped]));
         press(&mut app, KeyCode::Esc);
         assert!(!app.in_worker_view(), "esc leaves once there is nothing left to stop");
