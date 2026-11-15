@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let quit = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::clone(&quit);
     let model = profiles
-        .get(profiles::ORCHESTRATOR)
+        .get(profiles::SUPERVISOR)
         .and_then(|profile| profile.model.clone())
         .unwrap_or_else(|| cfg.model.clone());
     // Read before the core takes the config: the palette is fixed before the first frame.

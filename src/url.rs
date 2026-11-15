@@ -321,7 +321,7 @@ mod tests {
     fn a_profile_reads_through_its_scheme_and_nothing_writes_one() {
         let catalogue = profiles::Catalogue::default();
         let mut ctx = Ctx { conflicts: None, skills: None, profiles: Some(&catalogue) };
-        assert!(read(&mut ctx, "profile://orchestrator").unwrap().contains("You coordinate."));
+        assert!(read(&mut ctx, "profile://orchestrator").unwrap().contains("You own one task from the brief"));
         let error = read(&mut ctx, "profile://ghost").unwrap_err();
         assert!(error.contains("unknown profile ghost"), "{error}");
         let mut blind = Ctx { conflicts: None, skills: None, profiles: None };
