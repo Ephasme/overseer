@@ -73,6 +73,36 @@ pub(crate) fn state_dir(home: &Path) -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state", home).join("overseer")
 }
 
+/// Where the TUI remembers how the user left its layout between runs.
+pub(crate) fn tui_state(home: &Path) -> PathBuf {
+    state_dir(home).join("tui.toml")
+}
+
+/// What one run of the TUI carries over to the next.
+#[derive(Default, Deserialize, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+struct RawTui {
+    panel_width: Option<u16>,
+}
+
+/// The agent panel's width as the last run left it, if it was ever dragged.
+pub(crate) fn panel_width(home: &Path) -> Option<u16> {
+    let text = fs::read_to_string(tui_state(home)).ok()?;
+    toml::from_str::<RawTui>(&text).ok()?.panel_width
+}
+
+/// Remembers the agent panel's width for the next run.
+///
+/// A drag is not worth failing over: a state directory that cannot be written costs the next run
+/// its layout, not this one its panel.
+pub(crate) fn save_panel_width(home: &Path, width: u16) {
+    let path = tui_state(home);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, format!("panel_width = {width}\n"));
+}
+
 /// The `<path>: <os error>` shape every tool, log and path error uses.
 pub(crate) fn io_error(path: impl std::fmt::Display, e: &std::io::Error) -> String {
     format!("{path}: {e}")
@@ -161,6 +191,17 @@ fn canonical_dir(path: &str, home: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel width survives a run and a malformed or absent file leaves it at the launch width.
+    #[test]
+    fn the_panel_width_is_remembered_between_runs() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(panel_width(home.path()), None, "a first run has nothing to restore");
+        save_panel_width(home.path(), 52);
+        assert_eq!(panel_width(home.path()), Some(52));
+        fs::write(tui_state(home.path()), "panel_width = \"wide\"").unwrap();
+        assert_eq!(panel_width(home.path()), None, "a file this run cannot read is no width at all");
+    }
 
     #[test]
     fn parse_expands_home() {

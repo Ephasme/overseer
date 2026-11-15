@@ -1105,6 +1105,8 @@ pub(super) struct App {
     body_area: Rect,
     /// Whether the pointer is dragging the panel's rule.
     resizing: bool,
+    /// Whether the width changed since the frontend last wrote it down.
+    width_dirty: bool,
     /// Expanded: every row of what a call acts on, and what it returned. Off is the launch state.
     pub(super) tool_output: bool,
     /// The worker panel's inner area, so a click can tell the panel from the transcript.
@@ -1150,6 +1152,7 @@ impl App {
             split: None,
             body_area: Rect::ZERO,
             resizing: false,
+            width_dirty: false,
             tool_output: false,
             workers_area: Rect::ZERO,
             worker_rows: Vec::new(),
@@ -2144,6 +2147,23 @@ impl App {
         self.dirty = true;
     }
 
+    /// The width the panel opens at, as the last run left it; the launch width when it never moved.
+    pub(super) fn set_workers_width(&mut self, width: u16) {
+        self.workers_width = width.max(WORKERS_MIN);
+        self.dirty = true;
+    }
+
+    /// The width the panel is set to, which a resize of the terminal never narrows: it is what the
+    /// next run comes back to.
+    pub(super) fn workers_width(&self) -> u16 {
+        self.workers_width
+    }
+
+    /// Whether the width moved since the last call, so the frontend writes it down once per drag.
+    pub(super) fn take_width_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.width_dirty)
+    }
+
     /// The width the panel takes this frame, or `None` when it is hidden or the terminal has no room
     /// left for a readable transcript beside it.
     fn panel_width(&self, total: u16) -> Option<u16> {
@@ -2166,6 +2186,7 @@ impl App {
             return;
         }
         self.workers_width = width;
+        self.width_dirty = true;
         self.resize();
     }
 
@@ -3176,6 +3197,26 @@ mod tests {
         app.release();
         app.click(120, 1);
         assert_eq!(app.workers_area.width + 2, WORKERS_MIN, "a click past the panel resizes nothing");
+    }
+
+    /// The width a drag lands on is what the next run opens at, and no drag can hide the panel.
+    #[test]
+    fn a_resize_is_written_down_once_and_narrowed_no_further_than_the_floor() {
+        let mut app = App::new("m");
+        screen(&mut app, 120, 24);
+        assert!(!app.take_width_dirty(), "a fresh app has nothing to write down");
+        let rule = app.split.expect("the panel draws its rule");
+        app.click(rule, 1);
+        app.drag(rule - 10);
+        assert!(app.take_width_dirty(), "the drag asks for one write");
+        assert!(!app.take_width_dirty(), "and only one, however many frames it took");
+        screen(&mut app, 120, 24);
+        let mut next = App::new("m");
+        next.set_workers_width(app.workers_width());
+        screen(&mut next, 120, 24);
+        assert_eq!(next.workers_area, app.workers_area, "the next run opens where the drag left the panel");
+        next.set_workers_width(0);
+        assert_eq!(next.workers_width(), WORKERS_MIN, "a width that would hide the panel is refused");
     }
 
     /// A drag starts on the rule and nowhere else: nothing else in the frame moves the split.

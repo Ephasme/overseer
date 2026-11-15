@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use std::io::stdout;
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -31,6 +32,11 @@ type Copied = (u64, clipboard::Paste);
 pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str, theme: Theme) -> Result<()> {
     theme::install(theme);
     let mut app = App::new(model);
+    // The layout the last run was left with, and where this one writes its own back.
+    let home = crate::config::home().ok();
+    if let Some(width) = home.as_deref().and_then(crate::config::panel_width) {
+        app.set_workers_width(width);
+    }
     let mut terminal = ratatui::try_init()?;
     // ratatui's hook leaves raw mode and the alternate screen; these two are modes of ours.
     let previous = release_modes_on_panic();
@@ -39,7 +45,7 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, model: &str, them
         app.toggle_mouse();
         app.apply(UiEvent::Error(format!("cannot enable the mouse and paste modes: {err}")));
     }
-    let result = event_loop(&mut terminal, &mut app, ui, input);
+    let result = event_loop(&mut terminal, &mut app, ui, input, home.as_deref());
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     std::panic::set_hook(Box::new(move |info| previous(info)));
@@ -69,6 +75,7 @@ fn event_loop(
     app: &mut App,
     ui: Receiver<UiEvent>,
     input: Sender<Event>,
+    home: Option<&Path>,
 ) -> Result<()> {
     // Clipboard reads come back here: they run on their own thread so a paste never stalls a frame.
     let (pasted, copied) = mpsc::channel::<Copied>();
@@ -111,6 +118,11 @@ fn event_loop(
             app.attach(id, found);
         }
         app.tick();
+        if app.take_width_dirty()
+            && let Some(home) = home
+        {
+            crate::config::save_panel_width(home, app.workers_width());
+        }
         if app.quit {
             // The events that ended the session are already applied: show them once before leaving.
             if app.take_dirty() {
