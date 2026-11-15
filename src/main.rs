@@ -12,6 +12,7 @@ mod llm;
 mod mcp;
 mod memory;
 mod names;
+mod pipelines;
 mod plain;
 mod profiles;
 mod prompt;
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
     };
     let models = Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
     let profiles = Arc::new(profiles::Catalogue::load(&cfg.home));
+    let pipelines = Arc::new(pipelines::Catalogue::load(&cfg.home));
 
     // Started before the core loop: a server that is slow to connect must not delay startup.
     let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
@@ -72,7 +74,7 @@ fn main() -> Result<()> {
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
     let core = thread::spawn(move || {
-        session::run(models, profiles, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown)
+        session::run(models, profiles, pipelines, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown)
     });
 
     let frontend = if tui_available() {

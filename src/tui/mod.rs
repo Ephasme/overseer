@@ -397,7 +397,7 @@ mod tests {
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.take_prompt(), "/schemes", "down picked the second row and tab took it");
+        assert_eq!(app.take_prompt(), "/pipeline", "down picked the second row and tab took it");
     }
 
     /// The popup only takes the keys it lists: ctrl+0, the tool-card toggle, keeps working while the

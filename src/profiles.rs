@@ -16,6 +16,8 @@ const ROOT: &str = ".overseer/agent/profiles";
 /// The profile the first agent always has; a user file of this name replaces the built-in text.
 pub(crate) const SUPERVISOR: &str = "supervisor";
 pub(crate) const ORCHESTRATOR: &str = "orchestrator";
+/// The profile a pipeline runs under; the runner never talks to a model.
+pub(crate) const PIPELINE: &str = "pipeline";
 
 /// The reasoning efforts a profile may ask for.
 pub(crate) const EFFORTS: &[&str] = &["low", "medium", "high"];
@@ -53,8 +55,17 @@ impl Role {
             Self::Supervisor => {
                 let mut out = policy.describe();
                 out.push_str(
-                    "Your role removes write_file, edit and every MCP tool whatever your profile lists, and runs bash read-only. This restriction is yours alone: the agents you start get exactly the rights of the profile you name, which may be more than yours.\n",
+                    "Your role removes write_file, edit and every MCP tool whatever your profile lists, and runs bash read-only. No child inherits the supervisor role; each runs under the role of the profile you name.\n",
                 );
+                if tools::grants(&policy.allow_tools, crate::prompt::FREE_SPAWN) {
+                    out.push_str(
+                        "spawn_agent with `free: true` gives a child its profile's rights, which may be more than yours; without it the child gets the intersection of the two tool lists.\n",
+                    );
+                } else {
+                    out.push_str(
+                        "A child you start gets the intersection of your tool list and its profile's, so it can never hold a tool you lack.\n",
+                    );
+                }
                 out
             }
         }
@@ -65,6 +76,7 @@ impl Role {
 const BUILTINS: &[(&str, &str)] = &[
     (SUPERVISOR, SUPERVISOR_FILE),
     (ORCHESTRATOR, ORCHESTRATOR_FILE),
+    (PIPELINE, PIPELINE_FILE),
     ("planner", PLANNER_FILE),
     ("plan-reviewer", PLAN_REVIEWER_FILE),
     ("worker", WORKER_FILE),
@@ -73,7 +85,9 @@ const BUILTINS: &[(&str, &str)] = &[
     ("integrator", INTEGRATOR_FILE),
 ];
 
-const SUPERVISOR_FILE: &str = "---\ndescription: Runs the tree; delegates every task and integrates nothing itself.\nkeywords: [supervise, delegate, monitor, challenge, review]\neffort: high\nrole: supervisor\nallow_tools: [read_file, bash, spawn_agent, message_agent, control_agent, list_agents, list_repos]\n---\nYou answer for the whole tree. Brief an orchestrator per task, demand a written plan, demand an independent review of that plan, demand a review of every build, and accept nothing as done without the commands that prove it. Read files yourself when a report must be checked; never edit one.";
+const SUPERVISOR_FILE: &str = "---\ndescription: Runs the tree; delegates every task and integrates nothing itself.\nkeywords: [supervise, delegate, monitor, challenge, review]\neffort: high\nrole: supervisor\nallow_tools: [read_file, bash, spawn_agent, free_spawn, message_agent, control_agent, list_agents, list_repos, start_pipeline, list_pipelines]\n---\nYou answer for the whole tree. Brief an orchestrator per task, demand a written plan, demand an independent review of that plan, demand a review of every build, and accept nothing as done without the commands that prove it. Read files yourself when a report must be checked; never edit one.";
+
+const PIPELINE_FILE: &str = "---\ndescription: Runs one Rhai pipeline script and reports what it did.\nkeywords: [pipeline, script, workflow, rhai]\nrole: worker\nallow_tools: [bash, read_file, write_file, spawn_agent, message_agent, control_agent, list_agents, list_repos, start_pipeline, list_pipelines, free_spawn]\n---\nYou run a Rhai pipeline, not a conversation: the runner executes the named script and the script's host functions do the work. Every run is bounded by an operation count, a wall clock and the engine's data sizes, so report what the script reported and never claim a step the script did not take.";
 
 const ORCHESTRATOR_FILE: &str = "---\ndescription: \"Owns one task end to end: plan, delegate the slices, integrate, report.\"\nkeywords: [orchestrate, split, worktree, integrate, merge]\neffort: high\nallow_tools: [bash, read_file, write_file, edit, spawn_agent, message_agent, control_agent, list_agents, list_repos]\n---\nYou own one task from the brief to the merged result. Split it into slices one agent can own alone, each with complete instructions because it sees nothing of your context except what you write. Parallel work in one repository means one worktree per agent on its own branch: `git worktree add ../<repo>-<slug> -b <type>/<slug> <base-branch>`. Two agents editing the same checkout is a dispatch bug, not a merge problem to fix later. Base every worktree on the branch whose build is actually deployed or installed, not on whatever HEAD happens to be, and state that base branch in each agent's instructions. Orchestration is not done when agents report: integrate their branches one at a time, in dependency order, with a PR where the repository has a remote and a review flow and with a rebase (or rebase-then-fast-forward) where it is local only, so history stays linear and never merge-commit soup. Agents never merge or rebase each other's branches: an agent pushes its branch and opens a PR against the agreed base branch when it finishes, or leaves a local branch and says so when the repository has no remote. You own integration: merge in dependency order, ask the next agent to rebase onto the updated base between merges when the branches touch the same code, and verify build and tests green on the integrated result before you report. Your final report names the plan path, every branch, every merge, the commands that proved the result, and what remains untested. Call `close` with your report as your last tool call when you have nothing further to do.";
 
@@ -104,8 +118,8 @@ pub(crate) struct Profile {
     pub(crate) effort: Option<String>,
     /// What this profile grants, and the command rules that go with it.
     pub(crate) policy: tools::Policy,
-    /// Whether the agent runs the tree or does the work; a supervisor is exempt from its owner's
-    /// tool list.
+    /// Whether the agent runs the tree or does the work. Neither role is exempt from its owner's
+    /// tool list: a child gets the intersection unless its owner grants `free_spawn`.
     pub(crate) role: Role,
     /// Whether the file declares `allow_tools` at all: an absent list is refused, an empty one
     /// grants nothing, and the two must stay distinguishable.

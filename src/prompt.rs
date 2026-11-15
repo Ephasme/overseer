@@ -12,6 +12,10 @@ pub(crate) const MESSAGE_AGENT: &str = "message_agent";
 pub(crate) const CONTROL_AGENT: &str = "control_agent";
 pub(crate) const LIST_AGENTS: &str = "list_agents";
 pub(crate) const LIST_REPOS: &str = "list_repos";
+pub(crate) const START_PIPELINE: &str = "start_pipeline";
+pub(crate) const LIST_PIPELINES: &str = "list_pipelines";
+/// A grant, not a tool: it lets the holder pass `free: true` to `spawn_agent`.
+pub(crate) const FREE_SPAWN: &str = "free_spawn";
 
 /// The progress-note and closing tools live with the file tools: a policy refuses calls, and the
 /// policy must not depend on this module.
@@ -29,6 +33,9 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     CONTROL_AGENT,
     LIST_AGENTS,
     LIST_REPOS,
+    START_PIPELINE,
+    LIST_PIPELINES,
+    FREE_SPAWN,
     tools::REPLY,
     tools::CLOSE,
 ];
@@ -60,7 +67,8 @@ pub(crate) fn agent_tool_definitions(mcp: &mcp::Registry, policy: &tools::Policy
     functions.retain(|tool| {
         let Some(name) = function_name(tool) else { return true };
         let always = tools::ALWAYS_GRANTED.contains(&name);
-        let too_deep = name == SPAWN_AGENT && remaining_depth == 0;
+        // Both start a child, so neither is offered to an agent that may have none.
+        let too_deep = (name == SPAWN_AGENT || name == START_PIPELINE) && remaining_depth == 0;
         (always || tools::grants(&policy.allow_tools, name)) && !too_deep
     });
     defs
@@ -119,7 +127,8 @@ fn swarm_tool_definitions() -> Vec<Value> {
         "properties": {
             "profile": {"type": "string", "description": "The profile the new agent runs, from the catalogue your prompt lists. It fixes its model, its effort and its rights."},
             "path": {"type": "string", "description": "Directory the agent works in; relative paths resolve there. Defaults to your own directory."},
-            "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
+            "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."},
+            "free": {"type": "boolean", "description": "Spawn with the child profile's policy instead of the intersection with your own. Requires the free_spawn grant."}
         },
         "required": ["task", "profile"]
     });
@@ -157,6 +166,18 @@ fn swarm_tool_definitions() -> Vec<Value> {
             "parameters": {"type": "object", "properties": {}}
         }}),
         json!({"type": "function", "function": {
+            "name": START_PIPELINE,
+            "description": "Start one of the user's Rhai pipelines as a child agent, in your own directory. The script runs under a fixed policy and reports through its host functions; a tool its header requires but that policy refuses stops the call before anything is created.",
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "The pipeline name, from the catalogue your prompt lists."}
+            }, "required": ["name"]}
+        }}),
+        json!({"type": "function", "function": {
+            "name": LIST_PIPELINES,
+            "description": "List the pipeline names the user's catalogue holds.",
+            "parameters": {"type": "object", "properties": {}}
+        }}),
+        json!({"type": "function", "function": {
             "name": CLOSE,
             "description": "End your turn with your final report and close yourself. Your owner re-opens you by sending another instruction; only your owner can archive you.",
             "parameters": {"type": "object", "properties": {"report": {"type": "string", "description": "The complete report for your owner."}}, "required": ["report"]}
@@ -189,7 +210,7 @@ pub(crate) struct AgentFacts<'a> {
 
 /// What a supervisor is for. It never changes anything itself: every change belongs to an agent it
 /// starts, and its own instruments are the tree tools, `read_file` and read-only commands.
-const SUPERVISOR_PROMPT: &str = "You are the supervisor. You never change anything: you do not write files, you do not run a command that changes anything, and you do not merge. Everything that changes the repository belongs to an agent you start. Your instruments are spawn_agent, message_agent, control_agent, list_agents, list_repos, read_file and read-only commands. Answering a question from what you can read is your job too: do not spawn an agent to tell you what a file says.\n\
+const SUPERVISOR_PROMPT: &str = "You are the supervisor. You never change anything: you do not write files, you do not run a command that changes anything, and you do not merge. Everything that changes the repository belongs to an agent you start. Your instruments are spawn_agent, message_agent, control_agent, list_agents, list_repos, start_pipeline, read_file and read-only commands. Answering a question from what you can read is your job too: do not spawn an agent to tell you what a file says.\n\
 A request that needs work is not answered, it is run. One task gets one orchestrator: spawn an `orchestrator` with the request rewritten as a complete brief — goal, directory, base branch, constraints, what \"done\" means, which profiles it may use, and the evidence you will demand. The orchestrator owns the execution; you own the outcome.\n\
 The loop:\n\
 1. Brief before spawn. Never send a brief you would not accept as an outsider: no context the agent cannot read, no branch it must guess, no acceptance you cannot check.\n\
@@ -248,7 +269,7 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
     if may_spawn {
         let _ = write!(
             out,
-            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. A worker's child keeps only the tools its owner also has; a supervisor's child gets its profile's rights alone.\n<profiles>\n{}\n</profiles>\n",
+            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. A child gets the intersection of your tool list and its profile's, unless you hold the free_spawn grant and pass `free: true`, which gives it its profile's rights.\n<profiles>\n{}\n</profiles>\n",
             facts.profiles.catalogue()
         );
     }

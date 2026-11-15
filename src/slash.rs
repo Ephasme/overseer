@@ -10,6 +10,9 @@
 /// living in two places.
 pub(crate) const RESUME: &str = "/resume";
 
+/// `/pipeline <name|list|stop>`: run or manage a Rhai pipeline without a model call.
+pub(crate) const PIPELINE: &str = "/pipeline";
+
 /// Most rows the popup shows at once.
 pub(crate) const LIMIT: usize = 6;
 
@@ -42,8 +45,9 @@ impl Command {
 }
 
 /// Every slash command `Event::from_line` recognises, in the order the popup lists them.
-pub(crate) const COMMANDS: [Command; 4] = [
+pub(crate) const COMMANDS: [Command; 5] = [
     Command { name: RESUME, hint: Some("<id>"), about: "retask an agent without a model call" },
+    Command { name: PIPELINE, hint: Some("<name|list|stop>"), about: "run or manage a Rhai pipeline" },
     Command { name: "/schemes", hint: None, about: "list the internal URI schemes" },
     Command { name: "/mcp", hint: None, about: "show the MCP servers" },
     Command { name: "/login", hint: Some("<server>"), about: "log in to an MCP server" },
