@@ -49,7 +49,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+x|drop the attached image|
 |PageUp / PageDown|scroll the view you are in; End follows new output again|
 |F2|hide or show the agent panel|
-|ctrl+o / ctrl+0|expand every tool card, or collapse it back: a card starts as one row, and expands to the whole body plus what the call returned|
+|ctrl+o / ctrl+0|expand every tool card, or collapse it back: a shell command always shows whole, and every other card starts as one row and expands to the whole body plus what the call returned|
 |F4|open the picked agent's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
 |click an agent row|open that agent's view; click its `esc back to fleet` line to come back|

@@ -213,7 +213,7 @@ impl Control {
 /// One worker tool call, as the user sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Progress {
-    /// A tool call started; `summary` is one line of its arguments.
+    /// A tool call started; `summary` is what its arguments act on, whole for a shell command.
     Started { call: usize, tool: String, summary: String },
     /// The same call returned after `secs`, with what its result is worth showing.
     Finished { call: usize, secs: f64, preview: tools::Preview },
@@ -387,8 +387,8 @@ fn first_line(value: Option<&String>) -> &str {
 
 /// What a tool call acts on: the transcript header and the worker panel both show it.
 ///
-/// An instruction the overseer sends a worker is kept whole, so the user can read what was
-/// actually said; every other summary is one capped line.
+/// An instruction the overseer sends a worker, and a shell command, are kept whole, so the user
+/// can read what was said or run; every other summary is one capped line.
 pub(crate) fn describe(name: &str, arguments: &str) -> String {
     let args: Described = serde_json::from_str(arguments).unwrap_or_default();
     let line = match name {
@@ -408,11 +408,11 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         }
         prompt::CONTROL_AGENT => format!("#{} · {}", args.id.unwrap_or_default(), field(args.action.as_ref())),
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
-        tools::BASH => first_line(args.command.as_ref()).to_string(),
+        tools::BASH => field(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE => field(args.path.as_ref()).to_string(),
         _ => String::new(),
     };
-    if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT) {
+    if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT | tools::BASH) {
         return line;
     }
     tools::shorten(&line, PROGRESS_WIDTH)
@@ -1571,13 +1571,11 @@ mod tests {
         let message = json!({"id": 4, "text": "one\ntwo"}).to_string();
         assert_eq!(describe(prompt::MESSAGE_AGENT, &message), "#4 · one\ntwo");
         let command = json!({"command": "cargo test\nls"}).to_string();
-        assert_eq!(describe(tools::BASH, &command), "cargo test");
+        assert_eq!(describe(tools::BASH, &command), "cargo test\nls", "the whole command, newlines kept");
         assert_eq!(describe(prompt::LIST_REPOS, "{}"), "");
         assert_eq!(describe(tools::BASH, "not json"), "");
         let long = json!({"command": "x".repeat(200)}).to_string();
-        let summary = describe(tools::BASH, &long);
-        assert_eq!(summary.chars().count(), 101);
-        assert!(summary.ends_with('…'));
+        assert_eq!(describe(tools::BASH, &long), "x".repeat(200), "no cap on a command");
         let long = json!({"id": 1, "text": "y".repeat(400)}).to_string();
         assert_eq!(describe(prompt::MESSAGE_AGENT, &long).chars().count(), 405, "no cap on an instruction");
     }
