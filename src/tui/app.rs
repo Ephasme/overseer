@@ -216,7 +216,7 @@ impl Entry {
         }
     }
 
-    /// A tool call: one header row, then its whole body and what it returned once expanded.
+    /// A tool call: its whole command, and what it returned once expanded.
     fn tool_lines(&self, width: usize, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let (glyph, colour) = if self.output.is_none() {
             (SPINNER.get(spinning % SPINNER.len()).copied().unwrap_or("·"), theme::warning())
@@ -236,12 +236,13 @@ impl Entry {
         let verb = verb(&self.title);
         let lead = 1 + text_width(glyph);
         let room = width.saturating_sub(lead + text_width(verb) + 1 + text_width(&chips)).max(12);
-        // One row at rest; the whole body once the reader asks for it.
+        // The whole command at rest: it is what the call does. Any other body, and what the call
+        // returned, stay one row until the reader asks for them.
         let mut rows: Vec<String> = Vec::new();
         for source in self.body.split('\n') {
             rows.extend(wrap(source, room));
         }
-        if !expand {
+        if !expand && self.title != tools::BASH {
             rows.truncate(1);
         }
         let pad = " ".repeat(lead + text_width(verb) + 1);
@@ -2635,6 +2636,16 @@ mod tests {
         let whole = app.lead.entries[0].lines(40, 0, true);
         assert!(whole.len() > 1, "ctrl+0 shows the whole body: {whole:?}");
         assert!(row_text(&whole).contains("tail"), "the expanded card reaches the end");
+    }
+
+    #[test]
+    fn a_shell_command_is_shown_whole_at_rest() {
+        let mut app = App::new("m");
+        tool_call(&mut app, 0, "bash", "cargo test\ncargo build");
+        let collapsed = row_text(&app.lead.entries[0].lines(80, 0, false));
+        assert!(collapsed.contains("cargo test"), "{collapsed}");
+        assert!(collapsed.contains("cargo build"), "the whole command, not its first line: {collapsed}");
+        assert!(!collapsed.contains('…'), "nothing is elided: {collapsed}");
     }
 
     #[test]
