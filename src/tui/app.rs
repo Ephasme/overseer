@@ -43,7 +43,7 @@ const HINTS: [&str; 8] = [
     "enter send",
     "ctrl+j newline",
     "F2 agents",
-    "ctrl+0 expand",
+    "ctrl+o expand",
     "F4 view",
     "ctrl+r rename",
     "F5 mouse",
@@ -66,7 +66,7 @@ const ATTACHMENT_DISMISS: &str = " · ctrl+x dismisses";
 const ATTACHMENT_READING: &str = "reading the clipboard…";
 
 /// Key hints while an agent's view is open: the way out is on its own header line.
-const WORKER_HINTS: [&str; 4] = ["F4 toggle", "ctrl+0 expand", "F5 mouse", "ctrl+d quit"];
+const WORKER_HINTS: [&str; 4] = ["F4 toggle", "ctrl+o expand", "F5 mouse", "ctrl+d quit"];
 
 /// The same line while the rename prompt is open: nothing else takes a key then.
 const RENAME_HINTS: [&str; 2] = ["enter accept", "esc cancel"];

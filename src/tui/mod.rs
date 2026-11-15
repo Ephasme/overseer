@@ -137,8 +137,8 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         }
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
         KeyCode::F(5) => mouse(app)?,
-        // The verbosity flag is global, like the mouse: ctrl+0 works from a worker's view too.
-        KeyCode::Char('0') if ctrl => app.toggle_tool_output(),
+        // The verbosity flag is global, like the mouse: both keys work from a worker's view too.
+        KeyCode::Char('0' | 'o') if ctrl => app.toggle_tool_output(),
         // A menu in front of the caret takes esc first; a worker's view takes it next, stopping a
         // working agent and leaving when there is nothing to stop. The root is never a target: it
         // is the user's only voice.
@@ -244,18 +244,18 @@ mod tests {
         assert!(queue.try_recv().is_err(), "a key pressed in an agent view wakes the core");
     }
 
-    /// Ctrl+0 opens every tool card; a bare 0 is still a digit.
+    /// Ctrl+o and ctrl+0 both open every tool card; a bare o or 0 is still typed.
     #[test]
-    fn ctrl_0_flips_the_tool_output_flag_and_a_bare_0_does_not() {
+    fn ctrl_o_and_ctrl_0_flip_the_tool_output_flag_and_a_bare_key_does_not() {
         let mut app = App::new("m");
         let before = app.tool_output;
+        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_ne!(app.tool_output, before, "ctrl+o expands or collapses every tool card");
         press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
-        assert_ne!(app.tool_output, before, "ctrl+0 expands or collapses every tool card");
-        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::CONTROL);
-        assert_eq!(app.tool_output, before, "the same key toggles it back");
-        press_with(&mut app, KeyCode::Char('0'), KeyModifiers::NONE);
-        assert_eq!(app.tool_output, before, "a bare 0 never flips the flag");
-        assert_eq!(app.take_prompt(), "0", "a bare 0 types a digit into the composer");
+        assert_eq!(app.tool_output, before, "ctrl+0 toggles the same flag back");
+        press_with(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(app.tool_output, before, "a bare o never flips the flag");
+        assert_eq!(app.take_prompt(), "o", "a bare o types an o into the composer");
     }
 
     fn press(app: &mut App, code: KeyCode) {
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(app.take_prompt(), "/", "the 0 never reached the composer");
     }
 
-    /// F3 and ctrl+o no longer expand: ctrl+0 is the one key that does.
+    /// F3 no longer expands: the two control keys do.
     #[test]
     fn f3_no_longer_toggles_expansion() {
         let mut app = App::new("m");
