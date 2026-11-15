@@ -12,6 +12,8 @@ pub(crate) const MESSAGE_AGENT: &str = "message_agent";
 pub(crate) const CONTROL_AGENT: &str = "control_agent";
 pub(crate) const LIST_AGENTS: &str = "list_agents";
 pub(crate) const LIST_REPOS: &str = "list_repos";
+/// A grant, not a tool: it lets the holder pass `free: true` to `spawn_agent`.
+pub(crate) const FREE_SPAWN: &str = "free_spawn";
 
 /// The progress-note and closing tools live with the file tools: a policy refuses calls, and the
 /// policy must not depend on this module.
@@ -29,6 +31,7 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     CONTROL_AGENT,
     LIST_AGENTS,
     LIST_REPOS,
+    FREE_SPAWN,
     tools::REPLY,
     tools::CLOSE,
 ];
@@ -119,7 +122,8 @@ fn swarm_tool_definitions() -> Vec<Value> {
         "properties": {
             "profile": {"type": "string", "description": "The profile the new agent runs, from the catalogue your prompt lists. It fixes its model, its effort and its rights."},
             "path": {"type": "string", "description": "Directory the agent works in; relative paths resolve there. Defaults to your own directory."},
-            "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."}
+            "task": {"type": "string", "description": "Complete, self-contained instructions. The agent sees nothing else."},
+            "free": {"type": "boolean", "description": "Spawn with the child profile's policy instead of the intersection with your own. Requires the free_spawn grant."}
         },
         "required": ["task", "profile"]
     });
@@ -248,7 +252,7 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
     if may_spawn {
         let _ = write!(
             out,
-            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. A worker's child keeps only the tools its owner also has; a supervisor's child gets its profile's rights alone.\n<profiles>\n{}\n</profiles>\n",
+            "Profiles for your sub-agents: pass `profile` to `spawn_agent`, or read `profile://<name>` for the full file. A child gets the intersection of your tool list and its profile's, unless you hold the free_spawn grant and pass `free: true`, which gives it its profile's rights.\n<profiles>\n{}\n</profiles>\n",
             facts.profiles.catalogue()
         );
     }

@@ -216,10 +216,19 @@ impl Policy {
     /// The rights paragraph an agent reads in its prompt.
     pub(crate) fn describe(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
-        if self.allow_tools.is_empty() {
+        // A grant has no schema and no call, so it is not part of the list a model can invoke.
+        let callable: Vec<&str> =
+            self.allow_tools.iter().map(String::as_str).filter(|tool| *tool != crate::prompt::FREE_SPAWN).collect();
+        if callable.is_empty() {
             lines.push("- tools you may call: none — you can only think and answer.".into());
         } else {
-            lines.push(format!("- tools you may call: {}.", self.allow_tools.join(" ")));
+            lines.push(format!("- tools you may call: {}.", callable.join(" ")));
+        }
+        if grants(&self.allow_tools, crate::prompt::FREE_SPAWN) {
+            lines.push(
+                "- free_spawn: a child you start with spawn_agent(free: true) gets its profile's rights, not the intersection with yours."
+                    .into(),
+            );
         }
         if self.read_only {
             lines.push(format!(
@@ -1240,6 +1249,19 @@ mod tests {
         assert!(grants(&owner.allow_tools, "mcp__slack_msg"));
         assert!(!grants(&owner.allow_tools, "mcp__slackbot_x"), "a prefix is not a grant");
         assert!(grants(&owner.allow_tools, "mcp__slack"), "the server entry grants the server's tools");
+    }
+
+    #[test]
+    fn a_grant_is_described_but_never_listed_as_callable() {
+        let alone = Policy { allow_tools: vec![crate::prompt::FREE_SPAWN.into()], ..Policy::default() };
+        let text = alone.describe();
+        assert!(text.contains("- tools you may call: none — you can only think and answer."), "{text}");
+        assert!(text.contains("- free_spawn: a child you start with spawn_agent(free: true)"), "{text}");
+        let mixed = Policy { allow_tools: vec![BASH.into(), crate::prompt::FREE_SPAWN.into()], ..Policy::default() };
+        let text = mixed.describe();
+        assert!(text.contains("- tools you may call: bash."), "{text}");
+        assert!(!text.contains("tools you may call: bash free_spawn"), "{text}");
+        assert!(text.contains("- free_spawn:"), "{text}");
     }
 
     #[test]

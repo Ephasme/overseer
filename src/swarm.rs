@@ -65,10 +65,12 @@ const IDLE_POLL: Duration = Duration::from_millis(50);
 /// Arguments of each overseer tool. `deny_unknown_fields` turns a wrong key into an error naming the right ones.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnArgs {
-    path: Option<String>,
-    task: String,
-    profile: String,
+pub(crate) struct SpawnArgs {
+    pub(crate) path: Option<String>,
+    pub(crate) task: String,
+    pub(crate) profile: String,
+    #[serde(default)]
+    pub(crate) free: bool,
 }
 
 #[derive(Deserialize)]
@@ -893,7 +895,7 @@ impl Swarm {
     /// The policy is merged under the tree lock, before the thread exists: nothing can change it
     /// afterwards. The log file is opened and the thread started with that lock released, because
     /// both block and every other agent's dispatch, the session's events and `snapshot()` wait on it.
-    fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
+    pub(crate) fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
         let _reserved = spawning();
         let (depth, dir, home, id, log_path, control, llm, sender, profile, role) = {
             let tree = lock(swarm);
@@ -914,12 +916,22 @@ impl Swarm {
             profile.tools(prompt::GRANTABLE_TOOLS)?;
             let llm = tree.models.get(profile.model.as_deref(), effort);
             let control = Arc::new(Control::default());
-            // A worker tightens: its child gets the intersection of the two tool lists. A supervisor
-            // is exempt, so it can start agents with more rights than itself.
-            let policy = if parent.role == profiles::Role::Supervisor {
+            // A child tightens to the intersection of the two tool lists, unless its owner holds the
+            // `free_spawn` grant and asks for the child profile's own policy.
+            let parent_policy = parent.role.restrict(&parent.control.policy());
+            if !tools::grants(&parent_policy.allow_tools, prompt::SPAWN_AGENT) {
+                return Err(format!("spawn_agent is not granted to {}", parent.label()));
+            }
+            let policy = if args.free {
+                if !tools::grants(&parent_policy.allow_tools, prompt::FREE_SPAWN) {
+                    return Err(format!(
+                        "free_spawn is not granted to {}; grant free_spawn in its profile to spawn with the child profile's rights",
+                        parent.label()
+                    ));
+                }
                 profile.policy.clone()
             } else {
-                parent.control.policy().inherit(&profile.policy)
+                parent_policy.inherit(&profile.policy)
             };
             control.set_policy(policy);
             let dir = args.path.clone().unwrap_or_else(|| parent.working_dir.display().to_string());
@@ -1805,17 +1817,65 @@ mod tests {
     }
 
     #[test]
-    fn a_child_may_have_more_rights_than_the_supervisor() {
+    fn a_free_spawn_lets_the_supervisor_start_a_writer() {
         let h = harness_full(Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))), &[]);
         tool(
             &h.swarm,
             Swarm::ROOT,
             prompt::SPAWN_AGENT,
-            &json!({"path": h.repo, "task": "build", "profile": "worker"}),
+            &json!({"path": h.repo, "task": "build", "profile": "worker", "free": true}),
         );
         let child = h.swarm.lock().unwrap().agent(2).unwrap().control.policy();
         assert!(child.allow_tools.iter().any(|tool| tool == tools::WRITE_FILE));
         assert!(child.refuse(tools::WRITE_FILE, &json!({"path": "x", "content": ""}).to_string()).is_none());
+    }
+
+    #[test]
+    fn a_free_spawn_requires_the_grant() {
+        let lead = "description: Leads.\nallow_tools: [bash, read_file, spawn_agent]";
+        let writer = "description: Writes.\nallow_tools: [bash, read_file, write_file]";
+        let h = harness_full(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[("lead", lead), ("writer", writer)],
+        );
+        tool(&h.swarm, Swarm::ROOT, prompt::SPAWN_AGENT, &json!({"path": h.repo, "task": "lead", "profile": "lead"}));
+        let refused =
+            tool(&h.swarm, 2, prompt::SPAWN_AGENT, &json!({"task": "write", "profile": "writer", "free": true}));
+        assert!(refused.contains("free_spawn is not granted"), "{refused}");
+        assert_eq!(h.swarm.lock().unwrap().snapshot().len(), 2, "a refused spawn adds no agent");
+    }
+
+    #[test]
+    fn a_worker_with_free_spawn_can_start_a_writer() {
+        let lead = "description: Leads.\nallow_tools: [bash, read_file, spawn_agent, free_spawn]";
+        let writer = "description: Writes.\nallow_tools: [bash, read_file, write_file]";
+        let h = harness_full(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[("lead", lead), ("writer", writer)],
+        );
+        tool(
+            &h.swarm,
+            Swarm::ROOT,
+            prompt::SPAWN_AGENT,
+            &json!({"path": h.repo, "task": "lead", "profile": "lead", "free": true}),
+        );
+        tool(&h.swarm, 2, prompt::SPAWN_AGENT, &json!({"task": "write", "profile": "writer", "free": true}));
+        let child = h.swarm.lock().unwrap().agent(3).unwrap().control.policy();
+        assert!(child.allow_tools.iter().any(|tool| tool == tools::WRITE_FILE), "{:?}", child.allow_tools);
+    }
+
+    #[test]
+    fn without_free_the_child_is_still_an_intersection() {
+        let writer = "description: Writes.\nallow_tools: [bash, read_file, write_file]";
+        let h = harness_full(Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))), &[("writer", writer)]);
+        tool(
+            &h.swarm,
+            Swarm::ROOT,
+            prompt::SPAWN_AGENT,
+            &json!({"path": h.repo, "task": "write", "profile": "writer"}),
+        );
+        let child = h.swarm.lock().unwrap().agent(2).unwrap().control.policy();
+        assert!(!child.allow_tools.iter().any(|tool| tool == tools::WRITE_FILE), "{:?}", child.allow_tools);
     }
 
     #[test]
@@ -1867,7 +1927,13 @@ mod tests {
     }
 
     fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, dir: &Path, task: &str) -> String {
-        tool(swarm, caller, prompt::SPAWN_AGENT, &json!({"path": dir, "task": task, "profile": "orchestrator"}))
+        // The built-in supervisor holds `free_spawn`; nothing else does, so only its spawns pass it.
+        tool(
+            swarm,
+            caller,
+            prompt::SPAWN_AGENT,
+            &json!({"path": dir, "task": task, "profile": "orchestrator", "free": caller == Swarm::ROOT}),
+        )
     }
 
     /// The label an agent id always gets: every expectation below is built from it, so no test
@@ -2583,7 +2649,7 @@ mod tests {
             &h.swarm,
             Swarm::ROOT,
             prompt::SPAWN_AGENT,
-            &json!({"path": h.repo, "task": "write", "profile": "solo"}),
+            &json!({"path": h.repo, "task": "write", "profile": "solo", "free": true}),
         );
         assert_eq!(started, format!("{} started", codename(2)));
         // `solo` grants bash to nobody, so its `bash` call is refused before it ever runs.
