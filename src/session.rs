@@ -33,16 +33,8 @@ pub(crate) fn run(
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
-    let swarm = Arc::new(Mutex::new(Swarm::new(
-        models,
-        profiles,
-        cfg.roots.clone(),
-        cfg.home.clone(),
-        log_dir,
-        input,
-        cfg.max_depth,
-        Arc::clone(&mcp),
-    )));
+    let swarm =
+        Arc::new(Mutex::new(Swarm::new(models, profiles, Arc::new(cfg.clone()), log_dir, input, Arc::clone(&mcp))));
     if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
         let _ = ui.send(UiEvent::Error(e.clone()));
         tools::kill_running();
@@ -130,6 +122,9 @@ pub(crate) fn run(
             Event::Thought { id, text } => {
                 let _ = ui.send(UiEvent::AgentThought { id, text });
             }
+            Event::Out { id, text } => {
+                let _ = ui.send(UiEvent::Out { id, text });
+            }
             Event::TurnStart { id } => {
                 let _ = ui.send(UiEvent::Boundary { id });
             }
@@ -143,7 +138,7 @@ pub(crate) fn run(
             Event::Agent { id, kind, text } => {
                 let (agents, busy) = {
                     let mut tree = lock(&swarm);
-                    tree.finish_turn(id, kind);
+                    tree.finish_turn(id, kind, &text);
                     tree.deliver(id, kind, &text);
                     (tree.snapshot(), tree.busy())
                 };

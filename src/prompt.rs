@@ -70,6 +70,47 @@ fn function_name(tool: &Value) -> Option<&str> {
     tool.get("function")?.get("name")?.as_str()
 }
 
+/// The names of every tool this caller is offered, in the order the `tools` array lists them.
+pub(crate) fn tool_names(mcp: &mcp::Registry, policy: &tools::Policy, remaining_depth: usize) -> Vec<String> {
+    agent_tool_definitions(mcp, policy, remaining_depth)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| function_name(tool).map(ToString::to_string))
+        .collect()
+}
+
+/// One line per tool: its name and the first line of its description, for `overseer://tools`.
+pub(crate) fn tool_summaries(mcp: &mcp::Registry, policy: &tools::Policy, remaining_depth: usize) -> Vec<String> {
+    agent_tool_definitions(mcp, policy, remaining_depth)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            let description = function.get("description").and_then(Value::as_str).unwrap_or_default();
+            Some(format!("{name}: {}", description.lines().next().unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// One tool's schema as pretty JSON, or why no tool of this caller answers to the name.
+pub(crate) fn schema(
+    name: &str,
+    mcp: &mcp::Registry,
+    policy: &tools::Policy,
+    remaining_depth: usize,
+) -> Result<String, String> {
+    let defs = agent_tool_definitions(mcp, policy, remaining_depth);
+    let found = defs.as_array().into_iter().flatten().find(|tool| function_name(tool) == Some(name));
+    let Some(tool) = found else {
+        return Err(format!("unknown tool {name}; tools are {}", tool_names(mcp, policy, remaining_depth).join(", ")));
+    };
+    let function = tool.get("function").cloned().unwrap_or_else(|| tool.clone());
+    serde_json::to_string_pretty(&function).map_err(|e| format!("{name}: {e}"))
+}
+
 /// The tools an agent commands the tree with, and the two that end its own turn.
 fn swarm_tool_definitions() -> Vec<Value> {
     let spawn = json!({

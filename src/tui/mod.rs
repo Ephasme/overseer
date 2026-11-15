@@ -208,7 +208,7 @@ fn copy(app: &mut App, pasted: &Sender<Copied>) {
     let Some(id) = app.begin_paste() else { return };
     let sender = pasted.clone();
     std::thread::spawn(move || {
-        let found = clipboard::read();
+        let found = clipboard::paste();
         // The loop drops this receiver when it ends, and then there is nobody left to tell.
         let _ = sender.send((id, found));
     });

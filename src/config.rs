@@ -19,7 +19,7 @@ struct RawConfig {
     dir: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     /// Directories scanned for repositories by `list_repos` and listed in the overseer prompt; not a sandbox.
     pub(crate) roots: Vec<PathBuf>,
@@ -58,6 +58,50 @@ impl Theme {
             other => bail!("theme {other:?} is not auto, dark, light or mono"),
         }
     }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Mono => "mono",
+        }
+    }
+}
+
+/// The settings one key at a time, in the order [`value`] accepts them; `base_url` is redacted.
+pub(crate) fn describe(cfg: &Config) -> String {
+    SETTINGS
+        .iter()
+        .map(|key| format!("{key} = {}", value(cfg, key).unwrap_or_default()))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
+pub(crate) const SETTINGS: &[&str] = &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir"];
+
+/// One effective setting, or why the key names none.
+pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
+    let text = match key {
+        "roots" => cfg.roots.iter().map(|root| root.display().to_string()).collect::<Vec<String>>().join(", "),
+        "base_url" => redact(&cfg.base_url),
+        "model" => cfg.model.clone(),
+        "theme" => cfg.theme.name().to_string(),
+        "max_depth" => cfg.max_depth.to_string(),
+        "dir" => cfg.dir.display().to_string(),
+        "home" => cfg.home.display().to_string(),
+        "state_dir" => state_dir(&cfg.home).display().to_string(),
+        other => return Err(format!("unknown setting {other}; settings are {}", SETTINGS.join(", "))),
+    };
+    Ok(text)
+}
+
+/// `url` with the userinfo of its authority replaced by `***`: a base URL is shown, its secret is not.
+fn redact(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let (authority, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let Some((_, host)) = authority.rsplit_once('@') else { return url.to_string() };
+    format!("{scheme}://***@{host}{tail}")
 }
 
 /// The user's home directory; an unset or empty `HOME` is an error, not a relative path.

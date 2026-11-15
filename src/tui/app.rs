@@ -1250,6 +1250,11 @@ impl App {
                 self.worker_stream_mut(id).push(Entry::new(Role::You, String::new(), text));
                 self.note_unread(id);
             }
+            UiEvent::Out { id, text } => {
+                // The agent wrote this for the user: it lands in the lead's transcript, as prose.
+                let body = format!("agent {id} · {}:\n\n{text}", self.name(id));
+                self.push(Role::Model, String::new(), body);
+            }
             UiEvent::Agents(agents) => {
                 // A child that just joined gets a stream of its own and one line in the lead's. The
                 // root already writes into the lead's stream, so it gets neither.

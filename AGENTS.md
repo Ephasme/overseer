@@ -45,6 +45,12 @@
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
 | `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in profiles, the `Role` that narrows one, and the text `profile://` reads |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
+| `src/artifacts.rs` | tool output too large for one result, kept per process and read back by `artifact://` |
+| `src/jobs.rs` | background `bash` commands, their pipes and process groups, behind `proc://` |
+| `src/memory.rs` | per-project notes under the state directory, behind `memory://` |
+| `src/vault.rs` | the `.env` credential file, behind `vault://` |
+| `src/rules.rs` | the instruction files that govern a directory, behind `rule://` |
+| `src/forge.rs` | `gh` and `glab` invocations, behind `issue://`, `pr://` and `mr://` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
 | `src/config.rs` | `config.toml`, roots, `max_depth`, the root's `dir`, `home`, `resolve_dir`, state directory, `io_error` |
@@ -67,9 +73,9 @@
 - `spawn_agent` requires a profile, so every agent's rights have one place to be read; `worker` is the generalist (code, configuration, commands).
 - `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
-- A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme is activated by giving it handlers in that table, and its line then reaches the tool descriptions and `/schemes` on its own. A reserved name is invisible to models — refused in the same words as a name nobody ever wrote — so the roadmap cannot be read out of a prompt.
+- A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
-- Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build` or an MCP server outlives the process.
+- Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build`, a background `bash` job or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.
 - The core never prints: everything visible is a `UiEvent`, and only a frontend touches the terminal. `Event` is the other direction, frontend to core.
 - A model call reaches a view one way: `llm::StreamLlm` turns its pieces into `Event::Thought` and `Event::Delta`, and each becomes one entry appended to that agent's own `Stream`, in the order the call produced them. `Event::Instruction` opens a worker's stream, `Event::TurnStart` breaks it into paragraphs, and `Event::Progress` adds the tool card; nothing rewrites an entry already written, and a finished turn whose answer streamed is not written again. The core never feeds any of it back up the tree.
