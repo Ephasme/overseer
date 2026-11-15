@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en" class="dark" data-theme="dark" style="color-scheme: dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>overseer roadmap: features by priority</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/basecoat-css@1.0.2/dist/basecoat.cdn.min.css">
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --fg: #ededef;
+    --muted: #8f8f99;
+    --border: #26262b;
+    --surface: #121215;
+    --surface-2: #17171c;
+    --accent: #a5b4fc;
+    --accent-dim: #6366f1;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(165,180,252,.28); }
+  a:hover { border-bottom-color: var(--accent); }
+  code, .rm-mono { font-family: var(--mono); font-size: .88em; }
+  code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: .08em .34em; color: #e7e7ea; }
+  h1, h2, h3, h4 { line-height: 1.22; letter-spacing: -.01em; margin: 0; }
+  h1 { font-size: clamp(26px, 3.2vw, 40px); font-weight: 640; }
+  h2 { font-size: clamp(19px, 2vw, 25px); font-weight: 620; }
+  h3 { font-size: 15px; font-weight: 620; }
+  h2 code, h3 code, h4 code { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); }
+  p { margin: 0; }
+
+  .rm-topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(10,10,11,.92); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 10px clamp(20px, 4vw, 64px);
+    display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+  }
+  .rm-topbar .rm-brand { font-weight: 640; font-size: 14px; letter-spacing: -.01em; }
+  .rm-topbar nav { display: flex; gap: 2px; flex-wrap: wrap; }
+  .rm-topbar nav a { border: 0; padding: 3px 7px; border-radius: 6px; font-size: 12.5px; color: var(--muted); }
+  .rm-topbar nav a:hover { background: var(--surface-2); color: var(--fg); }
+
+  header.rm-hero { padding: clamp(28px, 4vw, 56px) clamp(20px, 4vw, 64px) clamp(20px, 3vw, 32px); border-bottom: 1px solid var(--border); }
+  .rm-eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted); font-weight: 600; margin-bottom: 10px; }
+  .rm-hero h1 span { color: var(--muted); font-weight: 520; }
+  .rm-lede { margin-top: 12px; max-width: 118ch; color: #c9c9d1; }
+  .rm-meta-row { margin-top: 18px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+  main { padding: clamp(8px, 2vw, 16px) clamp(20px, 4vw, 64px) 120px; }
+  section.rm-block { padding: clamp(28px, 3.4vw, 48px) 0; border-bottom: 1px solid var(--border); scroll-margin-top: 56px; }
+  section.rm-block:last-of-type { border-bottom: 0; }
+  .rm-block-head { display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+  .rm-block-num { font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; }
+  .rm-block-sub { color: var(--muted); margin-bottom: 20px; max-width: 130ch; }
+
+  .rm-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 560; line-height: 1;
+    padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface); color: #b9b9c2; white-space: nowrap;
+  }
+  .rm-chip.rm-ok { color: var(--ok); border-color: rgba(74,222,128,.35); background: rgba(74,222,128,.09); }
+  .rm-chip.rm-warn { color: var(--warn); border-color: rgba(251,191,36,.35); background: rgba(251,191,36,.09); }
+  .rm-chip.rm-bad { color: var(--bad); border-color: rgba(248,113,113,.35); background: rgba(248,113,113,.09); }
+  .rm-chip.rm-accent { color: var(--accent); border-color: rgba(165,180,252,.4); background: rgba(99,102,241,.14); }
+  .rm-chip.rm-tier { font-family: var(--mono); letter-spacing: .02em; }
+
+  .rm-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 16px; }
+  .rm-grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); gap: 16px; }
+
+  .rm-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .rm-card > h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .rm-card .rm-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-dim); flex: none; }
+  .rm-card ul, .rm-card ol, .rm-callout ul, .rm-callout ol { margin: 0; padding-left: 20px; display: grid; gap: 7px; list-style: disc outside; }
+  .rm-card ol, .rm-callout ol { list-style: decimal outside; }
+  .rm-card li::marker, .rm-callout li::marker { color: #7d7d88; }
+  .rm-card li { color: #c2c2cb; }
+  .rm-card li::marker { color: #7d7d88; }
+  .rm-card p + p { margin-top: 8px; }
+  .rm-note { font-size: 13px; color: var(--muted); }
+  .rm-num { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; }
+  .rm-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0 10px; }
+  .rm-stats div { display: flex; flex-direction: column; gap: 3px; }
+  .rm-stats b { font-family: var(--mono); font-size: 21px; font-weight: 620; line-height: 1; letter-spacing: -.02em; }
+  .rm-stats b.rm-bad { color: var(--bad); } .rm-stats b.rm-warn { color: var(--warn); } .rm-stats b.rm-ok { color: var(--ok); }
+  .rm-stats span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .rm-num.rm-ok { color: var(--ok); } .rm-num.rm-warn { color: var(--warn); } .rm-num.rm-bad { color: var(--bad); }
+
+  .rm-tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead th {
+    text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 620; padding: 10px 12px;
+    border-bottom: 1px solid var(--border); background: var(--surface-2); white-space: nowrap;
+  }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: #141419; }
+  /* One grid for all four tier tables: the same column has to sit at the same x in every section. */
+  table.rm-matrix, table.rm-seq { table-layout: fixed; }
+  table.rm-matrix td, table.rm-matrix th, table.rm-seq td, table.rm-seq th { overflow-wrap: anywhere; }
+  table.rm-matrix td { min-width: 0; }
+  table.rm-matrix td.rm-scope { white-space: normal; }
+  table.rm-matrix thead th .rm-note, table.rm-seq thead th .rm-note { white-space: normal; }
+
+  td.rm-feat { font-weight: 600; color: #f2f2f5; min-width: 13ch; }
+  td.rm-scope { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  td.rm-field { font-family: var(--mono); font-size: 12px; white-space: nowrap; color: #a9a9b4; }
+  td.rm-state { min-width: 30ch; color: #c8c8d0; }
+  td.rm-next { min-width: 22ch; color: #a9a9b4; }
+  td code { padding: .05em .2em; }
+  td kbd, .rm-kbd { font-family: var(--mono); font-size: .86em; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 .3em; }
+  .rm-mark { font-family: var(--mono); font-size: 12.5px; letter-spacing: 1px; }
+  .rm-card p .rm-mark, .rm-callout .rm-mark { font-size: 1em; }
+  .rm-mark.rm-y { color: var(--ok); } .rm-mark.rm-p { color: var(--warn); } .rm-mark.rm-n { color: #7f7f8a; }
+
+  .rm-callout { border: 1px solid var(--border); border-left: 3px solid var(--accent-dim); border-radius: 0 var(--radius) var(--radius) 0; background: var(--surface); padding: 14px 18px; display: grid; gap: 8px; }
+  .rm-callout.rm-bad { border-left-color: var(--bad); }
+  .rm-callout.rm-warn { border-left-color: var(--warn); }
+  .rm-callout h3 { font-size: 14px; }
+  .rm-callout ul { margin: 0; padding-left: 18px; display: grid; gap: 7px; font-size: 14px; color: #c2c2cb; }
+
+  .rm-bar { height: 8px; border-radius: 999px; background: #24242a; overflow: hidden; display: flex; }
+  .rm-bar i { display: block; height: 100%; }
+  .rm-bar .rm-f { background: var(--ok); } .rm-bar .rm-p { background: var(--warn); } .rm-bar .rm-n { background: #3a3a43; }
+  .rm-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .rm-legend span { display: inline-flex; gap: 6px; align-items: center; }
+  .rm-sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .rm-sw.rm-f { background: var(--ok); } .rm-sw.rm-p { background: var(--warn); } .rm-sw.rm-n { background: #3a3a43; }
+
+  .rm-search { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .rm-search input {
+    width: min(46vw, 260px); padding: 5px 10px; font: inherit; font-size: 12.5px;
+    color: var(--fg); background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px;
+    outline: none; appearance: none;
+  }
+  .rm-search input::placeholder { color: #6f6f7a; }
+  .rm-search input:focus { border-color: var(--accent-dim); box-shadow: 0 0 0 3px rgba(99,102,241,.18); }
+  .rm-search input::-webkit-search-cancel-button { filter: invert(.7); }
+  .rm-count { font-family: var(--mono); font-size: 11.5px; color: var(--muted); min-width: 5ch; text-align: right; }
+  .rm-none { padding: 26px 0; color: var(--muted); }
+  .rm-none b { color: var(--fg); }
+  footer { padding: 26px clamp(20px, 4vw, 64px) 80px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  footer p + p { margin-top: 6px; }
+  @media (max-width: 760px) {
+    .rm-topbar nav { display: none; }
+    /* A six-column matrix is unreadable on a phone: stack each row into its own block. */
+    table.rm-matrix, table.rm-seq { table-layout: fixed; }
+  table.rm-matrix td, table.rm-matrix th, table.rm-seq td, table.rm-seq th { overflow-wrap: anywhere; }
+  table.rm-matrix td { min-width: 0; }
+  table.rm-matrix td.rm-scope { white-space: normal; }
+  .rm-tbl-wrap table, .rm-tbl-wrap thead, .rm-tbl-wrap tbody, .rm-tbl-wrap tr, .rm-tbl-wrap td, .rm-tbl-wrap th { display: block; }
+    .rm-tbl-wrap thead { display: none; }
+    .rm-tbl-wrap tbody tr { border-bottom: 1px solid var(--border); padding: 14px 14px 16px; }
+    .rm-tbl-wrap tbody tr:last-child { border-bottom: 0; }
+    .rm-tbl-wrap tbody td { border: 0; padding: 0; min-width: 0; }
+    .rm-tbl-wrap td.rm-feat { font-size: 14.5px; margin-bottom: 2px; }
+    .rm-tbl-wrap td.rm-scope { margin-bottom: 8px; }
+    .rm-tbl-wrap td.rm-field { display: none; }
+    .rm-tbl-wrap td:nth-child(4) { margin-bottom: 8px; }
+    .rm-tbl-wrap td.rm-state { margin-bottom: 8px; }
+    .rm-tbl-wrap td.rm-next::before { content: "Next · "; color: var(--muted); font-weight: 600; }
+  }
+</style>
+</head>
+<body>
+
+<div class="rm-topbar">
+  <span class="rm-brand">overseer roadmap</span>
+  <nav>
+    <a href="#method">Method</a>
+    <a href="#scoreboard">Scoreboard</a>
+    <a href="#p0">P0</a>
+    <a href="#p1">P1</a>
+    <a href="#p2">P2</a>
+    <a href="#p3">P3</a>
+    <a href="#sequence">Sequence</a>
+    <a href="#nongoals">Non-goals</a>
+  </nav>
+  <div class="rm-search">
+    <input id="q" type="search" autocomplete="off" spellcheck="false" aria-label="Filter the feature tables" placeholder="Filter features">
+    <span class="rm-count" id="qc" aria-live="polite"></span>
+  </div>
+</div>
+
+<header class="rm-hero">
+  <div class="rm-eyebrow">Feature inventory graded against the field</div>
+  <h1>overseer <span>·</span> what a good harness needs</h1>
+  <p class="rm-lede">
+    Every capability in <a href="harness-comparison.md">harness-comparison.md</a> — the same rows used to compare
+    omp, jcode, opencode and hermes — graded on two independent axes: how much a harness needs it, and how much of it
+    overseer already ships. Priority is a judgement about the market, not about this codebase; status is read off the
+    code, with the file and symbol named for every claim.
+  </p>
+  <div class="rm-meta-row">
+    <span class="rm-chip">graded 2026-11-15</span>
+    <span class="rm-chip">overseer 0.2.0 · 29 files · ~14.7k LOC</span>
+    <span class="rm-chip rm-accent">101 features</span>
+    <span class="rm-chip rm-ok">9 full</span>
+    <span class="rm-chip rm-warn">30 partial</span>
+    <span class="rm-chip rm-bad">62 none</span>
+  </div>
+</header>
+
+<main>
+
+<p class="rm-none" id="none" hidden>No feature matches that. <b>Esc</b> clears the filter.</p>
+
+<section class="rm-block" id="method">
+  <div class="rm-block-head"><span class="rm-block-num">00</span><h2>How to read this</h2></div>
+  <p class="rm-block-sub">Two axes, deliberately orthogonal. A P0 feature can be missing and a P3 feature can already be built.</p>
+  <div class="rm-grid-2">
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>Priority: why the feature matters at all</h3>
+      <ul>
+        <li><span class="rm-chip rm-tier">P0</span> Without it overseer cannot be someone's daily driver, or its central claim does not hold. Missing P0 is a bug, not a backlog item.</li>
+        <li><span class="rm-chip rm-tier">P1</span> Anyone assessing overseer against the incumbents will ask for it. Its absence is a real cost, not a fatal one.</li>
+        <li><span class="rm-chip rm-tier">P2</span> Differentiator. Worth building once P0 and P1 hold; each one is a reason to pick overseer over a rival.</li>
+        <li><span class="rm-chip rm-tier">P3</span> Optional. Build for a named user or not at all; several are better left unbuilt.</li>
+      </ul>
+    </div>
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>Status: how much is already there</h3>
+      <ul>
+        <li><span class="rm-chip rm-ok">FULL</span> Works end to end and a user gets the whole behaviour.</li>
+        <li><span class="rm-chip rm-warn">PARTIAL</span> Something ships, but a named piece is missing or refuses a realistic case.</li>
+        <li><span class="rm-chip rm-bad">NONE</span> Not in the code. Named where I looked, never inferred from silence.</li>
+      </ul>
+      <p class="rm-note">Evidence cites the file and the symbol or literal, not a line number: lines rot, names survive a refactor.</p>
+    </div>
+  </div>
+  <div class="rm-grid-2" style="margin-top:16px">
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>The <code>Field</code> column</h3>
+      <p>Four marks, in the order <span class="rm-mono">omp · jcode · opencode · hermes</span>, copied from the comparison doc:
+        <span class="rm-mark rm-y">✓</span> documented by the vendor, <span class="rm-mark rm-p">~</span> partial or caveated,
+        <span class="rm-mark rm-n">–</span> absent from the docs read. It tells table stakes from differentiators:
+        <span class="rm-mono">✓✓✓✓</span> is table stakes, <span class="rm-mono">–––✓</span> is one vendor's bet.</p>
+    </div>
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>What is graded</h3>
+      <p>66 matrix rows from the comparison doc, plus 35 features the second scouting pass surfaced beyond it
+        (hooks, plans, review UX, task environments, trust primitives, MCP client duties) and four
+        harness-engineering items. The matrix's <em>Language</em> row is dropped: it names an implementation
+        choice, not a capability, and overseer's answer is already fixed.</p>
+    </div>
+  </div>
+</section>
+
+<section class="rm-block" id="scoreboard">
+  <div class="rm-block-head"><span class="rm-block-num">01</span><h2>Scoreboard</h2></div>
+  <p class="rm-block-sub">Where the 101 graded items stand. A P0 with NONE is the only category that blocks a release.</p>
+  <div class="rm-grid-4"><div class="rm-card"><h3><span class="rm-chip rm-tier">P0</span> <span class="rm-note">the daily driver</span></h3><div class="rm-stats"><div><b class="rm-bad">5</b><span>missing</span></div><div><b class="rm-warn">8</b><span>partial</span></div><div><b class="rm-ok">7</b><span>full</span></div></div><div class="rm-bar"><i class="rm-f" style="width:35.0%"></i><i class="rm-p" style="width:40.0%"></i><i class="rm-n" style="width:25.0%"></i></div><p class="rm-note" style="margin-top:10px">Every missing row here is a reason a first user leaves.</p></div><div class="rm-card"><h3><span class="rm-chip rm-tier">P1</span> <span class="rm-note">what the incumbents set</span></h3><div class="rm-stats"><div><b class="rm-bad">17</b><span>missing</span></div><div><b class="rm-warn">12</b><span>partial</span></div><div><b class="rm-ok">2</b><span>full</span></div></div><div class="rm-bar"><i class="rm-f" style="width:6.5%"></i><i class="rm-p" style="width:38.7%"></i><i class="rm-n" style="width:54.8%"></i></div><p class="rm-note" style="margin-top:10px">The gaps a reader of the comparison doc will spot immediately.</p></div><div class="rm-card"><h3><span class="rm-chip rm-tier">P2</span> <span class="rm-note">differentiators</span></h3><div class="rm-stats"><div><b class="rm-bad">20</b><span>missing</span></div><div><b class="rm-warn">7</b><span>partial</span></div><div><b class="rm-ok">0</b><span>full</span></div></div><div class="rm-bar"><i class="rm-p" style="width:25.9%"></i><i class="rm-n" style="width:74.1%"></i></div><p class="rm-note" style="margin-top:10px">Where the tool reach and the tree can beat the field.</p></div><div class="rm-card"><h3><span class="rm-chip rm-tier">P3</span> <span class="rm-note">optional</span></h3><div class="rm-stats"><div><b class="rm-bad">20</b><span>missing</span></div><div><b class="rm-warn">3</b><span>partial</span></div><div><b class="rm-ok">0</b><span>full</span></div></div><div class="rm-bar"><i class="rm-p" style="width:13.0%"></i><i class="rm-n" style="width:87.0%"></i></div><p class="rm-note" style="margin-top:10px">Named so they can be refused out loud.</p></div></div>
+  <div class="rm-grid-2" style="margin-top:16px">
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>Coverage by scope</h3>
+      <div class="rm-tbl-wrap" style="border:0;background:transparent">
+        <table><thead><tr><th>Scope</th><th>Full</th><th>Partial</th><th>None</th><th style="width:34%"></th></tr></thead>
+        <tbody><tr><td>runtime</td><td>1</td><td>3</td><td>3</td><td><div class="rm-bar"><i class="rm-f" style="width:14.3%"></i><i class="rm-p" style="width:42.9%"></i><i class="rm-n" style="width:42.9%"></i></div></td></tr>
+<tr><td>clients</td><td>1</td><td>1</td><td>4</td><td><div class="rm-bar"><i class="rm-f" style="width:16.7%"></i><i class="rm-p" style="width:16.7%"></i><i class="rm-n" style="width:66.7%"></i></div></td></tr>
+<tr><td>providers</td><td>1</td><td>2</td><td>3</td><td><div class="rm-bar"><i class="rm-f" style="width:16.7%"></i><i class="rm-p" style="width:33.3%"></i><i class="rm-n" style="width:50.0%"></i></div></td></tr>
+<tr><td>tools</td><td>0</td><td>4</td><td>7</td><td><div class="rm-bar"><i class="rm-p" style="width:36.4%"></i><i class="rm-n" style="width:63.6%"></i></div></td></tr>
+<tr><td>safety</td><td>0</td><td>3</td><td>4</td><td><div class="rm-bar"><i class="rm-p" style="width:42.9%"></i><i class="rm-n" style="width:57.1%"></i></div></td></tr>
+<tr><td>context</td><td>1</td><td>4</td><td>7</td><td><div class="rm-bar"><i class="rm-f" style="width:8.3%"></i><i class="rm-p" style="width:33.3%"></i><i class="rm-n" style="width:58.3%"></i></div></td></tr>
+<tr><td>agents</td><td>3</td><td>1</td><td>2</td><td><div class="rm-bar"><i class="rm-f" style="width:50.0%"></i><i class="rm-p" style="width:16.7%"></i><i class="rm-n" style="width:33.3%"></i></div></td></tr>
+<tr><td>interop</td><td>0</td><td>2</td><td>4</td><td><div class="rm-bar"><i class="rm-p" style="width:33.3%"></i><i class="rm-n" style="width:66.7%"></i></div></td></tr>
+<tr><td>sessions</td><td>0</td><td>0</td><td>6</td><td><div class="rm-bar"><i class="rm-n" style="width:100.0%"></i></div></td></tr>
+<tr><td>automation</td><td>0</td><td>0</td><td>7</td><td><div class="rm-bar"><i class="rm-n" style="width:100.0%"></i></div></td></tr>
+<tr><td>hooks</td><td>0</td><td>0</td><td>2</td><td><div class="rm-bar"><i class="rm-n" style="width:100.0%"></i></div></td></tr>
+<tr><td>review</td><td>0</td><td>0</td><td>3</td><td><div class="rm-bar"><i class="rm-n" style="width:100.0%"></i></div></td></tr>
+<tr><td>plans</td><td>0</td><td>1</td><td>1</td><td><div class="rm-bar"><i class="rm-p" style="width:50.0%"></i><i class="rm-n" style="width:50.0%"></i></div></td></tr>
+<tr><td>ux</td><td>0</td><td>5</td><td>1</td><td><div class="rm-bar"><i class="rm-p" style="width:83.3%"></i><i class="rm-n" style="width:16.7%"></i></div></td></tr>
+<tr><td>environment</td><td>0</td><td>0</td><td>1</td><td><div class="rm-bar"><i class="rm-n" style="width:100.0%"></i></div></td></tr>
+<tr><td>trust</td><td>0</td><td>2</td><td>3</td><td><div class="rm-bar"><i class="rm-p" style="width:40.0%"></i><i class="rm-n" style="width:60.0%"></i></div></td></tr>
+<tr><td>mcp</td><td>0</td><td>1</td><td>3</td><td><div class="rm-bar"><i class="rm-p" style="width:25.0%"></i><i class="rm-n" style="width:75.0%"></i></div></td></tr>
+<tr><td>engineering</td><td>2</td><td>1</td><td>1</td><td><div class="rm-bar"><i class="rm-f" style="width:50.0%"></i><i class="rm-p" style="width:25.0%"></i><i class="rm-n" style="width:25.0%"></i></div></td></tr></tbody></table>
+      </div>
+      <div class="rm-legend"><span><i class="rm-sw rm-f"></i>full</span><span><i class="rm-sw rm-p"></i>partial</span><span><i class="rm-sw rm-n"></i>none</span></div>
+    </div>
+    <div class="rm-card">
+      <h3><span class="rm-dot"></span>What the shape says</h3>
+      <ul>
+<li><b>Full where it was designed</b>: the tree (spawn, message, control, profiles), the TUI, the offline test suite and the release pipeline are the four places the code is finished rather than started.</li>
+<li><b>Partial where a shell substitutes for a tool</b>: read, edit, search and code execution all work through <code>bash</code> and <code>write_file</code>, so a user gets the behaviour while the model pays for it in rounds and tokens.</li>
+<li><b>Missing where the harness needs a spine</b>: nothing persists, nothing is counted, nothing is gated. Those three properties cut across nine scopes, which is why the sequence below starts there rather than at any single feature.</li>
+<li><b>The matrix flatters breadth and hides this</b>: overseer grades well on the rows a comparison table can express and poorly on the ones that decide whether a week of work survives a crash.</li>
+</ul>
+    </div>
+  </div>
+</section>
+
+<section class="rm-block" id="p0">
+  <div class="rm-block-head"><span class="rm-block-num">02</span><h2>P0 — the daily driver</h2><span class="rm-chip rm-bad">5 missing</span><span class="rm-chip rm-warn">8 partial</span></div>
+  <p class="rm-block-sub">Without every row here, overseer is a demo. The gaps are ranked by what a first serious user hits first.</p>
+  <div class="rm-tbl-wrap"><table class="rm-matrix">
+    <colgroup><col style="width:17%"><col style="width:8%"><col style="width:11%"><col style="width:8%"><col style="width:37%"><col style="width:19%"></colgroup>
+    <thead><tr><th>Feature</th><th>Scope</th><th title="omp · jcode · opencode · hermes, in that order">Field</th><th>Status</th><th>Current state</th><th>Next step</th></tr></thead>
+    <tbody><tr><td class="rm-feat">Cost control</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing accounts for tokens: the stream chunk type drops <code>usage</code>, so even the provider's own counts are discarded. The only bounds are 200 tool rounds, a 600 s request timeout and a 300 s bash kill.</td><td class="rm-next">Parse <code>usage</code> into per-agent and per-session totals, then <code>--max-cost</code>/<code>--warn-cost</code> stopping the fleet.</td></tr>
+<tr><td class="rm-feat">Approval model</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No prompt exists. Tools run unattended; a <code>Policy</code> set at spawn (<code>read_only</code>, <code>deny_tools</code>, <code>allow_commands</code>, <code>deny_commands</code>) is the only gate, and it is fixed for the agent's life.</td><td class="rm-next">One tiered gate on <code>bash</code> and <code>write_file</code> (ask / cached-ask / write / yolo) answered in the TUI, because a fleet with no gate cannot be pointed at a real repository.</td></tr>
+<tr><td class="rm-feat">Instruction files</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The harness reads no AGENTS.md, CLAUDE.md or rule file: the tree it starts in is never consulted for instructions. A user's project conventions only reach a model if someone types them.</td><td class="rm-next">Load AGENTS.md/CLAUDE.md from the root's directory up to the repository root, plus one file per configured root, cached per agent at thread start.</td></tr>
+<tr><td class="rm-feat">Compaction</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">History grows until the provider refuses it; then the turn fails and <code>agent.rs</code> truncates the history back to the turn's starting point. Nothing summarises, counts tokens or measures the window.</td><td class="rm-next">Token accounting per request from the provider's <code>usage</code>, then summarise-and-keep-N at a configurable threshold, which is also the prerequisite for cost control.</td></tr>
+<tr><td class="rm-feat">Resume</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">A session ends with the process. <code>/resume &lt;id&gt;</code> exists but only retasks a live agent; the per-run logs are write-only and nothing reads them back.</td><td class="rm-next">Session persistence and <code>-c</code>/<code>-r</code>, building on the state-store row: today a crash loses the whole fleet's work.</td></tr>
+<tr><td class="rm-feat">State store</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Per-run directory of plaintext per-agent logs under <code>$XDG_STATE_HOME/overseer/sessions/</code>; nothing is read back, so a killed session leaves logs, not a resumable state.</td><td class="rm-next">Machine-readable session record (JSONL per session) written as the turn runs, as the substrate for resume, search and export.</td></tr>
+<tr><td class="rm-feat">Headless / print</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Redirecting stdin/stdout, or <code>OVERSEER_PLAIN=1</code>, gives line mode: one prompt per stdin line, answers on stdout, agent activity on stderr, exit at EOF once idle.</td><td class="rm-next"><code>-p</code>/<code>--print</code> taking the prompt as an argument and <code>--mode json</code> emitting structured events, so CI can consume results without parsing prose.</td></tr>
+<tr><td class="rm-feat">Read</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>read_file(path)</code>: whole UTF-8 file capped at 28 000 bytes. <code>skill://</code>, <code>profile://</code> and <code>conflict://</code> resolve through the same call.</td><td class="rm-next">Line ranges (<code>offset</code>/<code>limit</code>) and binary-aware reads; without them a large file costs a truncation notice and a shell workaround.</td></tr>
+<tr><td class="rm-feat">Edit</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>write_file</code> creates or overwrites whole files atomically-by-rename for conflicts but plain <code>fs::write</code> otherwise. The <code>conflict://</code> registry splices merge markers only, which is the one surgical edit.</td><td class="rm-next">A patch/hashline edit that changes named lines without rewriting the file, so a model does not have to hold the whole file to touch one line.</td></tr>
+<tr><td class="rm-feat">Search</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">No search tool: agents run <code>rg</code>/<code>grep</code>/<code>git grep</code> through <code>bash</code>, and the prompt teaches exactly that. Read-only agents may still run them.</td><td class="rm-next">A structured <code>glob</code>/<code>grep</code> pair returning paths and line ranges, so search survives a shell-less policy.</td></tr>
+<tr><td class="rm-feat">Code execution</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>bash</code> runs one <code>sh -c</code> per call in its own process group, 300 s cap, 30 KB per stream, sequential within a message. Nothing survives the call: a backgrounded child is killed after a drain grace.</td><td class="rm-next">A persistent kernel (Python, then Bun) with a tool bridge, which turns a 20-call pipeline into one call; also the precondition for async jobs.</td></tr>
+<tr><td class="rm-feat">Run bounds</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">200 tool rounds per turn, 600 s per request, 300 s per command. No session-level wall-clock or spend ceiling, so the only thing bounding a runaway fleet is the user watching it.</td><td class="rm-next"><code>--max-time</code> and <code>--max-cost</code> checked before every model call and every tool call, the same place the urgent flag is read.</td></tr>
+<tr><td class="rm-feat">MCP</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">stdio and Streamable-HTTP servers from <code>~/.overseer/agent/mcp.json</code>, tools exposed as <code>mcp__&lt;server&gt;_&lt;tool&gt;</code>, per-server timeout/cwd/env/headers, <code>${VAR}</code> and <code>!command</code> secret resolution, OAuth login with refresh, <code>/mcp</code> status, process groups killed on quit.</td><td class="rm-next">A project-level <code>.mcp.json</code> and the importers below; today the one home file is the whole surface.</td></tr>
+<tr><td class="rm-feat">Session process model</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">One process per session: <code>main</code> picks the frontend, a core thread owns the <code>Swarm</code> tree, one detached thread per agent on blocking <code>reqwest</code>; two mpsc channels carry <code>Event</code> in and <code>UiEvent</code> out.</td><td class="rm-next">—</td></tr>
+<tr><td class="rm-feat">TUI</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">ratatui UI: Markdown prose, agent panel (F2), per-agent views with own scrollback (F4/click), slash completion, tool cards (<kbd>ctrl+o</kbd>), prompt recall, rename (<kbd>ctrl+r</kbd>), mouse handback (F5), drag-resizable persisted panel, clipboard paste, three themes plus <code>NO_COLOR</code>.</td><td class="rm-next">Least: LaTeX and mermaid in prose, a renderer preview (<code>omp gallery</code>).</td></tr>
+<tr><td class="rm-feat">Custom OpenAI-compatible endpoint</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">Any bearer chat-completions server via <code>base_url</code> + <code>model</code>, streaming SSE with a non-SSE fallback, <code>reasoning_effort</code> passthrough, provider error bodies surfaced truncated.</td><td class="rm-next">Azure-style <code>api-key</code>/<code>api-version</code> endpoints and a non-Bearer auth scheme are the only reachable gaps.</td></tr>
+<tr><td class="rm-feat">Subagents</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state"><code>spawn_agent</code> starts a child under the caller's rights with a profile, a directory and a self-contained task, returns its id immediately, and delivers its final answer as a completion message. <code>max_depth</code> (default 3) bounds the tree and a spawn past it is refused.</td><td class="rm-next">—</td></tr>
+<tr><td class="rm-feat">Cross-agent messaging</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state"><code>message_agent</code> queues a follow-up (<code>urgent</code> cuts the running turn, killing its command), <code>reply</code> sends a progress note up without ending the turn, <code>control_agent</code> pauses, resumes or stops a subtree.</td><td class="rm-next">Peers cannot talk: messaging is strictly parent↔child, so two workers solving one interface must route through the root.</td></tr>
+<tr><td class="rm-feat">Release and distribution</td><td class="rm-scope">engineering</td><td class="rm-field"><span class="rm-mark rm-n" title="not a matrix row">—</span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">Homebrew tap, prebuilt binaries for Apple silicon, Intel Mac and static Linux, a <code>v*</code> tag gated on the same checks as a PR, and a formula update job.</td><td class="rm-next">—</td></tr>
+<tr><td class="rm-feat">Offline deterministic tests</td><td class="rm-scope">engineering</td><td class="rm-field"><span class="rm-mark rm-n" title="not a matrix row">—</span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state"><code>cargo nextest</code> with a scripted model backend, no network, a 60 s per-test ceiling; CI runs fmt, clippy with warnings as errors, shear, deny and typos on two OSes.</td><td class="rm-next">—</td></tr></tbody>
+  </table></div>
+</section>
+
+<section class="rm-block" id="p1">
+  <div class="rm-block-head"><span class="rm-block-num">03</span><h2>P1 — what the incumbents set</h2><span class="rm-chip rm-bad">17 missing</span><span class="rm-chip rm-warn">12 partial</span></div>
+  <p class="rm-block-sub">The comparison this project is judged by. Each row is something a user of omp, opencode or hermes already relies on.</p>
+  <div class="rm-tbl-wrap"><table class="rm-matrix">
+    <colgroup><col style="width:17%"><col style="width:8%"><col style="width:11%"><col style="width:8%"><col style="width:37%"><col style="width:19%"></colgroup>
+    <thead><tr><th>Feature</th><th>Scope</th><th title="omp · jcode · opencode · hermes, in that order">Field</th><th>Status</th><th>Current state</th><th>Next step</th></tr></thead>
+    <tbody><tr><td class="rm-feat">Remote / selectable working directory</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The root's directory is <code>config.toml</code>'s <code>dir</code> (default <code>~</code>), canonicalised, and only <code>spawn_agent.path</code> moves a child elsewhere. There is no flag, so two projects mean editing the file.</td><td class="rm-next"><code>--dir</code>/<code>-C</code> overriding <code>config.dir</code> for one run; <code>--add-dir</code> to widen <code>roots</code> without editing.</td></tr>
+<tr><td class="rm-feat">Editor / ACP</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No ACP server and no editor integration; the TUI and line mode are the only surfaces.</td><td class="rm-next"><code>overseer acp</code> over stdio: the smallest surface that puts the harness in Zed, Neovim and any ACP client.</td></tr>
+<tr><td class="rm-feat">Subscription OAuth</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">One static bearer token resolved at startup from <code>OVERSEER_API_KEY</code> or <code>~/.config/overseer/.env</code>. <code>/login</code> exists but drives MCP servers only; OAuth machinery is already written for them (<code>src/mcp/oauth.rs</code>).</td><td class="rm-next">Provider login for the model plane reusing the MCP OAuth flow: token store, refresh, re-auth on 401.</td></tr>
+<tr><td class="rm-feat">Key / quota resilience</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">One POST, no retry: a provider blip ends the turn and hands the error to the user. History is rolled back first, so a manual retry does not replay half a turn.</td><td class="rm-next">Retry with backoff on transport errors and 429/5xx, then a fallback model or endpoint from config.</td></tr>
+<tr><td class="rm-feat">LSP</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No language-server client; nothing in <code>src/</code> speaks LSP.</td><td class="rm-next">A single-client LSP tool for definitions, references, hover and diagnostics, which is what makes a multi-repo fleet cheaper than grep.</td></tr>
+<tr><td class="rm-feat">Sandbox / isolation backend</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Explicitly none: agents run with the user's rights; worktree separation is prompt text, and <code>roots</code> is documented as discovery, not a boundary.</td><td class="rm-next">One enforced boundary (seatbelt/landlock, or a container profile) is enough to make <code>read_only</code> credible.</td></tr>
+<tr><td class="rm-feat">Memory</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing survives a session except write-only logs. <code>memory://</code> is a reserved scheme name, refused to the model like any unknown scheme.</td><td class="rm-next">A file-backed store plus a <code>memory://</code> handler, so an agent stops relearning the same repository every run.</td></tr>
+<tr><td class="rm-feat">Staying on task</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No todo tool, no plan mode, no goal state: a long instruction is tracked by the model's own prose, and a fleet's progress is visible only through <code>list_agents</code> and <code>reply</code>.</td><td class="rm-next">A <code>todo</code> tool scoped per agent, rendered in its view, since the tree already gives a natural place to show it.</td></tr>
+<tr><td class="rm-feat">Programmatic API</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No argv parsing, no RPC, no JSON output: the only scriptable path is line mode's plain text.</td><td class="rm-next">One JSON framing over stdio that reuses <code>Event</code> and <code>UiEvent</code>, which is also what an ACP server and an editor client need.</td></tr>
+<tr><td class="rm-feat">Undo of file changes</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing checkpoints: <code>write_file</code> overwrites and <code>conflict://</code> splices markers, both irreversible. Git is only used for repository discovery and read-only allowlists.</td><td class="rm-next">A checkpoint per tool write (content-addressed, in the state dir) with a rewind verb, which a fleet editing one tree needs far more than a single agent does.</td></tr>
+<tr><td class="rm-feat">Session search</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No cross-session index; <code>history://</code> is reserved and refused. Prompt recall is in-memory and per-run.</td><td class="rm-next"><code>history://</code> over the session store, which is what makes a past decision findable instead of re-derived.</td></tr>
+<tr><td class="rm-feat">Usage analytics</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The wire types drop <code>usage</code>, so even the tokens a provider reports are discarded. The TUI shows per-tool elapsed seconds and the logs keep no totals.</td><td class="rm-next">Parse <code>usage</code>, write a per-run record, and report tokens and cost per agent, model and directory.</td></tr>
+<tr><td class="rm-feat">Selective restore of conversation and files</td><td class="rm-scope">review</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No checkpoint machinery: history lives in memory, <code>write_file</code> writes directly.</td><td class="rm-next">Restore files only, task only, or both — files-only restore is the piece a fleet editing one tree needs.</td></tr>
+<tr><td class="rm-feat">Dependency-ranked repository map</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state"><code>list_repos</code> lists repository paths capped at 300; no symbols, no ranking, no budget.</td><td class="rm-next">A symbol map ranked by cross-file references under a token budget, injected into worker prompts.</td></tr>
+<tr><td class="rm-feat">Live context meter</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The stream chunk type drops <code>usage</code>; the status line shows elapsed time and agent counters only.</td><td class="rm-next">Parse usage, track per-agent context fill, render a bar in the status line.</td></tr>
+<tr><td class="rm-feat">Reproducible task environments</td><td class="rm-scope">environment</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state"><code>spawn_agent</code> resolves a directory and starts a thread; no environment declaration, setup, or isolation.</td><td class="rm-next">A profile-level environment block: image/container, setup command, secret mapping.</td></tr>
+<tr><td class="rm-feat">Command-line surface</td><td class="rm-scope">engineering</td><td class="rm-field"><span class="rm-mark rm-n" title="not a matrix row">—</span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">There is no argument parsing at all: no <code>--help</code>, no <code>--version</code>, no flags. Everything is set in <code>config.toml</code> or an environment variable.</td><td class="rm-next">One flag set (<code>--dir</code>, <code>--model</code>, <code>--max-depth</code>, <code>--help</code>, <code>--version</code>), which most P1 rows above also need as their entry point.</td></tr>
+<tr><td class="rm-feat">Local models</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>base_url</code> pointing at ollama, LM Studio or llama.cpp works on the identical chat-completions wire; the served model name must still be typed into <code>config.toml</code>.</td><td class="rm-next">Model discovery from <code>GET /models</code> and a startup health check, so a bad local endpoint fails in one second instead of at the first turn.</td></tr>
+<tr><td class="rm-feat">Model abstraction</td><td class="rm-scope">providers</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">One global <code>model</code>, per-profile <code>model</code> + <code>effort</code>, the root pinned to <code>orchestrator.md</code>'s model; one cached client per (model, effort) pair.</td><td class="rm-next">Named roles (<code>smol</code>/<code>slow</code>/<code>plan</code>) the prompt can reference, and a runtime model switch for the root without editing files.</td></tr>
+<tr><td class="rm-feat">Secrets</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">MCP env values and headers resolve at connect from <code>${VAR}</code> or <code>!command</code> with a lifetime cache, so no credential sits in <code>mcp.json</code>; OAuth tokens are 0600 with redacted <code>Debug</code>. The model key is plaintext in <code>.env</code> and <code>bash</code> sees the whole parent environment.</td><td class="rm-next"><code>!command</code> resolution for the model key too, and an environment scrub for <code>bash</code>: today a fleet leaks whatever the shell holds.</td></tr>
+<tr><td class="rm-feat">Persona</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">A profile's body is appended to the agent prompt and the built-in <code>orchestrator</code> text can be replaced by a user file, but the base prompt itself is not replaceable.</td><td class="rm-next">Let a profile declare the whole system prompt for its agent, keeping the tool-usage section generated.</td></tr>
+<tr><td class="rm-feat">Conflict handling</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Collisions are managed by convention: the prompt requires one worktree per agent and one integration owner. <code>conflict://</code> resolves merge markers in a file but nothing notices that two agents edited the same path.</td><td class="rm-next">A file-change notice to any agent that read a path another agent wrote, and an enforced worktree per spawn.</td></tr>
+<tr><td class="rm-feat">Custom commands</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Four built-in commands (<code>/resume</code>, <code>/schemes</code>, <code>/mcp</code>, <code>/login</code>) with completion and a drift-guarded parser; a user cannot add one.</td><td class="rm-next">Command files read from the project, each expanding into a prompt or a shell action.</td></tr>
+<tr><td class="rm-feat">Plan acceptance gate</td><td class="rm-scope">plans</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">The supervisor prompt demands a written plan and review, but nothing gates implementation on approval: spawned agents start immediately.</td><td class="rm-next">A plan state on the agent record: submitted → approved → building, answered in the TUI.</td></tr>
+<tr><td class="rm-feat">Repo-pinned knowledge with relevance retrieval</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>memory://</code> stores notes per project path and <code>rule://</code> discovers instruction files, but neither is loaded into a prompt automatically.</td><td class="rm-next">Load repo-pinned memory and discovered rules at agent start, with per-agent scoping.</td></tr>
+<tr><td class="rm-feat">Mid-turn steering</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">User input queues for the root's next instruction; <code>urgent</code> interruption exists only for agent-to-agent messages, and the root cannot be targeted by children.</td><td class="rm-next">A steering modifier on user input that jumps the queue, mirroring what agents already have.</td></tr>
+<tr><td class="rm-feat">Image input to the model</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><kbd>ctrl+v</kbd> writes a clipboard image to a temp file and the prompt carries its path as text; <code>Message::content</code> is <code>Option&lt;String&gt;</code> and the wire payload is text-only.</td><td class="rm-next">Multimodal content parts in the payload type; the capture half already exists.</td></tr>
+<tr><td class="rm-feat">Durable run state with replay and branching</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">History is an in-memory <code>Vec&lt;Message&gt;</code>; logs are append-only text; <code>resume</code> retasks a live agent.</td><td class="rm-next">This is the state-store row seen from the other side: checkpoints plus fork-from-checkpoint.</td></tr>
+<tr><td class="rm-feat">Documentation matching the code</td><td class="rm-scope">engineering</td><td class="rm-field"><span class="rm-mark rm-n" title="not a matrix row">—</span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">AGENTS.md is accurate and detailed; README is not: it claims the root has no file tools, documents a <code>restart</code> action and a live policy change that the code does not have, and omits the tree tools.</td><td class="rm-next">Rewrite the README against <code>src/prompt.rs</code>, or generate the tool and flag sections from the schemas.</td></tr>
+<tr><td class="rm-feat">Skills</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">Skills discovered from the user's and the project's roots, advertised by name and description in every agent's prompt, read on demand through <code>skill://&lt;name&gt;</code> with <code>read_file</code>, scoped per directory.</td><td class="rm-next">—</td></tr>
+<tr><td class="rm-feat">Agent definitions</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-ok">FULL</span></td><td class="rm-state">Profiles as Markdown with YAML frontmatter: description, keywords, model, effort, <code>read_only</code>, <code>deny_tools</code>, and a body appended to the prompt; listed in every prompt through <code>profile://</code>.</td><td class="rm-next">—</td></tr></tbody>
+  </table></div>
+</section>
+
+<section class="rm-block" id="p2">
+  <div class="rm-block-head"><span class="rm-block-num">04</span><h2>P2 — differentiators</h2><span class="rm-chip rm-warn">7 partial</span></div>
+  <p class="rm-block-sub">Nothing here is built. These are the rows where overseer could beat the field rather than match it, ranked by leverage instead of readiness.</p>
+  <div class="rm-tbl-wrap"><table class="rm-matrix">
+    <colgroup><col style="width:17%"><col style="width:8%"><col style="width:11%"><col style="width:8%"><col style="width:37%"><col style="width:19%"></colgroup>
+    <thead><tr><th>Feature</th><th>Scope</th><th title="omp · jcode · opencode · hermes, in that order">Field</th><th>Status</th><th>Current state</th><th>Next step</th></tr></thead>
+    <tbody><tr><td class="rm-feat">Server / attach mode</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No argv parsing anywhere in <code>src/</code>. A second client cannot attach to a running session.</td><td class="rm-next">Line-delimited JSON over stdio (<code>--mode rpc</code>) reusing <code>Event</code>/<code>UiEvent</code>, which are already the only two types crossing the boundary.</td></tr>
+<tr><td class="rm-feat">Profile isolation</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Agent <em>flavour</em> profiles exist (<code>~/.overseer/agent/profiles/*.md</code>: model, effort, rights, prompt text) but nothing scopes auth, config, caches or sessions per identity.</td><td class="rm-next"><code>--profile</code> moving config, <code>.env</code> and state under one name, plus <code>--alias</code>.</td></tr>
+<tr><td class="rm-feat">Structural / AST</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No AST tool and no tree-sitter dependency.</td><td class="rm-next">Optional; a text model plus a reliable edit tool covers most of the value.</td></tr>
+<tr><td class="rm-feat">Browser automation</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No browser tool; the only browser use is opening an OAuth consent page.</td><td class="rm-next">Not before <code>webfetch</code>/<code>websearch</code>: a fetch tool is most of the value at a tenth of the surface.</td></tr>
+<tr><td class="rm-feat">Org-level policy</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Config is user-owned: <code>config.toml</code> carries roots/base_url/model/depth/dir and no policy keys; the orchestrator profile that restricts the root is user-editable.</td><td class="rm-next">A project or admin layer that wins over the user's file, since an agent that can rewrite its own limits has none.</td></tr>
+<tr><td class="rm-feat">Network egress</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Inherited: any command reaches any host.</td><td class="rm-next">Per-session proxy variables plus a fail-closed check, which is cheap and covers the common case.</td></tr>
+<tr><td class="rm-feat">Long-running / scheduled work</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No async jobs: a backgrounded shell child is killed after a 5 s drain grace, <code>proc://</code> is a reserved scheme, and nothing schedules a run.</td><td class="rm-next">Async <code>bash</code> jobs with a handle, then a scheduler; both want the persistent state store first.</td></tr>
+<tr><td class="rm-feat">Code-mode tool calling</td><td class="rm-scope">agents</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-p">~</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Every tool call is a separate model round trip; a pipeline of 20 reads and greps is 20 requests.</td><td class="rm-next">An <code>eval</code> kernel with a tool bridge, which is the same work as the persistent execution row above.</td></tr>
+<tr><td class="rm-feat">Plugin surface</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No loader and no hook points: MCP servers are the only extension, and they cannot see turns or tools.</td><td class="rm-next">Hook points at turn, tool and session boundaries, the cheapest useful one being a post-write formatter/linter hook.</td></tr>
+<tr><td class="rm-feat">Import from other agents</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing reads another tool's config; <code>mcp.json</code> is merely shaped like omp's.</td><td class="rm-next"><code>--from-claude</code>/<code>--from-codex</code> for MCP servers and instruction files, which is the cheapest adoption path from a rival.</td></tr>
+<tr><td class="rm-feat">Fork / handoff</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No fork, no transfer, no export.</td><td class="rm-next">Fork from a stored session once sessions persist; handoff is a compaction rule.</td></tr>
+<tr><td class="rm-feat">Self-hosted GitHub bot</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No HTTP listener and no webhook handling; CI only builds and releases.</td><td class="rm-next">Out of scope until a server mode exists, then a webhook receiver that resumes a session per issue.</td></tr>
+<tr><td class="rm-feat">Notifications</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No bell, desktop notification or webhook; a finished fleet is visible only by looking at the TUI.</td><td class="rm-next">A terminal bell plus one webhook URL on turn completion, which is what makes unattended runs usable.</td></tr>
+<tr><td class="rm-feat">Lifecycle hooks</td><td class="rm-scope">hooks</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing runs at a lifecycle boundary: a turn runs <code>agent::Turn::run</code> and dispatches tools, and neither exposes a user-defined handler.</td><td class="rm-next">One hook at pre-tool and one at post-write; shell commands, refusing only when the hook fails.</td></tr>
+<tr><td class="rm-feat">Model-call interception</td><td class="rm-scope">hooks</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state"><code>llm.rs::OpenAiClient::payload</code> builds the request and <code>send</code> posts it with no seam in between.</td><td class="rm-next">A pre-send rewrite seam, which is also the cheapest path to request-level retries and the model-router feature above.</td></tr>
+<tr><td class="rm-feat">Per-file diff review UI</td><td class="rm-scope">review</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The TUI shows tool cards and previews; <code>Entry::tool_lines</code> carries generic progress, not structured file changes.</td><td class="rm-next">A <code>diff://</code> scheme plus one view: navigate per-file patches, mark reviewed.</td></tr>
+<tr><td class="rm-feat">Build-in-background from an approved plan</td><td class="rm-scope">plans</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing spawns work outside the interactive tree.</td><td class="rm-next">Same machinery as async jobs; the approved plan is just the first instruction.</td></tr>
+<tr><td class="rm-feat">Security scanning in the loop</td><td class="rm-scope">trust</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No scanner wired into writes or turn end; agents can run one ad hoc through bash or MCP.</td><td class="rm-next">A post-write hook running a scanner, findings returned as tool output.</td></tr>
+<tr><td class="rm-feat">MCP elicitation</td><td class="rm-scope">mcp</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state"><code>mcp/client.rs</code> answers <code>ping</code> and <code>roots/list</code>; <code>elicitation/create</code> gets method-not-found.</td><td class="rm-next">Needs the typed interrupt contract: server question → TUI prompt → validated answer.</td></tr>
+<tr><td class="rm-feat">Bug-style PR review bot</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No webhook listener; <code>pr://</code> and <code>issue://</code> read through <code>gh</code>, and the comparison doc's robomp row is omp-only.</td><td class="rm-next">A <code>pr://</code>-reading review agent behind a webhook, or simpler: cron-less manual trigger per PR.</td></tr>
+<tr><td class="rm-feat">Shell analysis</td><td class="rm-scope">safety</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>Policy::refuse</code> reads the program word (path, <code>env</code>/<code>sudo</code> and <code>VAR=x</code> stripped), refuses shell syntax when command rules exist, checks each pipeline segment for read-only mode, and blacklists writing flags.</td><td class="rm-next">It only runs when a rule exists, and quoting is not modelled: a scanner that classifies an unrestricted command is what makes deny rules safe to ship.</td></tr>
+<tr><td class="rm-feat">Token optimisation</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">The only lever is per-agent: a profile's cheaper model and lower effort for a sub-agent. Tool results are capped head+tail at 30 KB, which bounds a single result but not the history.</td><td class="rm-next">Reuse of the prompt cache across turns (stable prefix ordering), and a log of what each turn actually cost.</td></tr>
+<tr><td class="rm-feat">Prompt queue while working</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Enter submits immediately and queues behind current work (root FIFO); no explicit queue-now affordance.</td><td class="rm-next">One key chord or prefix to queue without submitting.</td></tr>
+<tr><td class="rm-feat">Connectivity diagnostics</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Startup reports a missing key; wrong URL or TLS failure surfaces as the provider's error at the first turn. No doctor command.</td><td class="rm-next"><code>overseer doctor</code>: key present, endpoint reachable, TLS trusted, config valid.</td></tr>
+<tr><td class="rm-feat">Injection guardrails over the trace</td><td class="rm-scope">trust</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state"><code>Policy::refuse</code> sees one tool call; it cannot see messages, prior tool outputs or call ordering.</td><td class="rm-next">Rule checks that can read the trace and block — needs the durable session record first.</td></tr>
+<tr><td class="rm-feat">MCP roots</td><td class="rm-scope">mcp</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">The client advertises <code>roots</code> and answers <code>roots/list</code> with an empty array; no configured roots, no change notifications.</td><td class="rm-next">Answer with the agent's directory and configured roots; cheap.</td></tr>
+<tr><td class="rm-feat">Reconnectable event streams</td><td class="rm-scope">runtime</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">One process, live channels, transcript in memory; a restarted frontend gets nothing back.</td><td class="rm-next">Event log plus replay cursor, once the session record exists.</td></tr></tbody>
+  </table></div>
+</section>
+
+<section class="rm-block" id="p3">
+  <div class="rm-block-head"><span class="rm-block-num">05</span><h2>P3 — optional</h2></div>
+  <p class="rm-block-sub">Cheap to say no to. Where a row is worth building, the condition is named.</p>
+  <div class="rm-tbl-wrap"><table class="rm-matrix">
+    <colgroup><col style="width:17%"><col style="width:8%"><col style="width:11%"><col style="width:8%"><col style="width:37%"><col style="width:19%"></colgroup>
+    <thead><tr><th>Feature</th><th>Scope</th><th title="omp · jcode · opencode · hermes, in that order">Field</th><th>Status</th><th>Current state</th><th>Next step</th></tr></thead>
+    <tbody><tr><td class="rm-feat">Desktop app</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Terminal only; no bundle or GUI shell in the tree.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Phone / web surface</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No listener: <code>reqwest</code> is client-side only; the binary has no HTTP server dependency.</td><td class="rm-next">Not planned before a server mode exists.</td></tr>
+<tr><td class="rm-feat">Chat platforms</td><td class="rm-scope">clients</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No bot module, no chat transport.</td><td class="rm-next">Not planned; a webhook notifier (P2 row below) covers the useful half.</td></tr>
+<tr><td class="rm-feat">Debugger (DAP)</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No debug adapter.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Desktop automation</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No window, screenshot or input tool.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Binary / reverse engineering</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">None.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Media generation</td><td class="rm-scope">tools</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">None; a pasted image reaches the prompt as <code>[attached image: /path]</code> text, and the wire type has no image part.</td><td class="rm-next">Image input before image output: the payload type is text-only today.</td></tr>
+<tr><td class="rm-feat">Skill maintenance</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The catalogue is rebuilt per agent at thread start; nothing tracks usage, staleness or pruning.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Plugin distribution</td><td class="rm-scope">interop</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">None; no install, list or update path.</td><td class="rm-next">Not before a plugin surface exists.</td></tr>
+<tr><td class="rm-feat">Self-modification</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Profiles load once at startup and the binary never reloads; an agent can edit the source it runs from but nothing rebuilds or restarts it.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Sharing / recording</td><td class="rm-scope">sessions</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No export, no recording, no share link.</td><td class="rm-next">A static HTML export of a session, once transcripts exist.</td></tr>
+<tr><td class="rm-feat">Benchmarking</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-y">✓</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">The test suite is behavioural; there is no bench harness or score.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Quality feedback loop</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-p">~</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">A tool failure goes back to the model as <code>error: …</code> text and nothing collects those events for the maintainer.</td><td class="rm-next">Optional: an <code>overseer report</code> that bundles the failing turn.</td></tr>
+<tr><td class="rm-feat">Commit-message generation</td><td class="rm-scope">review</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No one-click action; agents run <code>git</code> through bash and <code>Policy</code> permits <code>git commit</code> for non-read-only agents.</td><td class="rm-next">A slash command that drafts from the staged diff — small once the prompt surface exists.</td></tr>
+<tr><td class="rm-feat">Voice input</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-y">✓</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No audio dependency, no recording, no transcription path.</td><td class="rm-next">Not planned.</td></tr>
+<tr><td class="rm-feat">Risk metadata on tool calls</td><td class="rm-scope">trust</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No risk field in tool schemas or arguments; <code>security://</code> reports policy verdicts, not risk.</td><td class="rm-next">Not without an approval model to gate it; low value alone.</td></tr>
+<tr><td class="rm-feat">Workload identity for agent runs</td><td class="rm-scope">trust</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Commands inherit the whole environment; MCP OAuth tokens are server-login storage, not per-run identity.</td><td class="rm-next">Not before a sandbox backend exists.</td></tr>
+<tr><td class="rm-feat">MCP sampling</td><td class="rm-scope">mcp</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">No sampling capability advertised; one fixed endpoint with one key.</td><td class="rm-next">Server-requested generations through the harness's own client, gated by policy.</td></tr>
+<tr><td class="rm-feat">A2A cross-framework exchange</td><td class="rm-scope">mcp</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Command is restricted to descendants in one process; no remote agent addressing.</td><td class="rm-next">Not planned; MCP already covers tool-level interop.</td></tr>
+<tr><td class="rm-feat">Staged rollout with automated abort</td><td class="rm-scope">automation</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-bad">NONE</span></td><td class="rm-state">Nothing deployment-aware; the harness stops at git.</td><td class="rm-next">Not planned; reachable only as an MCP integration.</td></tr>
+<tr><td class="rm-feat">Inline thinking toggle</td><td class="rm-scope">context</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-p">~</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Streamed reasoning already flows through the chat-completions stream into a Thinking role in the TUI; no off/full setting, and plain mode ignores it.</td><td class="rm-next">One setting: off or full; nothing else.</td></tr>
+<tr><td class="rm-feat">Command palette</td><td class="rm-scope">ux</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">Slash completion covers four commands and <code>/resume</code> agent ids; no searchable list of every action in the current view.</td><td class="rm-next">Extend the completion popup into a palette of every TUI action.</td></tr>
+<tr><td class="rm-feat">External policy engine with decision logs</td><td class="rm-scope">trust</td><td class="rm-field"><span title="omp · jcode · opencode · hermes"><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n" title="not a matrix row">—</span><span class="rm-mark rm-n">–</span><span class="rm-mark rm-n">–</span></span></td><td><span class="rm-chip rm-warn">PARTIAL</span></td><td class="rm-state">In-process <code>Policy</code> with per-agent text logs that omit raw arguments and never log decisions.</td><td class="rm-next">Decision records plus an OPA/cedar adapter; only worth it with an approval model.</td></tr></tbody>
+  </table></div>
+</section>
+
+<section class="rm-block" id="sequence">
+  <div class="rm-block-head"><span class="rm-block-num">06</span><h2>Recommended sequence</h2></div>
+  <p class="rm-block-sub">Ordered by dependency, not by importance: each phase makes the next one cheap, and the first phase is what stops overseer losing work.</p>
+  <div class="rm-tbl-wrap"><table class="rm-seq">
+    <colgroup><col style="width:6%"><col style="width:16%"><col style="width:44%"><col style="width:34%"></colgroup>
+    <thead><tr><th>Phase</th><th>Theme</th><th>Features</th><th>Why here</th></tr></thead>
+    <tbody><tr><td class="rm-feat">1</td><td>Do not lose work</td><td class="rm-state">State store · Resume · Undo of file changes · Session search</td><td>Everything else assumes a session is durable. A crash today takes the fleet's history and any un-checkpointed edit with it.</td></tr>
+<tr><td class="rm-feat">2</td><td>Bound the fleet</td><td class="rm-state">Cost control · Run bounds · Usage analytics · Approval model</td><td>A tree multiplies every call, so an unbounded run is a bill, not a test. Token accounting is the shared prerequisite for three of these four.</td></tr>
+<tr><td class="rm-feat">3</td><td>Be a daily driver in a real repo</td><td class="rm-state">Instruction files · Compaction · Command-line surface · Working directory · Documentation</td><td>The first hour with overseer in someone else's project: its conventions must load, its window must survive a long task, and its README must not lie.</td></tr>
+<tr><td class="rm-feat">4</td><td>Reach the field</td><td class="rm-state">MCP project config + importers · LSP · Headless JSON · Programmatic API/ACP · Remote working directory</td><td>Table stakes against omp and opencode, and each one is a door into a surface overseer does not have: editor, CI, another tool's config.</td></tr>
+<tr><td class="rm-feat">5</td><td>Differentiate</td><td class="rm-state">Structured read/edit · todo · Conflict notice · Async jobs · Memory</td><td>Only after the spine exists: these are the rows where the harness can be better than the field rather than merely equal to it.</td></tr></tbody></table>
+  </div>
+</section>
+
+<section class="rm-block" id="nongoals">
+  <div class="rm-block-head"><span class="rm-block-num">07</span><h2>Deliberate non-goals</h2></div>
+  <p class="rm-block-sub">Rows from the matrix overseer should refuse, with the reason. A roadmap that only adds is not a roadmap.</p>
+  <div class="rm-grid-2"><div class="rm-card"><h3><span class="rm-dot"></span>Desktop, phone and chat surfaces</h3><p class="rm-note">The matrix's P3 client rows. Each is a frontend to the same core, and the core is not yet worth a second frontend. A programmatic API (P1) buys the same reach for a tenth of the work.</p></div>
+<div class="rm-card"><h3><span class="rm-dot"></span>Self-modification</h3><p class="rm-note">jcode's one unique row. An agent that rebuilds and restarts its own binary makes every bug a moving target; the value it delivers is a faster development loop for the harness author, not for the user.</p></div>
+<div class="rm-card"><h3><span class="rm-dot"></span>Debugger (DAP) and binary RE</h3><p class="rm-note">omp-only rows. Both are whole subsystems with a narrow audience; a user who needs them has omp.</p></div>
+<div class="rm-card"><h3><span class="rm-dot"></span>Media generation and desktop automation</h3><p class="rm-note">Not a coding capability. The one piece worth having is image input, and that is an LLM-payload fix, not a tool.</p></div>
+<div class="rm-card"><h3><span class="rm-dot"></span>Plugin distribution and org policy</h3><p class="rm-note">Both presuppose a plugin surface and a policy layer that do not exist. Building the registry first would be building the shop before the goods.</p></div>
+<div class="rm-card"><h3><span class="rm-dot"></span>Benchmarking</h3><p class="rm-note">A score for the maintainer, not the user. The behavioural test suite already gates what a release may break.</p></div></div>
+</section>
+
+<section class="rm-block" id="caveats">
+  <div class="rm-block-head"><span class="rm-block-num">08</span><h2>What this grading does not prove</h2></div>
+  <div class="rm-callout rm-warn">
+    <ul><li>Status was read from the source at that commit; nothing here was built, run or exercised. A row marked FULL is FULL in the code, not observed under load.</li>
+<li>Priority is my judgement of what a harness needs, weighted by the field. It is not a measurement, and it does not follow this codebase's strengths.</li>
+<li>The four field marks are copied from the comparison doc, which refused five items it could not source. A mark of · never proves a rival lacks the feature.</li>
+<li>The matrix cannot cut the other way: capabilities no rival documents have no row, so the <code>conflict://</code> registry, the reserved URI scheme table and <code>list_repos</code> are invisible above.</li>
+<li>Counts describe how many rows exist, not how many weeks they cost. Several PARTIAL rows are an afternoon; one P0 (session persistence) touches every module.</li></ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p>Graded against the source at commit <span class="rm-mono">4b32b7a</span> (overseer 0.2.0). Priority is a market judgement; status and current-state claims come from reading the code, not from running it.</p>
+  <p>Source catalogue: <a href="harness-comparison.md">harness-comparison.md</a> · artifact: <span class="rm-mono">docs/roadmap/roadmap.html</span></p>
+</footer>
+
+
+<script>
+(() => {
+  const input = document.getElementById('q');
+  const count = document.getElementById('qc');
+  const none = document.getElementById('none');
+  const rows = [...document.querySelectorAll('table.rm-matrix tbody tr')];
+  const sections = [...document.querySelectorAll('section.rm-block')];
+  const withRows = new Set(sections.filter(s => s.querySelector('table.rm-matrix')));
+  const total = rows.length;
+  input.placeholder = 'Filter ' + total + ' features';
+
+  const apply = () => {
+    const q = input.value.trim().toLowerCase();
+    let shown = 0;
+    for (const row of rows) {
+      const hit = q === '' || row.textContent.toLowerCase().includes(q);
+      row.hidden = !hit;
+      if (hit) shown += 1;
+    }
+    for (const section of sections) {
+      const keep = q === ''
+        ? true
+        : withRows.has(section) && [...section.querySelectorAll('tbody tr')].some(r => !r.hidden);
+      section.hidden = !keep;
+    }
+    count.textContent = q === '' ? String(total) : shown + '/' + total;
+    none.hidden = !(q !== '' && shown === 0);
+  };
+
+  input.addEventListener('input', apply);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { input.value = ''; apply(); input.blur(); }
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === '/' && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
+      e.preventDefault(); input.focus(); input.select();
+    }
+  });
+  apply();
+})();
+</script>
+</body>
+</html>

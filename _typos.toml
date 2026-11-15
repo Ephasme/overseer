@@ -1,3 +1,5 @@
 # `PNGf` is AppleScript's PNG class name, not a misspelling.
+# `ratatui` is the Rust TUI crate, not a misspelling of ratatouille.
 [default.extend-identifiers]
 PNGf = "PNGf"
+ratatui = "ratatui"
