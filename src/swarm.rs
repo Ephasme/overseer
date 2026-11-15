@@ -6,6 +6,7 @@ use crate::llm;
 use crate::llm::{Llm, Message, StreamLlm, StreamStep, ToolCall};
 use crate::mcp;
 use crate::names;
+use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
 use crate::repos;
@@ -104,6 +105,12 @@ struct NoArgs {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StartPipelineArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplyArgs {
     text: String,
 }
@@ -120,8 +127,9 @@ struct CloseArgs {
 struct Control {
     gate: Mutex<Gate>,
     wake: Condvar,
-    /// Set to abandon the running turn; the worker clears it when it starts an instruction.
-    interrupted: AtomicBool,
+    /// Set to abandon the running turn; the worker clears it when it starts an instruction. Shared
+    /// with a pipeline's host so a running command or a sleep stops with the agent.
+    interrupted: Arc<AtomicBool>,
     policy: Mutex<tools::Policy>,
 }
 
@@ -189,7 +197,12 @@ impl Control {
     }
 
     fn flag(&self) -> &AtomicBool {
-        &self.interrupted
+        self.interrupted.as_ref()
+    }
+
+    /// The same flag, owned: a pipeline's host and watchdog outlive this borrow.
+    fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupted)
     }
 
     fn policy(&self) -> tools::Policy {
@@ -294,6 +307,8 @@ pub(crate) enum Event {
     Mcp,
     /// User typed `/login <server>`: the argument, handled without a model call.
     Login(String),
+    /// User typed `/pipeline <name|list|stop <id>>`: the argument, handled without a model call.
+    Pipeline(String),
     Agent {
         id: usize,
         kind: AgentEvent,
@@ -349,6 +364,13 @@ impl Event {
         }
         if line == "/mcp" {
             return Some(Event::Mcp);
+        }
+        // `/pipelinefoo` stays a user message: only the bare command and its spaced argument count.
+        if line == "/pipeline" {
+            return Some(Event::Pipeline(String::new()));
+        }
+        if let Some(arg) = line.strip_prefix("/pipeline ") {
+            return Some(Event::Pipeline(arg.trim().to_string()));
         }
         if let Some(arg) = line.strip_prefix("/login") {
             return Some(Event::Login(arg.trim().to_string()));
@@ -556,6 +578,8 @@ impl Agent {
 pub(crate) struct Swarm {
     models: Arc<dyn llm::Models>,
     profiles: Arc<profiles::Catalogue>,
+    /// The pipelines loaded at startup; a start reads it, nothing writes it.
+    pipelines: Arc<pipelines::Catalogue>,
     /// The configuration the process started with: roots, home and the depth limit.
     config: Arc<config::Config>,
     log_dir: PathBuf,
@@ -580,6 +604,7 @@ impl Swarm {
     pub(crate) fn new(
         models: Arc<dyn llm::Models>,
         profiles: Arc<profiles::Catalogue>,
+        pipelines: Arc<pipelines::Catalogue>,
         config: Arc<config::Config>,
         log_dir: PathBuf,
         sender: Sender<Event>,
@@ -588,6 +613,7 @@ impl Swarm {
         Self {
             models,
             profiles,
+            pipelines,
             config,
             log_dir,
             sender,
@@ -631,6 +657,11 @@ impl Swarm {
     /// The agent's name alone, for a line that already carries its id.
     pub(crate) fn name(&self, id: usize) -> String {
         id.checked_sub(1).and_then(|index| self.agents.get(index)).map_or_else(|| names::name(id, None), Agent::name)
+    }
+
+    /// The pipeline names the catalogue holds, comma-separated; `none` when it holds none.
+    pub(crate) fn pipeline_names(&self) -> String {
+        self.pipelines.names()
     }
 
     /// The line an owner reads for one agent event: `[agent 3 · rapid-beacon says] ...`.
@@ -704,8 +735,24 @@ impl Swarm {
         self.agents.iter().filter(|agent| agent.parent == Some(id)).map(|agent| agent.id).collect()
     }
 
+    /// One agent's state as its owner may read it: the same ownership rule every other command obeys.
+    pub(crate) fn agent_state(&self, caller: usize, id: usize) -> Result<State, String> {
+        if let Some(refusal) = self.may_address(caller, id) {
+            return Err(refusal);
+        }
+        self.agent(id).map(Agent::state).ok_or_else(|| format!("no agent {}", self.label(id)))
+    }
+
+    /// The text of one agent's last completed turn, under the same ownership rule.
+    pub(crate) fn agent_output(&self, caller: usize, id: usize) -> Result<String, String> {
+        if let Some(refusal) = self.may_address(caller, id) {
+            return Err(refusal);
+        }
+        self.agent(id).map(|agent| agent.last_output.clone()).ok_or_else(|| format!("no agent {}", self.label(id)))
+    }
+
     /// Why `caller` may not address `target`, or `None` when it may.
-    fn may_address(&self, caller: usize, target: usize) -> Option<String> {
+    pub(crate) fn may_address(&self, caller: usize, target: usize) -> Option<String> {
         if self.agent(target).is_none() {
             return Some(format!("no agent {}", self.label(target)));
         }
@@ -862,6 +909,8 @@ impl Swarm {
                 | prompt::CONTROL_AGENT
                 | prompt::LIST_AGENTS
                 | prompt::LIST_REPOS
+                | prompt::START_PIPELINE
+                | prompt::LIST_PIPELINES
         );
         if tree_tool {
             let refused = {
@@ -886,6 +935,13 @@ impl Swarm {
             }
             prompt::LIST_AGENTS => Some(tools::parse_args::<NoArgs>(arguments).map(|_| lock(swarm).list(caller))),
             prompt::LIST_REPOS => Some(tools::parse_args::<NoArgs>(arguments).map(|_| Swarm::list_repos(swarm))),
+            prompt::START_PIPELINE => Some(tools::parse_args::<StartPipelineArgs>(arguments).and_then(|args| {
+                let id = Swarm::start_pipeline(swarm, caller, &args.name)?;
+                Ok(format!("{} started", lock(swarm).label(id)))
+            })),
+            prompt::LIST_PIPELINES => {
+                Some(tools::parse_args::<NoArgs>(arguments).map(|_| lock(swarm).pipeline_names()))
+            }
             _ => None,
         }
     }
@@ -985,6 +1041,155 @@ impl Swarm {
             handle,
         });
         Ok(id)
+    }
+
+    /// Starts one pipeline below `caller`, as a child agent that runs the script instead of a model.
+    ///
+    /// Everything a side effect could depend on is decided under the tree lock before anything is
+    /// created: the caller runs, it holds `start_pipeline`, the profile is valid, the depth allows a
+    /// child, the pipeline file loaded, and every tool its header requires is granted. A refusal
+    /// leaves no agent, no log and no thread behind.
+    pub(crate) fn start_pipeline(swarm: &Arc<Mutex<Swarm>>, caller: usize, name: &str) -> Result<usize, String> {
+        // Two starts must not allocate the same id while the tree lock is released.
+        let _reserved = spawning();
+        let (depth, working_dir, policy, remaining_depth, id, log_path, control, sender, pipeline, cfg, profiles, mcp) = {
+            let tree = lock(swarm);
+            let caller_agent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
+            let label = caller_agent.label();
+            if caller_agent.archived || caller_agent.stopped || caller_agent.finished() {
+                return Err(format!("{label} is not running"));
+            }
+            let caller_policy = caller_agent.role.restrict(&caller_agent.control.policy());
+            if !tools::grants(&caller_policy.allow_tools, prompt::START_PIPELINE) {
+                return Err(format!("start_pipeline is not granted to {label}"));
+            }
+            let profile = tree.profiles.get(profiles::PIPELINE).ok_or_else(|| {
+                format!("unknown profile {}; available: {}", profiles::PIPELINE, tree.profiles.names())
+            })?;
+            profile.tools(prompt::GRANTABLE_TOOLS)?;
+            let depth = caller_agent.depth.saturating_add(1);
+            if depth > tree.config.max_depth {
+                return Err(format!(
+                    "depth limit: an agent below {label} would be at depth {depth}, past max_depth {}",
+                    tree.config.max_depth
+                ));
+            }
+            let pipeline = tree.pipelines.get(name)?.clone();
+            let policy = if tools::grants(&caller_policy.allow_tools, prompt::FREE_SPAWN) {
+                profile.policy.clone()
+            } else {
+                caller_policy.inherit(&profile.policy)
+            };
+            let effective = profile.role.restrict(&policy);
+            // `refuse` rather than a grant check: a read-only caller cannot pass a `write_file`
+            // preflight, and a deny-all command policy cannot pass `bash`.
+            for required in &pipeline.requires {
+                if let Some(reason) = effective.refuse(required, "{}") {
+                    return Err(format!("pipeline {name} requires {required}: {reason}"));
+                }
+            }
+            let id = tree.agents.len() + 1;
+            let control = Arc::new(Control::default());
+            control.set_policy(effective.clone());
+            (
+                depth,
+                caller_agent.working_dir.clone(),
+                effective,
+                tree.config.max_depth.saturating_sub(depth),
+                id,
+                tree.log_dir.join(format!("agent-{id}.log")),
+                control,
+                tree.sender.clone(),
+                pipeline,
+                Arc::clone(&tree.config),
+                Arc::clone(&tree.profiles),
+                Arc::clone(&tree.mcp),
+            )
+        };
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| config::io_error(log_path.display(), &error))?;
+        let skills = Arc::new(skills::Catalogue::in_dir(&cfg.home, &working_dir));
+        let task = format!("pipeline {name}");
+        // The thread waits for its `Agent` entry: a fast pipeline must not report `Finished` before
+        // the tree has an entry whose `pending` it can decrement.
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let handle = {
+            let tree = Arc::downgrade(swarm);
+            let control = Arc::clone(&control);
+            let sender = sender.clone();
+            let instruction = task.clone();
+            let working_dir = working_dir.clone();
+            thread::spawn(move || {
+                let mut log = log;
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                let _ = sender.send(Event::Instruction { id, text: instruction });
+                let run_flag = Arc::new(AtomicBool::new(false));
+                let host = pipelines::SwarmHost {
+                    swarm: tree,
+                    id,
+                    working_dir,
+                    policy,
+                    skills,
+                    profiles,
+                    mcp,
+                    config: cfg,
+                    remaining_depth,
+                    sender: sender.clone(),
+                    run_flag: Arc::clone(&run_flag),
+                    conflicts: Arc::new(Mutex::new(conflict::Registry::default())),
+                    seen: Arc::new(Mutex::new(edit::Store::default())),
+                };
+                let outcome =
+                    pipelines::execute(&pipeline, &host, &pipelines::Limits::default(), &control.cancel(), &run_flag);
+                let (kind, text) = match outcome {
+                    Ok(report) => (AgentEvent::Finished, report),
+                    Err(_) if control.cancel().load(Ordering::SeqCst) => {
+                        (AgentEvent::Interrupted, "pipeline interrupted".to_string())
+                    }
+                    Err(text) => (AgentEvent::Failed, text),
+                };
+                let _ = writeln!(log, "= {}: {text}", kind.verb());
+                let _ = sender.send(Event::Agent { id, kind, text });
+            })
+        };
+        lock(swarm).agents.push(Agent {
+            id,
+            name: None,
+            parent: Some(caller),
+            depth,
+            working_dir,
+            initial_task: task,
+            profile: profiles::PIPELINE.into(),
+            role: profiles::Role::Worker,
+            archived: false,
+            pending: 1,
+            failed: false,
+            stopped: false,
+            control,
+            inbox: None,
+            busy_since: Some(Instant::now()),
+            last_output: String::new(),
+            handle,
+        });
+        let _ = start_tx.send(());
+        Ok(id)
+    }
+
+    /// Stops one pipeline agent; refuses an agent that is not one.
+    pub(crate) fn stop_pipeline(&mut self, id: usize) -> Result<String, String> {
+        if self.agent(id).is_none() {
+            return Err(format!("no agent {}", self.label(id)));
+        }
+        let label = self.label(id);
+        if self.agent(id).is_none_or(|agent| agent.profile != profiles::PIPELINE) {
+            return Err(format!("{label} is not a pipeline"));
+        }
+        self.stop(id)
     }
 
     fn message(&mut self, caller: usize, args: &MessageArgs) -> Result<String, String> {
@@ -1298,7 +1503,7 @@ impl Swarm {
 
     /// The repositories under the configured roots. The walk runs with the tree lock released: it
     /// recurses the whole filesystem, and every agent's dispatch waits on that lock.
-    fn list_repos(swarm: &Arc<Mutex<Swarm>>) -> String {
+    pub(crate) fn list_repos(swarm: &Arc<Mutex<Swarm>>) -> String {
         let configured = lock(swarm).config.roots.clone();
         let found = repos::find(&configured);
         if found.is_empty() {
@@ -1720,8 +1925,28 @@ mod tests {
         harness_full(Arc::new(llm::testing::Fixed(llm)), &[])
     }
 
-    /// The one builder: a tree whose profiles come from `files`, started at its root.
+    /// Writes the pipeline files a test names under `home`, then loads them the way startup does.
+    fn pipeline_catalogue(home: &Path, files: &[(&str, &str)]) -> Arc<pipelines::Catalogue> {
+        if !files.is_empty() {
+            let dir = home.join(pipelines::ROOT);
+            fs::create_dir_all(&dir).unwrap();
+            for (name, source) in files {
+                fs::write(dir.join(format!("{name}.rhai")), source).unwrap();
+            }
+        }
+        Arc::new(pipelines::Catalogue::load(home))
+    }
+
+    /// The one builder: a tree whose profiles and pipelines come from `files`, started at its root.
     fn harness_full(models: Arc<dyn llm::Models>, files: &[(&str, &str)]) -> Harness {
+        harness_with_pipelines(models, files, &[])
+    }
+
+    fn harness_with_pipelines(
+        models: Arc<dyn llm::Models>,
+        files: &[(&str, &str)],
+        pipeline_files: &[(&str, &str)],
+    ) -> Harness {
         let root = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
@@ -1729,8 +1954,17 @@ mod tests {
         let (sender, queue) = mpsc::channel();
         let mcp = Arc::new(mcp::Registry::load(root.path()));
         let profiles = catalogue(root.path(), files);
+        let pipelines = pipeline_catalogue(root.path(), pipeline_files);
         let config = Arc::new(test_config(root.path(), 3));
-        let swarm = Arc::new(Mutex::new(Swarm::new(models, profiles, config, logs.path().to_path_buf(), sender, mcp)));
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            models,
+            profiles,
+            pipelines,
+            config,
+            logs.path().to_path_buf(),
+            sender,
+            mcp,
+        )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
     }
@@ -2839,5 +3073,68 @@ mod tests {
         // Agent 2 is agent 3's sibling, not its owner, and its profile grants control_agent.
         let outside = tool(&h.swarm, 2, prompt::CONTROL_AGENT, &json!({"id": 3, "action": "archive"}));
         assert!(outside.contains("not under your command"), "{outside}");
+    }
+
+    /// Applies one pipeline's events to the tree the way the session does, until it settles.
+    fn settle_pipeline(h: &Harness, id: usize) -> State {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(event) = h.queue.recv_timeout(Duration::from_millis(20))
+                && let Event::Agent { id: reported, kind, text } = event
+            {
+                h.swarm.lock().unwrap().finish_turn(reported, kind, &text);
+            }
+            let state = h.swarm.lock().unwrap().agent_state(Swarm::ROOT, id).ok();
+            if state == Some(State::Done) || state == Some(State::Failed) {
+                return state.unwrap_or(State::Failed);
+            }
+        }
+        panic!("the pipeline never settled");
+    }
+
+    #[test]
+    fn a_pipeline_preflight_refuses_a_missing_tool_before_spawning() {
+        // A supervisor without `free_spawn` can only pass on what it holds itself, and it never
+        // holds `write_file`.
+        let h = harness_with_pipelines(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[("supervisor", "description: Strict.\nallow_tools: [read_file, bash, start_pipeline, list_pipelines]")],
+            &[("needs_write", "//! requires: write_file\nwrite_text(\"x\", \"y\");\n")],
+        );
+        let before = h.swarm.lock().unwrap().snapshot().len();
+        let error = Swarm::start_pipeline(&h.swarm, Swarm::ROOT, "needs_write").unwrap_err();
+        assert!(error.contains("pipeline needs_write requires write_file:"), "{error}");
+        assert_eq!(h.swarm.lock().unwrap().snapshot().len(), before, "a refused preflight creates nothing");
+    }
+
+    #[test]
+    fn a_pipeline_runs_as_a_child_and_reports() {
+        let h = harness_with_pipelines(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[],
+            &[("fixture", "//! requires:\nreport(\"done\");\n")],
+        );
+        let id = Swarm::start_pipeline(&h.swarm, Swarm::ROOT, "fixture").unwrap();
+        assert_eq!(id, 2, "the root is agent 1");
+        assert_eq!(h.swarm.lock().unwrap().snapshot().len(), 2);
+        let profile = h.swarm.lock().unwrap().snapshot().get(1).map(|agent| agent.profile.clone());
+        assert_eq!(profile, Some("pipeline".to_string()));
+        assert_eq!(settle_pipeline(&h, id), State::Done);
+        assert_eq!(h.swarm.lock().unwrap().agent_output(Swarm::ROOT, id).unwrap(), "done");
+    }
+
+    #[test]
+    fn a_pipeline_can_be_stopped() {
+        let h = harness_with_pipelines(
+            Arc::new(llm::testing::Fixed(Arc::new(Scripted::new(vec![])))),
+            &[],
+            &[("slow", "//! requires:\nsleep_ms(5000);\n")],
+        );
+        let id = Swarm::start_pipeline(&h.swarm, Swarm::ROOT, "slow").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let line = h.swarm.lock().unwrap().stop_pipeline(id).unwrap();
+        assert!(line.contains("stopped"), "{line}");
+        assert_eq!(h.swarm.lock().unwrap().agent_state(Swarm::ROOT, id), Ok(State::Stopped));
+        assert!(!h.swarm.lock().unwrap().busy(), "a stopped pipeline stops counting as work");
     }
 }

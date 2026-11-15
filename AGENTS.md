@@ -47,6 +47,7 @@
 | `src/slash.rs` | the slash-command table the composer's completion popup reads |
 | `src/mcp/` | MCP servers: config discovery, stdio and HTTP clients, OAuth, the registry an agent calls `mcp__` tools through |
 | `src/profiles.rs` | agent profiles discovered from `~/.overseer/agent/profiles`, the built-in profiles, the `Role` that narrows one, and the text `profile://` reads |
+| `src/pipelines.rs` | the Rhai pipeline catalogue, the `//! requires:` parser, the hardened engine, the host SDK and the bounded runner |
 | `src/conflict.rs` | the conflict registry: numbered merge-conflict blocks an agent resolves by `conflict://<N>` |
 | `src/artifacts.rs` | tool output too large for one result, kept per process and read back by `artifact://` |
 | `src/jobs.rs` | background `bash` commands, their pipes and process groups, behind `proc://` |
@@ -75,6 +76,7 @@
 - A profile's `allow_tools` is the whole right: tools are granted one by one, `mcp__<server>` grants one server's tools, and an empty list leaves an agent able to think and answer only. No tool changes a policy after the agent starts.
 - A child gets the intersection of the two tool lists. `free_spawn` is a grant, not a callable tool: an owner that holds it may pass `spawn_agent(free: true)`, and the child then gets its profile's policy. The built-in supervisor grants `free_spawn`, so the read-only root can start full-rights children; a custom `supervisor.md` without it is strict.
 - `spawn_agent` requires a profile, so every agent's rights have one place to be read; `worker` is the generalist (code, configuration, commands).
+- Pipelines are `~/.overseer/pipelines/<name>.rhai`, loaded once at startup like profiles; `/pipeline <name>` or `start_pipeline` runs one as a child agent in the caller's directory, and it stops with the session. Each file opens with `//! requires: <tool>[, <tool>...]`, and every run is bounded by an operation count, a wall clock and the engine's data sizes.
 - `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
