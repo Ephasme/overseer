@@ -89,6 +89,9 @@ const PROMPT_FRAME: border::Set = border::Set {
     horizontal_bottom: " ",
 };
 
+/// A bubble's bar: two columns down its left, on every row of the message.
+const BUBBLE_BAR: &str = "▌ ";
+
 /// A panel's edge: one quiet column, no corners, so the panel reads as a region, not a box.
 const SIDE_RULE: border::Set = border::Set {
     top_left: " ",
@@ -173,11 +176,17 @@ impl Entry {
     fn lines(&self, width: u16, spinning: usize, expand: bool) -> Vec<Line<'static>> {
         let width = usize::from(width).max(8);
         match self.role {
+            // The user's side: a bubble against the left edge, filled, the bar saying whose it is.
             Role::You => {
-                bar("▌ ", Style::new().fg(theme::primary()), &self.body, Style::new().fg(theme::text()), width)
+                let body = bubble_body(&self.body, width, Style::new().fg(theme::text()));
+                bubble(body, Style::new().fg(theme::primary()), theme::you_fill(), false, width)
             }
-            // Prose is Markdown: headings, lists, emphasis and fences render; the gutter stays plain.
-            Role::Model => markdown(&self.body, "  ", Style::new(), width),
+            // An agent's prose is Markdown, in a bubble of its own pushed to the right edge, so the
+            // conversation reads as two columns like any chat.
+            Role::Model => {
+                let body = markdown(&self.body, "", Style::new(), bubble_text(width));
+                bubble(body, Style::new().fg(theme::accent()), theme::agent_fill(), true, width)
+            }
             // The reasoning is the same model's: marked as not the answer, and quieter than one.
             Role::Thinking => block(
                 "✻ ",
@@ -331,14 +340,46 @@ fn block(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width
     lines
 }
 
-/// A quoted block: every row carries the bar, so a message of several lines reads as one region.
-fn bar(prefix: &str, prefix_style: Style, body: &str, body_style: Style, width: usize) -> Vec<Line<'static>> {
-    let room = width.saturating_sub(text_width(prefix)).max(8);
+/// One side of the conversation as a bubble: the bar down every row and the fill under the whole
+/// rectangle. It is as wide as its longest row and no wider, so a short message still reads as one;
+/// `right` then pushes an agent's answer against the far edge.
+fn bubble(body: Vec<Line<'static>>, bar: Style, fill: Color, right: bool, width: usize) -> Vec<Line<'static>> {
+    let bar_style = bar.bg(fill);
+    let fill_style = Style::new().bg(fill);
+    let bar_width = text_width(BUBBLE_BAR);
+    let widest = body.iter().map(Line::width).max().unwrap_or(0);
+    let room = (widest + bar_width).min(bubble_room(width)).max(bar_width);
+    let inset = if right { " ".repeat(width.saturating_sub(room)) } else { String::new() };
+    body.into_iter()
+        .map(|line| {
+            let used = line.width();
+            let mut spans = vec![Span::raw(inset.clone()), Span::styled(BUBBLE_BAR.to_string(), bar_style)];
+            for span in line.spans {
+                spans.push(Span::styled(span.content, fill_style.patch(span.style)));
+            }
+            spans.push(Span::styled(" ".repeat(room.saturating_sub(bar_width + used)), fill_style));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// How wide a bubble may grow: most of the transcript, so the gap between the two sides reads.
+fn bubble_room(width: usize) -> usize {
+    (width.saturating_mul(3) / 4).max(width.min(24))
+}
+
+/// The columns a bubble's text may take once its bar is paid for.
+fn bubble_text(width: usize) -> usize {
+    bubble_room(width).saturating_sub(text_width(BUBBLE_BAR))
+}
+
+/// Plain text wrapped to the room a bubble leaves, one row per line the user typed.
+fn bubble_body(body: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let room = bubble_text(width);
     let mut lines = Vec::new();
     for source in body.split('\n') {
         for text in wrap(source, room) {
-            lines
-                .push(Line::from(vec![Span::styled(prefix.to_string(), prefix_style), Span::styled(text, body_style)]));
+            lines.push(Line::from(highlight(&text, style)));
         }
     }
     lines
@@ -855,16 +896,13 @@ impl Stream {
         self.dirty_from = self.entries.len();
     }
 
-    /// Blank rows before an entry. Only two pairs touch: a tool call hangs off what it belongs to,
-    /// and a thought runs into the answer it explains. Everything else opens a paragraph.
+    /// Blank rows before an entry: every message, thought and tool call is a block of its own, and
+    /// one blank row keeps them from touching. The reasoning is the one exception, running on from
+    /// one thought to the next so a long deliberation stays a single region.
     fn gap_before(&self, index: usize) -> usize {
         let previous = self.entries.get(index.wrapping_sub(1)).map(|entry| &entry.role);
         let current = self.entries.get(index).map(|entry| &entry.role);
-        let attached = matches!(
-            (previous, current),
-            (Some(Role::You | Role::Model | Role::Thinking | Role::Tool), Some(Role::Tool))
-                | (Some(Role::Model | Role::Thinking), Some(Role::Thinking | Role::Model))
-        );
+        let attached = matches!((previous, current), (Some(Role::Thinking), Some(Role::Thinking)));
         usize::from(index > 0 && !attached)
     }
 
@@ -1054,17 +1092,21 @@ impl Attachment {
     }
 }
 
-/// The composer: one bar on the left, room to breathe, and a half block closing the bar.
+/// The composer: one bar on the left, room to breathe, and a half block closing the bar. It sits on
+/// the same fill as the user's own words, so typing and what was typed share one surface.
 fn composer() -> TextArea<'static> {
     let mut area = TextArea::default();
+    let fill = Style::new().bg(theme::you_fill());
     // The crate underlines the line holding the caret; this UI does not want underlines.
     area.set_cursor_line_style(Style::new());
+    area.set_style(fill);
     area.set_block(
         Block::new()
             .borders(Borders::LEFT | Borders::BOTTOM)
             .border_set(PROMPT_FRAME)
             .border_style(Style::new().fg(theme::edge()))
-            .padding(Padding::new(1, 1, 1, 0)),
+            .padding(Padding::new(1, 1, 1, 0))
+            .style(fill),
     );
     area.set_placeholder_text("Ask agent 1, /resume <id>, /schemes, or exit");
     area.set_wrap_mode(WrapMode::WordOrGlyph);
@@ -1401,7 +1443,8 @@ impl App {
             .borders(Borders::LEFT | Borders::BOTTOM)
             .border_set(PROMPT_FRAME)
             .border_style(Style::new().fg(theme::warning()))
-            .padding(Padding::new(1, 1, 1, 0));
+            .padding(Padding::new(1, 1, 1, 0))
+            .style(Style::new().bg(theme::you_fill()));
         let line = Line::from(vec![
             Span::styled(format!("rename {} ", rename.label), Style::new().fg(theme::warning())),
             Span::styled("› ", Style::new().fg(theme::warning())),
@@ -3438,20 +3481,61 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_hangs_off_its_message_and_the_next_entry_starts_a_paragraph() {
+    fn every_entry_is_a_block_of_its_own_and_only_two_thoughts_touch() {
         let mut app = App::new("m");
         app.apply(UiEvent::Answer("on it".into()));
         tool_call(&mut app, 0, "bash", "ls");
         screen(&mut app, 60, 16);
         let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
-        assert_eq!(rows.len(), 2, "the call sits under its message, no blank row between: {rows:?}");
+        assert_eq!(rows.len(), 3, "one blank row keeps the call off the message it answers: {rows:?}");
         assert!(rows[0].contains("on it"), "{rows:?}");
-        assert!(rows[1].contains("$ ls"), "{rows:?}");
+        assert!(rows[1].is_empty(), "{rows:?}");
+        assert!(rows[2].contains("$ ls"), "{rows:?}");
         app.apply(UiEvent::Notice("agent 2 is idle".into()));
         screen(&mut app, 60, 16);
         let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
-        assert_eq!(rows.len(), 4, "a notice opens a new paragraph: {rows:?}");
-        assert!(rows[2].is_empty(), "{rows:?}");
+        assert_eq!(rows.len(), 5, "a notice opens a paragraph of its own: {rows:?}");
+        assert!(rows[3].is_empty() && rows[4].contains("agent 2 is idle"), "{rows:?}");
+
+        // The reasoning is the one pair that runs on: two thoughts of one answer read as one region.
+        let mut app = App::new("m");
+        for (role, body) in
+            [(Role::You, "go"), (Role::Thinking, "first"), (Role::Thinking, "second"), (Role::Model, "done")]
+        {
+            app.lead.push(Entry::new(role, String::new(), body.into()));
+        }
+        screen(&mut app, 60, 16);
+        let rows: Vec<String> = app.lead.transcript.iter().map(|line| row_text(std::slice::from_ref(line))).collect();
+        let first = rows.iter().position(|row| row.contains("first")).expect("the first thought is on screen");
+        let second = rows.iter().position(|row| row.contains("second")).expect("the second one too");
+        assert_eq!(second, first + 1, "the thoughts touch: {rows:?}");
+        assert!(rows.last().is_some_and(|row| row.contains("done")), "the answer is a block apart: {rows:?}");
+    }
+
+    #[test]
+    fn an_answer_is_a_bubble_pushed_right_and_the_users_words_one_flush_left() {
+        let mut app = App::new("m");
+        app.echo("the question");
+        app.apply(UiEvent::Answer("the answer".into()));
+        app.toggle_workers();
+        let buffer = drawn(&mut app, 80, 24);
+        let cell = |x: u16, y: u16| buffer.cell((x, y));
+        let fill = |x: u16, y: u16| cell(x, y).map(|cell| cell.bg);
+        let rows: Vec<String> =
+            (0..24).map(|y| (0..80).map(|x| cell(x, y).map_or(" ", ratatui::buffer::Cell::symbol)).collect()).collect();
+        let at = |needle: &str| {
+            let row = rows.iter().position(|row| row.contains(needle)).expect("the line is on screen");
+            u16::try_from(row).expect("24 rows fit a u16")
+        };
+        let (question, answer) = (at("the question"), at("the answer"));
+        // The transcript insets two columns each side: the user's bubble starts on the left one, the
+        // answer's ends on the right one, and neither crosses to the other side.
+        assert_eq!(fill(2, question), Some(theme::you_fill()), "{}", rows[usize::from(question)]);
+        assert_eq!(fill(77, answer), Some(theme::agent_fill()), "{}", rows[usize::from(answer)]);
+        assert_ne!(fill(2, answer), Some(theme::agent_fill()), "{}", rows[usize::from(answer)]);
+        // The composer shares the fill of what the user typed.
+        assert_eq!(fill(0, 20), Some(theme::you_fill()), "the composer is filled");
+        assert_eq!(fill(79, 20), Some(theme::you_fill()));
     }
 
     #[test]
