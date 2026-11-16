@@ -1,3 +1,4 @@
+use crate::bounds;
 use crate::llm::{Llm, Message, ToolCall};
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -21,6 +22,7 @@ pub(crate) struct Turn<'a> {
     /// Invoked with the reply the moment it is committed to history: the session-record writer
     /// uses it to keep the model's answer in the JSONL log. `None` in tests.
     pub(crate) on_commit: Option<&'a mut dyn FnMut(&Message)>,
+    pub(crate) bounds: Option<&'a bounds::Bounds>,
 }
 
 impl Turn<'_> {
@@ -33,12 +35,18 @@ impl Turn<'_> {
         history.push(Message::user(input));
         let mut rounds = 0;
         loop {
+            // Budget first: a blown bound is terminal for the session, so it owns the message even
+            // when the fleet stop also raised the interrupt flag in the same instant.
+            if let Some(refusal) = self.over_budget() {
+                history.truncate(base);
+                bail!(refusal);
+            }
             if cancelled(self.cancel) {
                 history.truncate(base);
                 bail!(INTERRUPTED);
             }
             let reply = match self.llm.chat(history, self.tool_defs, self.cancel) {
-                Ok(reply) => reply,
+                Ok((reply, _usage)) => reply,
                 Err(e) => {
                     history.truncate(base);
                     return Err(e);
@@ -46,6 +54,10 @@ impl Turn<'_> {
             };
             // An order that landed while the call was in flight still owns the outcome: the
             // answer it raced is not the one that was asked for.
+            if let Some(refusal) = self.over_budget() {
+                history.truncate(base);
+                bail!(refusal);
+            }
             if cancelled(self.cancel) {
                 history.truncate(base);
                 bail!(INTERRUPTED);
@@ -76,6 +88,10 @@ impl Turn<'_> {
                 history.last().and_then(|message| message.tool_calls.clone()).unwrap_or_default();
             let mut outputs: Vec<(String, String)> = Vec::with_capacity(calls.len());
             for call in &calls {
+                if let Some(refusal) = self.over_budget() {
+                    history.truncate(base);
+                    bail!(refusal);
+                }
                 if cancelled(self.cancel) {
                     history.truncate(base);
                     bail!(INTERRUPTED);
@@ -86,6 +102,13 @@ impl Turn<'_> {
                 history.push(Message::tool(&id, output));
             }
         }
+    }
+}
+
+impl Turn<'_> {
+    /// Why the session bound refuses to continue, or `None` while it fits.
+    fn over_budget(&self) -> Option<String> {
+        self.bounds.and_then(bounds::Bounds::exceeded).map(|reason| format!("session budget exceeded: {reason}"))
     }
 }
 
@@ -115,6 +138,7 @@ mod tests {
             },
             cancel: None,
             on_commit: None,
+            bounds: None,
         };
         let answer = turn.run(&mut history, "go").unwrap();
         assert_eq!(answer, "done");
@@ -130,7 +154,12 @@ mod tests {
     fn failed_chat_leaves_history_untouched() {
         struct Failing;
         impl Llm for Failing {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> Result<(Message, Option<crate::llm::Usage>)> {
                 bail!("boom")
             }
         }
@@ -142,6 +171,7 @@ mod tests {
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
             on_commit: None,
+            bounds: None,
         };
         assert!(turn.run(&mut history, "go").is_err());
         assert_eq!(history.len(), 1);
@@ -159,6 +189,7 @@ mod tests {
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
             on_commit: None,
+            bounds: None,
         };
         let err = turn.run(&mut history, "go").unwrap_err();
         assert!(err.to_string().contains("neither text nor tool calls"), "{err}");
@@ -185,10 +216,28 @@ mod tests {
             },
             cancel: Some(&flag),
             on_commit: None,
+            bounds: None,
         };
         let err = turn.run(&mut history, "go").unwrap_err();
         assert_eq!(err.to_string(), "interrupted");
         assert_eq!(ran, 1, "the second call of the batch still ran");
         assert!(history.is_empty(), "an interrupted turn left history behind");
+    }
+
+    #[test]
+    fn a_blown_session_budget_fails_the_turn_before_any_model_call() {
+        let llm = Scripted::new(vec![text("never asked")]);
+        let budget = bounds::Bounds::expired_for_test();
+        let mut history = vec![Message::system("sys".into())];
+        let mut turn = Turn {
+            llm: &llm,
+            tool_defs: &json!([]),
+            execute: &mut |_: &ToolCall| String::new(),
+            cancel: None,
+            bounds: Some(&budget),
+        };
+        let err = turn.run(&mut history, "go").unwrap_err();
+        assert_eq!(err.to_string(), "session budget exceeded: time");
+        assert_eq!(history.len(), 1, "the user line of a refused turn stays out of the history");
     }
 }
