@@ -12,8 +12,21 @@ use std::thread;
 pub(crate) struct Args {
     /// A prompt given with `-p`/`--print`: one turn, then exit.
     pub(crate) print: Option<String>,
+    /// An explicit `--mode`: JSON lines, or text, which also takes line mode.
+    pub(crate) mode: Option<Mode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Text,
+    Json,
+}
+
+impl Args {
     /// `--mode json`: every event becomes one compact JSON line on stdout.
-    pub(crate) json: bool,
+    pub(crate) fn json(&self) -> bool {
+        self.mode == Some(Mode::Json)
+    }
 }
 
 /// Line mode: stdin lines become events, `UiEvent`s become plain lines.
@@ -22,7 +35,9 @@ pub(crate) struct Args {
 pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, args: &Args) -> anyhow::Result<()> {
     if let Some(prompt) = &args.print {
         // The prompt reaches the model verbatim, never the line parser: `exit` is a prompt, not a command.
-        let _ = input.send(Event::User(prompt.clone()));
+        input
+            .send(Event::User(prompt.clone()))
+            .map_err(|_| anyhow::anyhow!("the core is not running; the prompt was not delivered"))?;
         let _ = input.send(Event::Eof);
     } else {
         spawn_stdin_reader(input);

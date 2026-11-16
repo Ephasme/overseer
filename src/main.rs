@@ -101,10 +101,10 @@ fn main() -> Result<()> {
 }
 
 /// A terminal on both ends, unless `OVERSEER_PLAIN` asks for line mode anyway, or the run is
-/// headless (`-p`/`--print` or `--mode json`), which always takes line mode.
+/// headless (`-p`/`--print` or an explicit `--mode`, text included), which always takes line mode.
 fn tui_available(args: &Args) -> bool {
     args.print.is_none()
-        && !args.json
+        && args.mode.is_none()
         && env::var_os(config::PLAIN).is_none()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
@@ -113,7 +113,7 @@ fn tui_available(args: &Args) -> bool {
 /// The whole CLI: only `-p`/`--print` and `--mode`. Hand-rolled, no arg crate.
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
     let mut print: Option<String> = None;
-    let mut json = false;
+    let mut mode: Option<plain::Mode> = None;
     let mut mode_seen = false;
     let mut items = args.peekable();
     while let Some(arg) = items.next() {
@@ -155,28 +155,28 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
                     .into_string()
                     .map_err(|_| anyhow::anyhow!("arguments must be UTF-8"))?;
                 match value.as_str() {
-                    "json" => json = true,
-                    "text" => {}
+                    "json" => mode = Some(plain::Mode::Json),
+                    "text" => mode = Some(plain::Mode::Text),
                     other => anyhow::bail!("unknown --mode {other:?}: use text or json"),
                 }
             }
             "--mode=" => anyhow::bail!("--mode needs a value"),
-            value if let Some(mode) = value.strip_prefix("--mode=") => {
+            value if let Some(m) = value.strip_prefix("--mode=") => {
                 if mode_seen {
                     anyhow::bail!("--mode given twice");
                 }
                 mode_seen = true;
-                match mode {
+                match m {
                     "" => anyhow::bail!("--mode needs a value"),
-                    "json" => json = true,
-                    "text" => {}
+                    "json" => mode = Some(plain::Mode::Json),
+                    "text" => mode = Some(plain::Mode::Text),
                     other => anyhow::bail!("unknown --mode {other:?}: use text or json"),
                 }
             }
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
-    Ok(Args { print, json })
+    Ok(Args { print, mode })
 }
 
 #[cfg(test)]
