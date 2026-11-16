@@ -1,4 +1,5 @@
 use crate::agent::{INTERRUPTED, Turn};
+use crate::bounds;
 use crate::config;
 use crate::conflict;
 use crate::edit;
@@ -144,6 +145,12 @@ struct Gate {
 }
 
 impl Control {
+    /// Ends the running turn only, without changing lifecycle flags.
+    fn cut(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Gate> {
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -599,6 +606,7 @@ impl Agent {
 /// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
     models: Arc<dyn llm::Models>,
+    pub(crate) bounds: Arc<bounds::Bounds>,
     profiles: Arc<profiles::Catalogue>,
     /// The pipelines loaded at startup; a start reads it, nothing writes it.
     pipelines: Arc<pipelines::Catalogue>,
@@ -631,9 +639,11 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        bounds: Arc<bounds::Bounds>,
     ) -> Self {
         Self {
             models,
+            bounds,
             profiles,
             pipelines,
             config,
@@ -856,6 +866,8 @@ impl Swarm {
             )
         };
         let recorded = profile.clone();
+        // Read before the call: a `lock(swarm)` temporary there would hold the tree across the spawn.
+        let bounds = Arc::clone(&lock(swarm).bounds);
         let (inbox, handle) = spawn_thread(
             llm,
             sender,
@@ -869,6 +881,7 @@ impl Swarm {
             profiles::Role::Supervisor,
             &log_path,
             swarm,
+            bounds,
         )?;
         lock(swarm).agents.push(Agent {
             id,
@@ -1029,6 +1042,8 @@ impl Swarm {
         };
         let working_dir = config::resolve_dir(&dir, &home)?;
         let recorded = profile.clone();
+        // Read before the call: a `lock(swarm)` temporary there would hold the tree across the spawn.
+        let bounds = Arc::clone(&lock(swarm).bounds);
         let (inbox, handle) = spawn_thread(
             llm,
             sender,
@@ -1042,6 +1057,7 @@ impl Swarm {
             role,
             &log_path,
             swarm,
+            bounds,
         )?;
         lock(swarm).agents.push(Agent {
             id,
@@ -1294,6 +1310,22 @@ impl Swarm {
         } else {
             format!("{label} stopped, with {below} agent(s) below it")
         })
+    }
+
+    /// Cuts the root's turn and stops every worker. The root thread must survive so the user can
+    /// still type, and each later instruction's turn reports the bound rather than reaching a model.
+    pub(crate) fn stop_all(&mut self) {
+        for agent in &mut self.agents {
+            if agent.id == Swarm::ROOT {
+                agent.control.cut();
+            } else {
+                agent.control.stop();
+                agent.inbox = None;
+                agent.stopped = true;
+                agent.pending = 0;
+                agent.busy_since = None;
+            }
+        }
     }
 
     /// Queues `text` for one agent, counting it as pending work.
@@ -1561,6 +1593,7 @@ fn spawn_thread(
     role: profiles::Role,
     records_path: &Path,
     me: &Arc<Mutex<Swarm>>,
+    bounds: Arc<bounds::Bounds>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
     let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
@@ -1597,6 +1630,7 @@ fn spawn_thread(
             control: &control,
             conflicts: conflict::Registry::default(),
             seen: edit::Store::default(),
+            bounds,
         };
         run.run(streamed.as_ref(), &instructions);
     });
@@ -1649,6 +1683,7 @@ struct AgentRun<'a> {
     seen: edit::Store,
     /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
     calls: usize,
+    bounds: Arc<bounds::Bounds>,
 }
 
 impl AgentRun<'_> {
@@ -1723,6 +1758,7 @@ impl AgentRun<'_> {
                 // `Writer::write` takes `&self`, so both closures below share one copied
                 // reference: the execute closure keeps `&mut self` capture without a conflict.
                 let records = self.records;
+                let bounds = Arc::clone(&self.bounds);
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
@@ -1731,6 +1767,7 @@ impl AgentRun<'_> {
                     on_commit: Some(&mut |message: &Message| {
                         records.write(&records::Record::Assistant { message: message.clone() });
                     }),
+                    bounds: Some(&bounds),
                 };
                 turn.run(&mut history, &input)
             };
@@ -1999,6 +2036,7 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
@@ -2012,6 +2050,9 @@ mod tests {
             model: "m".into(),
             theme: config::Theme::Auto,
             max_depth,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.to_path_buf(),
             rule_dir: root.join("overseer").clone(),
             home: root.to_path_buf(),
@@ -2655,8 +2696,13 @@ mod tests {
     struct Sleepy;
 
     impl Llm for Sleepy {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
-            Ok(call("c1", tools::BASH, &json!({"command": "sleep 30"})))
+        fn chat(
+            &self,
+            _: &[Message],
+            _: &Value,
+            _: Option<&AtomicBool>,
+        ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
+            Ok((call("c1", tools::BASH, &json!({"command": "sleep 30"})), None))
         }
     }
 
@@ -2810,7 +2856,12 @@ mod tests {
     fn a_panicking_agent_does_not_keep_the_swarm_busy() {
         struct Panic;
         impl Llm for Panic {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
                 panic!("boom")
             }
         }
