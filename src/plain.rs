@@ -42,8 +42,6 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, args: &Args) -> a
     } else {
         spawn_stdin_reader(input);
     }
-pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
-    spawn_stdin_reader(input);
     // The roster, for the one thing line mode needs from it: the name of an agent it reports on.
     let mut agents: Vec<AgentView> = Vec::new();
     // Which tool each running call was: keyed by (agent id, call number), filled on start.
@@ -53,41 +51,15 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
         match event {
             UiEvent::Answer(text) => {
                 answered = true;
-                if args.json {
+                if args.json() {
                     out(&json!({"type": "answer", "text": text}).to_string());
                 } else {
                     out(&text);
-            UiEvent::Notice(line) => err(&format!("overseer: {line}")),
-            UiEvent::Error(line) => err(&format!("error: {line}")),
-            UiEvent::Debug(line) => err(&line),
-            UiEvent::Answer(text) => out(&text),
-            UiEvent::Agent { id, kind, text } => {
-                let mut stderr = io::stderr().lock();
-                let mut lines = text.lines();
-                // The id comes first, as in the transcript; the name follows it because a person reads this too.
-                let _ = writeln!(
-                    stderr,
-                    "agent {id} · {} {}: {}",
-                    name(&agents, id),
-                    kind.verb(),
-                    lines.next().unwrap_or_default()
-                );
-                for line in lines {
-                    let _ = writeln!(stderr, "  {line}");
                 }
             }
-            UiEvent::Out { id, text } => out(&format!("[agent {id} · {} out]\n{text}", name(&agents, id))),
-            UiEvent::Progress { id, progress } => err(&format!("[{}] {}", label(&agents, id), describe(&progress))),
-            // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
-            UiEvent::AgentDelta { .. }
-            | UiEvent::AgentThought { .. }
-            | UiEvent::Boundary { .. }
-            | UiEvent::Instruction { .. }
-            | UiEvent::Busy(_) => {}
-            UiEvent::Agents(roster) => agents = roster,
             UiEvent::Done => break,
             event => {
-                let line = if args.json {
+                let line = if args.json() {
                     match json_event(&mut agents, &mut tools, event) {
                         Some(value) => value.to_string(),
                         None => continue,
@@ -365,7 +337,7 @@ mod tests {
         ui_tx.send(UiEvent::Answer("hello".into())).unwrap();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        run(ui_rx, input_tx, &Args { print: Some("hi".into()), json: false }).unwrap();
+        run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: None }).unwrap();
         // The prompt went to the core verbatim, followed by the idle quit.
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
         assert_eq!(input_rx.recv().unwrap(), Event::Eof);
@@ -377,7 +349,7 @@ mod tests {
         let (input_tx, input_rx) = mpsc::channel();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        let error = run(ui_rx, input_tx, &Args { print: Some("hi".into()), json: false }).unwrap_err();
+        let error = run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: None }).unwrap_err();
         assert_eq!(error.to_string(), "the root did not answer");
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
     }
@@ -387,7 +359,7 @@ mod tests {
         let (ui_tx, ui_rx) = mpsc::channel();
         let (input_tx, _) = mpsc::channel();
         ui_tx.send(UiEvent::Done).unwrap();
-        run(ui_rx, input_tx, &Args { print: None, json: false }).unwrap();
+        run(ui_rx, input_tx, &Args { print: None, mode: None }).unwrap();
     }
 
     #[test]
@@ -398,7 +370,7 @@ mod tests {
         ui_tx.send(UiEvent::Answer("hello".into())).unwrap();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        run(ui_rx, input_tx, &Args { print: Some("hi".into()), json: true }).unwrap();
+        run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: Some(Mode::Json) }).unwrap();
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
     }
 }

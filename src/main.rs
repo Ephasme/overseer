@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn no_args_is_line_mode() {
-        assert_eq!(parse(&[]).unwrap(), Args { print: None, json: false });
+        assert_eq!(parse(&[]).unwrap(), Args { print: None, mode: None });
     }
 
     #[test]
@@ -236,10 +236,10 @@ mod tests {
 
     #[test]
     fn mode_json_and_mode_text() {
-        assert_eq!(parse(&["--mode", "json"]).unwrap(), Args { print: None, json: true });
-        assert_eq!(parse(&["--mode=json"]).unwrap(), Args { print: None, json: true });
-        assert_eq!(parse(&["--mode", "text"]).unwrap(), Args { print: None, json: false });
-        assert_eq!(parse(&["--mode=text"]).unwrap(), Args { print: None, json: false });
+        assert_eq!(parse(&["--mode", "json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json) });
+        assert_eq!(parse(&["--mode=json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json) });
+        assert_eq!(parse(&["--mode", "text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text) });
+        assert_eq!(parse(&["--mode=text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text) });
     }
 
     #[test]
