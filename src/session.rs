@@ -1,3 +1,4 @@
+use crate::approvals::Gate;
 use crate::bounds;
 use crate::config;
 use crate::event::UiEvent;
@@ -33,10 +34,12 @@ pub(crate) fn run(
     events: Receiver<Event>,
     ui: Sender<UiEvent>,
     mcp: Arc<mcp::Registry>,
+    approvals: Arc<Gate>,
     shutdown: Arc<AtomicBool>,
     bounds: Arc<bounds::Bounds>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
+    let _ = ui.send(UiEvent::Approvals(approvals.tier()));
     let swarm = Arc::new(Mutex::new(Swarm::new(
         models,
         profiles,
@@ -45,6 +48,7 @@ pub(crate) fn run(
         log_dir,
         input,
         Arc::clone(&mcp),
+        Arc::clone(&approvals),
         Arc::clone(&bounds),
     )));
     if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
@@ -214,6 +218,19 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Notice(line));
                 let _ = ui.send(UiEvent::Agents(agents));
             }
+            Event::ApprovalRequest { id, request, tool, call } => {
+                let _ = ui.send(UiEvent::ApprovalRequest { agent: id, request, tool, call });
+            }
+            Event::Resolve { request, choice } => {
+                approvals.answer(request, choice);
+            }
+            Event::ApprovalWithdrawn { request } => {
+                let _ = ui.send(UiEvent::ApprovalWithdrawn { request });
+            }
+            Event::CycleTier => {
+                let tier = approvals.cycle();
+                let _ = ui.send(UiEvent::Approvals(tier));
+            }
             Event::Progress { id, progress } => {
                 let _ = ui.send(UiEvent::Progress { id, progress });
             }
@@ -311,6 +328,7 @@ mod tests {
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
@@ -328,6 +346,7 @@ mod tests {
                 input_rx,
                 ui,
                 mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
@@ -365,6 +384,7 @@ mod tests {
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
@@ -383,6 +403,7 @@ mod tests {
                 input_rx,
                 ui,
                 mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
@@ -436,6 +457,7 @@ mod tests {
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
@@ -454,6 +476,7 @@ mod tests {
                 input_rx,
                 ui,
                 mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
@@ -482,5 +505,68 @@ mod tests {
                 Err(e) => panic!("no answer reached the frontend ({e}); it saw {seen:?}"),
             }
         }
+    }
+
+    /// An approval request reaches the frontend as a `UiEvent`, and the answer through the
+    /// frontend's input lets the gated call run and the turn finish.
+    #[test]
+    fn an_approval_request_reaches_the_frontend_and_the_answer_runs_the_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a"), "").unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: std::collections::HashMap::new(),
+            dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
+            mcp_project: config::McpProject::On,
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let frontend = input.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![
+                    crate::llm::testing::call("c1", crate::tools::BASH, &serde_json::json!({"command": "ls"})),
+                    text("done"),
+                ])))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, std::collections::HashMap::new())),
+            )
+        });
+        frontend.send(Event::User("run".into())).unwrap();
+        let mut request = None;
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while request.is_none() {
+            assert!(Instant::now() < deadline, "no approval request reached the frontend; it saw {seen:?}");
+            match ui_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(UiEvent::ApprovalRequest { request: id, .. }) => request = Some(id),
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("the frontend stalled ({e}); it saw {seen:?}"),
+            }
+        }
+        frontend.send(Event::Resolve { request: request.unwrap(), choice: crate::approvals::Choice::Once }).unwrap();
+        assert_eq!(next_answer(&ui_rx), "done");
+        frontend.send(Event::Eof).unwrap();
+        handle.join().unwrap().unwrap();
     }
 }

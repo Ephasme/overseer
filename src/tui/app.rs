@@ -1,4 +1,5 @@
 use super::theme;
+use crate::approvals;
 use crate::clipboard;
 use crate::event::UiEvent;
 use crate::names;
@@ -45,7 +46,7 @@ const WHEEL_LINES: u16 = 3;
 const TICK: Duration = Duration::from_millis(120);
 
 /// Key hints, most useful first: a narrow terminal drops the tail rather than the first ones.
-const HINTS: [&str; 8] = [
+const HINTS: [&str; 9] = [
     "enter send",
     "ctrl+j newline",
     "F2 agents",
@@ -53,6 +54,7 @@ const HINTS: [&str; 8] = [
     "F4 view",
     "ctrl+r rename",
     "F5 mouse",
+    "F8 approvals",
     "ctrl+d quit",
 ];
 
@@ -79,6 +81,12 @@ const WORKER_HINTS: [&str; 4] = ["F4 toggle", "ctrl+o expand", "F5 mouse", "ctrl
 
 /// The same line while the rename prompt is open: nothing else takes a key then.
 const RENAME_HINTS: [&str; 2] = ["enter accept", "esc cancel"];
+
+/// The same line while an approval prompt is open: it takes every key but the quit ones.
+const APPROVAL_HINTS: [&str; 4] = ["y allow once", "a always allow", "n deny", "esc deny"];
+
+/// The rows an approval prompt takes over the composer slot, in a worker view as well as the fleet.
+const PROMPT_ROWS: u16 = 3;
 
 /// The composer's frame: one bar down the left, closed by a half block.
 const PROMPT_FRAME: border::Set = border::Set {
@@ -134,6 +142,17 @@ struct Rename {
     label: String,
     /// What the user has typed so far.
     text: String,
+}
+
+struct ApprovalPrompt {
+    /// The agent waiting, by the id that never changes.
+    agent: usize,
+    /// The gate's request id, what the answer carries back.
+    request: u64,
+    /// The gated tool's name.
+    tool: String,
+    /// What the call does, one capped line.
+    call: String,
 }
 
 struct Entry {
@@ -1252,6 +1271,10 @@ pub(super) struct App {
     back_area: Rect,
     /// The rename prompt, while it is open.
     rename: Option<Rename>,
+    /// Gated calls waiting for the user's decision, oldest first.
+    approvals: Vec<ApprovalPrompt>,
+    /// The current approval tier, corrected by the first `UiEvent::Approvals`.
+    tier: approvals::Tier,
     busy: bool,
     busy_since: Instant,
     last_tick: Instant,
@@ -1271,8 +1294,11 @@ impl App {
             composer: composer(),
             attachment: None,
             paste: 0,
+            rename: None,
+            approvals: Vec::new(),
             model: model.to_string(),
             history: Vec::new(),
+            tier: approvals::Tier::Ask,
             recall: None,
             completion: None,
             calls: Vec::new(),
@@ -1290,7 +1316,6 @@ impl App {
             selected: None,
             open: false,
             back_area: Rect::ZERO,
-            rename: None,
             busy: false,
             busy_since: Instant::now(),
             last_tick: Instant::now(),
@@ -1373,6 +1398,11 @@ impl App {
                 }
             }
             UiEvent::Done => self.quit = true,
+            UiEvent::ApprovalRequest { agent, request, tool, call } => {
+                self.approvals.push(ApprovalPrompt { agent, request, tool, call });
+            }
+            UiEvent::Approvals(tier) => self.tier = tier,
+            UiEvent::ApprovalWithdrawn { request } => self.approvals.retain(|prompt| prompt.request != request),
         }
     }
 
@@ -1548,6 +1578,55 @@ impl App {
         Paragraph::new(line).block(block)
     }
 
+    /// The approval prompt, drawn with the rename's frame wherever the user is looking.
+    ///
+    /// The whole call is shown, newlines flattened: approving a multi-line command from its first
+    /// line alone would be approving something the user never read.
+    fn approval_widget(&self, prompt: &ApprovalPrompt, width: u16) -> Paragraph<'static> {
+        let width = usize::from(width.max(24)).saturating_sub(8);
+        let block = Block::new()
+            .borders(Borders::LEFT | Borders::BOTTOM)
+            .border_set(PROMPT_FRAME)
+            .border_style(Style::new().fg(theme::warning()))
+            .padding(Padding::new(1, 1, 1, 0))
+            .style(Style::new().bg(theme::you_fill()));
+        let line = Line::from(vec![
+            Span::styled(
+                format!("approve {} · {} › ", self.label(prompt.agent), prompt.tool),
+                Style::new().fg(theme::warning()),
+            ),
+            Span::styled(truncate(&prompt.call.replace('\n', " ↵ "), width), Style::new().fg(theme::warning())),
+            Span::styled("  (y/a/n, esc deny)", Style::new().fg(theme::warning())),
+        ]);
+        Paragraph::new(line).block(block)
+    }
+
+    /// Whether an approval prompt is open: it takes every key but the two quit ones.
+    pub(super) fn approvals_open(&self) -> bool {
+        !self.approvals.is_empty()
+    }
+
+    /// One key while an approval prompt is open. The event it returns is the one the frontend sends.
+    ///
+    /// A control or alt chord answers nothing: `ctrl+n` is the composer's recall-next, and `ctrl+a`
+    /// must not become a session-wide allow by accident.
+    pub(super) fn approval_key(&mut self, key: KeyEvent) -> Option<Event> {
+        self.dirty = true;
+        let request = self.approvals.first()?.request;
+        let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let choice = match key.code {
+            KeyCode::Char('y' | 'Y') if plain => Some(approvals::Choice::Once),
+            KeyCode::Char('a' | 'A') if plain => Some(approvals::Choice::Always),
+            KeyCode::Char('n' | 'N') if plain => Some(approvals::Choice::Deny),
+            KeyCode::Esc => Some(approvals::Choice::Deny),
+            _ => None,
+        };
+        choice.map(|choice| {
+            self.approvals.remove(0);
+            Event::Resolve { request, choice }
+        })
+    }
+
     /// Whether the rename prompt is open: every key belongs to it until it closes.
     pub(super) fn renaming(&self) -> bool {
         self.rename.is_some()
@@ -1716,7 +1795,9 @@ impl App {
         let view = self.in_worker_view();
         let attached = u16::from(self.attachment.is_some() && !view);
         let rows = if view {
-            0
+            // An approval prompt is drawn over the composer slot in a worker view too: its keys
+            // are taken there, so it must be visible there.
+            if self.approvals.is_empty() { 0 } else { PROMPT_ROWS }
         } else {
             let rows = self.composer.measure(area.width).preferred_rows;
             rows.clamp(3, area.height.saturating_sub(4 + attached).max(3))
@@ -1730,6 +1811,10 @@ impl App {
         .areas(area);
         if view {
             self.render_worker_view(frame, body);
+            if let Some(first) = self.approvals.first() {
+                let prompt = self.approval_widget(first, input.width);
+                frame.render_widget(prompt, input);
+            }
         } else {
             self.body_area = body;
             let transcript = if let Some(width) = self.panel_width(body.width) {
@@ -1745,7 +1830,10 @@ impl App {
             };
             self.render_transcript(frame, transcript);
             self.render_attachment(frame, chip);
-            if self.rename.is_some() {
+            if let Some(first) = self.approvals.first() {
+                let prompt = self.approval_widget(first, input.width);
+                frame.render_widget(prompt, input);
+            } else if self.rename.is_some() {
                 let prompt = self.rename_widget();
                 frame.render_widget(prompt, input);
             } else {
@@ -1888,11 +1976,14 @@ impl App {
         let paused = if paused == 0 { String::new() } else { format!("{paused} paused · ") };
         spans
             .push(Span::styled(format!(" · {working} working · {paused}{idle} idle"), Style::new().fg(theme::muted())));
+        spans.push(Span::styled(format!(" · {}", self.tier.name()), Style::new().fg(theme::muted())));
         if let Some(scroll) = self.scrolled() {
             spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::warning())));
         }
         let used = Line::from(spans.clone()).width();
-        let hints = if self.renaming() {
+        let hints = if !self.approvals.is_empty() {
+            APPROVAL_HINTS.as_slice()
+        } else if self.renaming() {
             RENAME_HINTS.as_slice()
         } else if self.in_worker_view() {
             WORKER_HINTS.as_slice()
