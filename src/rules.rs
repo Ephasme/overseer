@@ -37,6 +37,42 @@ fn found(config_dir: &Path, dir: &Path) -> Vec<PathBuf> {
     seen
 }
 
+/// One discovered rule file: loaded with its text and truncation flag, or skipped on a read error.
+type Entry = (PathBuf, Option<(String, bool)>);
+
+/// The rule files an agent's prompt carries, loaded once at thread start and reused every turn.
+pub(crate) struct Rules {
+    /// Every discovered file in discovery order: repository root first, the agent's directory
+    /// last, then the configuration's.
+    entries: Vec<Entry>,
+}
+
+impl Rules {
+    /// Reads every discovered rule file. A file that cannot be read is skipped, not fatal: the
+    /// prompt names it and `rule://` still surfaces the error on demand.
+    pub(crate) fn load(config_dir: &Path, dir: &Path) -> Self {
+        let entries = found(config_dir, dir)
+            .into_iter()
+            .map(|path| match crate::tools::read_limited(&path, &path.display().to_string()) {
+                Ok((text, cut)) => (path, Some((text, cut))),
+                Err(_) => (path, None),
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Empty means no `<rules>` section at all: neither content nor a skip note.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterates `(path, Some((text, truncated)))` per loaded file, `(path, None)` per skipped one,
+    /// in discovery order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter()
+    }
+}
+
 /// What `rule://` lists: every rule file that governs `dir`, with its size.
 pub(crate) fn list(config_dir: &Path, dir: &Path) -> String {
     let files = found(config_dir, dir);

@@ -10,6 +10,7 @@ use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
 use crate::repos;
+use crate::rules;
 use crate::skills;
 use crate::tools;
 use crate::url;
@@ -1653,7 +1654,6 @@ impl AgentRun<'_> {
         // Discovered once per agent, like the skills: a rule file changed mid-session reaches the
         // agent through `rule://`.
         let rules = rules::Rules::load(&config.rule_dir, self.working_dir);
->>>>>>> 2ee4f2a (fix: harden rule-file loading per code review)
         let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
@@ -1672,6 +1672,7 @@ impl AgentRun<'_> {
                     policy: &policy,
                     children: tree.children(self.id),
                     skills: &skills,
+                    rules: &rules,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
                     profile,
@@ -2387,7 +2388,6 @@ mod tests {
             skills: &skills,
             mcp: &mcp,
             rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
->>>>>>> 2ee4f2a (fix: harden rule-file loading per code review)
             root: false,
         };
         let rendered = prompt::agent_prompt(&facts);

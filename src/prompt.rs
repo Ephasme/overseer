@@ -1,5 +1,6 @@
 use crate::mcp;
 use crate::profiles;
+use crate::rules;
 use crate::skills;
 use crate::tools;
 use serde_json::{Value, json};
@@ -206,6 +207,8 @@ pub(crate) struct AgentFacts<'a> {
     pub(crate) role: profiles::Role,
     /// The agent the user talks to.
     pub(crate) root: bool,
+    /// The instruction files loaded at thread start, carried by every prompt rebuild.
+    pub(crate) rules: &'a rules::Rules,
 }
 
 /// What a supervisor is for. It never changes anything itself: every change belongs to an agent it
@@ -279,6 +282,9 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
             out,
             "Skills you can read: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>\n"
         );
+    }
+    if !facts.rules.is_empty() {
+        out.push_str(&rules_section(facts.rules));
     }
     // A read-only agent is offered no MCP tool, so notes about them would describe calls it cannot
     // make. The servers' prose is fenced: it is theirs, not an instruction of yours.
@@ -403,6 +409,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: Some(reviewer),
@@ -436,6 +443,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: None,
@@ -476,6 +484,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: true,
             profile: profiles.get(profiles::SUPERVISOR),
@@ -509,6 +518,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: None,
