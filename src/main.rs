@@ -17,6 +17,7 @@ mod pipelines;
 mod plain;
 mod profiles;
 mod prompt;
+mod records;
 mod repos;
 mod rules;
 mod secrets;
