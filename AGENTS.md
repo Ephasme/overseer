@@ -37,6 +37,7 @@
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
 | `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
+| `src/records.rs` | JSONL session records: one writer per agent, and the renderer `history://` reads back |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |

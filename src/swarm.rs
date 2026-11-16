@@ -9,6 +9,7 @@ use crate::names;
 use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
+use crate::records;
 use crate::repos;
 use crate::rules;
 use crate::skills;
@@ -16,8 +17,6 @@ use crate::tools;
 use crate::url;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
@@ -279,6 +278,18 @@ impl AgentEvent {
             AgentEvent::Finished => "finished",
             AgentEvent::Failed => "failed",
             AgentEvent::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// The record outcome a turn-ending event writes. `Reply` never ends a turn; it maps with
+/// `Finished` only because the match must be exhaustive.
+impl From<AgentEvent> for records::Outcome {
+    fn from(kind: AgentEvent) -> Self {
+        match kind {
+            AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
+            AgentEvent::Failed => records::Outcome::Failed,
+            AgentEvent::Interrupted => records::Outcome::Interrupted,
         }
     }
 }
@@ -837,7 +848,7 @@ impl Swarm {
             control.set_policy(supervisor.policy.clone());
             (
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 tree.models.get(supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
@@ -1008,7 +1019,7 @@ impl Swarm {
                 dir,
                 tree.config.home.clone(),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 llm,
                 tree.sender.clone(),
@@ -1108,7 +1119,7 @@ impl Swarm {
                 effective,
                 tree.config.max_depth.saturating_sub(depth),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 control,
                 tree.sender.clone(),
                 pipeline,
@@ -1117,11 +1128,8 @@ impl Swarm {
                 Arc::clone(&tree.mcp),
             )
         };
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| config::io_error(log_path.display(), &error))?;
+        let records =
+            records::Writer::create(&log_path).map_err(|error| config::io_error(log_path.display(), &error))?;
         let skills = Arc::new(skills::Catalogue::in_dir(&cfg.home, &working_dir));
         let task = format!("pipeline {name}");
         // The thread waits for its `Agent` entry: a fast pipeline must not report `Finished` before
@@ -1134,11 +1142,12 @@ impl Swarm {
             let instruction = task.clone();
             let working_dir = working_dir.clone();
             thread::spawn(move || {
-                let mut log = log;
+                let records = &records;
                 if start_rx.recv().is_err() {
                     return;
                 }
-                let _ = sender.send(Event::Instruction { id, text: instruction });
+                let _ = sender.send(Event::Instruction { id, text: instruction.clone() });
+                records.write(&records::Record::Instruction { text: instruction });
                 let run_flag = Arc::new(AtomicBool::new(false));
                 let host = pipelines::SwarmHost {
                     swarm: tree,
@@ -1164,7 +1173,8 @@ impl Swarm {
                     }
                     Err(text) => (AgentEvent::Failed, text),
                 };
-                let _ = writeln!(log, "= {}: {text}", kind.verb());
+                let outcome = records::Outcome::from(kind);
+                records.write(&records::Record::Outcome { outcome, text: text.clone() });
                 let _ = sender.send(Event::Agent { id, kind, text });
             })
         };
@@ -1420,7 +1430,7 @@ impl Swarm {
             let lines: Vec<String> = mine
                 .iter()
                 .map(|agent| {
-                    let path = self.log_dir.join(format!("agent-{}.log", agent.id));
+                    let path = self.log_dir.join(format!("agent-{}.jsonl", agent.id));
                     match std::fs::metadata(&path) {
                         Ok(meta) => format!("agent {} {} ({} bytes)", agent.label(), path.display(), meta.len()),
                         Err(_) => format!("agent {} {} (no log)", agent.label(), path.display()),
@@ -1434,10 +1444,10 @@ impl Swarm {
         if !self.visible(caller, id) {
             return Err(format!("agent {} is not under your command", agent.label()));
         }
-        let path = self.log_dir.join(format!("agent-{id}.log"));
+        let path = self.log_dir.join(format!("agent-{id}.jsonl"));
         let label = format!("history://{id}");
         match tools::read_limited_bounded(&path, &label, false) {
-            Ok((Ok(text), cut)) => Ok(tools::with_note(text, cut)),
+            Ok((Ok(text), cut)) => Ok(tools::with_note(records::render(&text), cut)),
             Ok((Err(e), _)) => Err(e),
             Err(_) => Err(format!("agent {} has no log yet", agent.label())),
         }
@@ -1549,14 +1559,10 @@ fn spawn_thread(
     task: Option<String>,
     profile: String,
     role: profiles::Role,
-    log_path: &Path,
+    records_path: &Path,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_err(|e| config::io_error(log_path.display(), &e))?;
+    let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
     let tree = Arc::downgrade(me);
     let stream_sender = sender.clone();
@@ -1576,7 +1582,7 @@ fn spawn_thread(
     ));
     let agent_dir = working_dir.to_path_buf();
     let handle = thread::spawn(move || {
-        let mut log = log;
+        let records = &records;
         let mut run = AgentRun {
             swarm: &tree,
             id,
@@ -1586,7 +1592,7 @@ fn spawn_thread(
             role,
             working_dir: &agent_dir,
             sender: &sender,
-            log: &mut log,
+            records,
             calls: 0,
             control: &control,
             conflicts: conflict::Registry::default(),
@@ -1635,7 +1641,7 @@ struct AgentRun<'a> {
     role: profiles::Role,
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
-    log: &'a mut File,
+    records: &'a records::Writer,
     control: &'a Control,
     /// Conflict blocks this agent has read, by id: resolving one writes only its marker lines.
     conflicts: conflict::Registry,
@@ -1706,7 +1712,7 @@ impl AgentRun<'_> {
             let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
             // Sent before the turn's first delta, so a frontend always reads the instruction first.
             let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
-            let _ = writeln!(self.log, "> {input}");
+            self.records.write(&records::Record::Instruction { text: input.clone() });
             let result = {
                 let context = tools::Context {
                     skills: &skills,
@@ -1714,18 +1720,25 @@ impl AgentRun<'_> {
                     mcp: mcp.as_ref(),
                     scope: Some(&scope),
                 };
+                // `Writer::write` takes `&self`, so both closures below share one copied
+                // reference: the execute closure keeps `&mut self` capture without a conflict.
+                let records = self.records;
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
                     execute: &mut |call: &ToolCall| self.execute(call, control, &context),
                     cancel: Some(control.flag()),
+                    on_commit: Some(&mut |message: &Message| {
+                        records.write(&records::Record::Assistant { message: message.clone() });
+                    }),
                 };
                 turn.run(&mut history, &input)
             };
             // `close` cut this turn and already sent the report: the interrupt it raised must not
             // also be reported as an interruption, and the thread waits for its owner.
             if control.is_closed() {
-                let _ = writeln!(self.log, "= Closed");
+                self.records
+                    .write(&records::Record::Outcome { outcome: records::Outcome::Closed, text: String::new() });
                 continue;
             }
             let (kind, text) = match result {
@@ -1735,7 +1748,8 @@ impl AgentRun<'_> {
                 }
                 Err(e) => (AgentEvent::Failed, format!("{e:#}")),
             };
-            let _ = writeln!(self.log, "= {kind:?}: {text}");
+            let outcome = records::Outcome::from(kind);
+            self.records.write(&records::Record::Outcome { outcome, text: text.clone() });
             let _ = self.sender.send(Event::Agent { id: self.id, kind, text });
         }
     }
@@ -1751,23 +1765,28 @@ impl AgentRun<'_> {
     fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
         // `close` ends the turn and the agent with it, so it is answered here before any dispatch.
         if call.function.name == tools::CLOSE {
-            let Ok(args) = tools::parse_args::<CloseArgs>(&call.function.arguments) else {
-                return "error: invalid arguments: close takes one `report` string".to_string();
+            let output = match tools::parse_args::<CloseArgs>(&call.function.arguments) {
+                Err(_) => "error: invalid arguments: close takes one `report` string".to_string(),
+                Ok(args) if args.report.trim().is_empty() => {
+                    "error: a close needs a report; say what you did and what you did not test".to_string()
+                }
+                Ok(_) if self.parent.is_none() => "error: the root has no owner and cannot close itself".to_string(),
+                Ok(args) => {
+                    let _ =
+                        self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
+                    control.close();
+                    "closed; your report is on its way".to_string()
+                }
             };
-            if args.report.trim().is_empty() {
-                return "error: a close needs a report; say what you did and what you did not test".to_string();
-            }
-            if self.parent.is_none() {
-                return "error: the root has no owner and cannot close itself".to_string();
-            }
-            let _ = self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
-            control.close();
-            return "closed; your report is on its way".to_string();
+            // A close answers its own call: without a Tool record the assistant message would
+            // name a call that never has a result, which a replay would read as a dangling turn.
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
+            return output;
         }
-        // The log keeps the capped summary, never the raw arguments: a `write_file` carries a whole
-        // file, whose content would land on disk in plain text.
+        // The session record keeps the full fidelity the plaintext log never had: raw arguments
+        // live in the assistant record this call follows, the output lands as its own `Tool`
+        // record. The capped summary still goes to the user's progress card.
         let summary = describe(&call.function.name, &call.function.arguments);
-        let _ = writeln!(self.log, "· {} ({} bytes) {summary}", call.function.name, call.function.arguments.len());
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
             let seq = self.calls;
@@ -1784,7 +1803,7 @@ impl AgentRun<'_> {
             && let Some(refusal) = policy.refuse(&call.function.name, &call.function.arguments)
         {
             let output = format!("error: {refusal}");
-            let _ = writeln!(self.log, "{output}");
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
             if let Some(seq) = seq {
                 progress(
                     self.sender,
@@ -1820,7 +1839,7 @@ impl AgentRun<'_> {
                 context,
             )
         };
-        let _ = writeln!(self.log, "{output}");
+        self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
         if let Some(seq) = seq {
             let preview = tools::preview(&call.function.name, &output);
             let secs = started.elapsed().as_secs_f64();
@@ -2261,7 +2280,7 @@ mod tests {
         assert!(log.contains("> one"), "{log}");
         assert!(log.contains("= Finished: done"), "{log}");
         assert!(
-            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.log"),
+            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.jsonl"),
             "{}",
             read_uri(&h, Swarm::ROOT, "history://")
         );
@@ -2693,8 +2712,71 @@ mod tests {
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("> do it") && log.contains("· reply") && log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn a_turns_records_keep_full_fidelity_and_render_back_to_legacy_lines() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "echo hi"})), text("done")]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "run it"), format!("{} started", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Finished, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        // (a) Every line parses as a record.
+        let parsed: Vec<records::Record> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}"))).collect();
+        let kinds: Vec<&str> = parsed
+            .iter()
+            .map(|record| match record {
+                records::Record::Instruction { .. } => "instruction",
+                records::Record::Assistant { .. } => "assistant",
+                records::Record::Tool { .. } => "tool",
+                records::Record::Outcome { .. } => "outcome",
+            })
+            .collect();
+        // The final answer is itself an assistant record (text, no calls).
+        assert_eq!(kinds, ["instruction", "assistant", "tool", "assistant", "outcome"]);
+        // (b) The assistant record carries the raw arguments verbatim: full fidelity.
+        let Some(records::Record::Assistant { message }) =
+            parsed.iter().find(|r| matches!(r, records::Record::Assistant { .. }))
+        else {
+            panic!("no assistant record");
+        };
+        let calls = message.tool_calls.as_deref().unwrap_or_default();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].function.arguments, json!({"command": "echo hi"}).to_string());
+        // (c) history:// renders the legacy lines from those records.
+        let log = read_uri(&h, Swarm::ROOT, "history://2");
+        assert!(log.contains("> run it"), "{log}");
+        assert!(log.contains("· bash"), "{log}");
+        assert!(log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_records_its_outcome_and_no_finished() {
+        // The second turn gets its own long command: with an instant scripted reply it could
+        // finish before this test reads the file, adding a Finished outcome it never saw written.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "sleep 30"})),
+            call("c2", tools::BASH, &json!({"command": "sleep 30"})),
+            text("done"),
+        ]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
+        let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
+        let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "now", "urgent": true}));
+        assert_eq!(sent, format!("interrupted {}; it reads your message now", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Interrupted, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        let parsed: Vec<records::Record> = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        let outcomes: Vec<&records::Outcome> = parsed
+            .iter()
+            .filter_map(|record| match record {
+                records::Record::Outcome { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, [&records::Outcome::Interrupted]);
     }
 
     #[test]
@@ -2859,7 +2941,7 @@ mod tests {
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "urgent done".into() };
         assert_eq!(next_event(&h.queue), finished);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("interrupted by overseer"), "{log}");
         assert!(log.contains("> now"), "{log}");
     }
@@ -3060,7 +3142,7 @@ mod tests {
         let mut log = String::new();
         while !log.contains("finished] built and tested") {
             assert!(Instant::now() < deadline, "the root never read the report: {log}");
-            log = fs::read_to_string(h.logs.path().join("agent-1.log")).unwrap_or_default();
+            log = records::render(&fs::read_to_string(h.logs.path().join("agent-1.jsonl")).unwrap_or_default());
             thread::sleep(Duration::from_millis(10));
         }
         let archived = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "archive"}));
