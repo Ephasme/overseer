@@ -1,5 +1,6 @@
 mod agent;
 mod artifacts;
+mod bounds;
 mod clipboard;
 mod config;
 mod conflict;
@@ -32,11 +33,12 @@ mod vault;
 mod version;
 
 use anyhow::{Context, Result};
+use bounds::Bounds;
 use event::UiEvent;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 use plain::Args;
@@ -46,12 +48,19 @@ fn main() -> Result<()> {
         Ok(args) => args,
         Err(error) => {
             eprintln!("overseer: {error}");
-            eprintln!("usage: overseer [-p <prompt> | --print <prompt>] [--mode text|json]");
+            eprintln!("usage: overseer [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>]");
             std::process::exit(2);
         }
     };
+    let flag_time = args.max_time.map(Duration::from_secs);
+    let flag_cost = args.max_cost;
     let home = config::home()?;
     let cfg = config::load(&home)?;
+    // A CLI flag overrides the file's bound; the merge happens here so every reader of `cfg` —
+    // the bounds, the startup notice, `cfg://` — sees the same effective value.
+    let mut cfg = cfg;
+    cfg.max_time = flag_time.or(cfg.max_time);
+    cfg.max_cost = flag_cost.or(cfg.max_cost);
     let api_key = secrets::api_key(&home)?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     // Two runs started in the same second must not share, and truncate, each other's worker logs.
@@ -69,8 +78,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let models = Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink)?);
+    let bounds = Arc::new(Bounds::new(cfg.max_time, cfg.max_cost, cfg.pricing.clone()));
+    let models =
+        Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink, Some(Arc::clone(&bounds)))?);
     let profiles = Arc::new(profiles::Catalogue::load(&cfg.home));
+    // A model the pricing table does not name still runs, but its tokens cannot be billed.
+    if cfg.max_cost.is_some() {
+        let unpriced = config::unpriced(&cfg, &profiles.models());
+        if !unpriced.is_empty() {
+            let _ = ui_tx
+                .send(UiEvent::Notice(format!("no pricing for: {}; their tokens count as $0", unpriced.join(", "))));
+        }
+    }
     let pipelines = Arc::new(pipelines::Catalogue::load(&cfg.home));
 
     // Started before the core loop: a server that is slow to connect must not delay startup.
@@ -86,7 +105,7 @@ fn main() -> Result<()> {
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
     let core = thread::spawn(move || {
-        session::run(models, profiles, pipelines, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown)
+        session::run(models, profiles, pipelines, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown, bounds)
     });
 
     let frontend = if tui_available(&args) {
@@ -117,6 +136,8 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
     let mut print: Option<String> = None;
     let mut mode: Option<plain::Mode> = None;
     let mut mode_seen = false;
+    let mut max_time: Option<u64> = None;
+    let mut max_cost: Option<f64> = None;
     let mut items = args.peekable();
     while let Some(arg) = items.next() {
         let arg = arg.into_string().map_err(|_| anyhow::anyhow!("arguments must be UTF-8"))?;
@@ -175,10 +196,52 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
                     other => anyhow::bail!("unknown --mode {other:?}: use text or json"),
                 }
             }
+            "--max-time" => {
+                let value = next_value(&mut items, "--max-time")?;
+                max_time = Some(seconds(&value)?);
+            }
+            "--max-time=" => anyhow::bail!("--max-time needs a value"),
+            value if let Some(seconds) = value.strip_prefix("--max-time=") => {
+                max_time = Some(self::seconds(seconds)?);
+            }
+            "--max-cost" => {
+                let value = next_value(&mut items, "--max-cost")?;
+                max_cost = Some(dollars(&value)?);
+            }
+            "--max-cost=" => anyhow::bail!("--max-cost needs a value"),
+            value if let Some(dollars) = value.strip_prefix("--max-cost=") => {
+                max_cost = Some(self::dollars(dollars)?);
+            }
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
-    Ok(Args { print, mode })
+    Ok(Args { print, mode, max_time, max_cost })
+}
+
+/// The value of a flag given as its own argument; the next item, which may start with `-`.
+fn next_value(items: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> Result<String> {
+    items
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{name} needs a value"))?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("arguments must be UTF-8"))
+}
+
+/// Whole seconds for `--max-time`; zero would trip the bound before any work starts.
+fn seconds(value: &str) -> Result<u64> {
+    match value.parse::<u64>() {
+        Ok(0) => anyhow::bail!("--max-time expects a positive number of seconds, got {value:?}"),
+        Ok(seconds) => Ok(seconds),
+        Err(_) => anyhow::bail!("--max-time expects seconds, got {value:?}"),
+    }
+}
+
+/// Dollars for `--max-cost`: a non-finite or non-positive ceiling would never trip, or trip at once.
+fn dollars(value: &str) -> Result<f64> {
+    match value.parse::<f64>() {
+        Ok(cost) if cost.is_finite() && cost > 0.0 => Ok(cost),
+        _ => anyhow::bail!("--max-cost expects a positive number of dollars, got {value:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +254,7 @@ mod tests {
 
     #[test]
     fn no_args_is_line_mode() {
-        assert_eq!(parse(&[]).unwrap(), Args { print: None, mode: None });
+        assert_eq!(parse(&[]).unwrap(), Args { print: None, mode: None, ..Args::default() });
     }
 
     #[test]
@@ -238,10 +301,22 @@ mod tests {
 
     #[test]
     fn mode_json_and_mode_text() {
-        assert_eq!(parse(&["--mode", "json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json) });
-        assert_eq!(parse(&["--mode=json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json) });
-        assert_eq!(parse(&["--mode", "text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text) });
-        assert_eq!(parse(&["--mode=text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text) });
+        assert_eq!(
+            parse(&["--mode", "json"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode=json"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode", "text"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode=text"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() }
+        );
     }
 
     #[test]

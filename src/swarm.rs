@@ -1,4 +1,5 @@
 use crate::agent::{INTERRUPTED, Turn};
+use crate::bounds;
 use crate::config;
 use crate::conflict;
 use crate::edit;
@@ -144,6 +145,12 @@ struct Gate {
 }
 
 impl Control {
+    /// Ends the running turn only, without changing lifecycle flags.
+    fn cut(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Gate> {
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -562,6 +569,16 @@ impl Agent {
         names::label(self.id, self.name.as_deref())
     }
 
+    /// One place the stop flags become a state: the thread takes no more work, the queued
+    /// instructions are dropped, and the counter and busy mark would otherwise stay set for good.
+    fn retire(&mut self) {
+        self.control.stop();
+        self.inbox = None;
+        self.stopped = true;
+        self.pending = 0;
+        self.busy_since = None;
+    }
+
     /// The one place the flags become a state. Precedence is the order of `State`'s variants.
     fn state(&self) -> State {
         if self.archived {
@@ -599,6 +616,7 @@ impl Agent {
 /// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
     models: Arc<dyn llm::Models>,
+    pub(crate) bounds: Arc<bounds::Bounds>,
     profiles: Arc<profiles::Catalogue>,
     /// The pipelines loaded at startup; a start reads it, nothing writes it.
     pipelines: Arc<pipelines::Catalogue>,
@@ -631,9 +649,11 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        bounds: Arc<bounds::Bounds>,
     ) -> Self {
         Self {
             models,
+            bounds,
             profiles,
             pipelines,
             config,
@@ -1279,13 +1299,7 @@ impl Swarm {
         stopped.push(id);
         for target in &stopped {
             if let Some(agent) = self.agent_mut(*target) {
-                agent.control.stop();
-                agent.inbox = None;
-                agent.stopped = true;
-                // Nothing will run the instructions still queued, so nothing will ever finish
-                // them: the counter and the busy mark would stay set for good.
-                agent.pending = 0;
-                agent.busy_since = None;
+                agent.retire();
             }
         }
         let below = stopped.len().saturating_sub(1);
@@ -1294,6 +1308,18 @@ impl Swarm {
         } else {
             format!("{label} stopped, with {below} agent(s) below it")
         })
+    }
+
+    /// Cuts the root's turn and stops every worker. The root thread must survive so the user can
+    /// still type, and each later instruction's turn reports the bound rather than reaching a model.
+    pub(crate) fn stop_all(&mut self) {
+        for agent in &mut self.agents {
+            if agent.id == Swarm::ROOT {
+                agent.control.cut();
+            } else {
+                agent.retire();
+            }
+        }
     }
 
     /// Queues `text` for one agent, counting it as pending work.
@@ -1655,10 +1681,10 @@ impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let (config, mcp, catalogue) = {
+        let (config, mcp, catalogue, bounds) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
             let tree = lock(&swarm);
-            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles))
+            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles), Arc::clone(&tree.bounds))
         };
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
@@ -1731,6 +1757,7 @@ impl AgentRun<'_> {
                     on_commit: Some(&mut |message: &Message| {
                         records.write(&records::Record::Assistant { message: message.clone() });
                     }),
+                    bounds: Some(&bounds),
                 };
                 turn.run(&mut history, &input)
             };
@@ -1999,6 +2026,7 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
@@ -2012,6 +2040,9 @@ mod tests {
             model: "m".into(),
             theme: config::Theme::Auto,
             max_depth,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.to_path_buf(),
             rule_dir: root.join("overseer").clone(),
             home: root.to_path_buf(),
@@ -2486,6 +2517,7 @@ mod tests {
             root.path().join("logs"),
             sender,
             Arc::new(mcp::Registry::load(root.path())),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         assert_eq!(swarm.lock().unwrap().tell_root("go").unwrap(), format!("sent to {}", codename(1)));
@@ -2655,8 +2687,13 @@ mod tests {
     struct Sleepy;
 
     impl Llm for Sleepy {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
-            Ok(call("c1", tools::BASH, &json!({"command": "sleep 30"})))
+        fn chat(
+            &self,
+            _: &[Message],
+            _: &Value,
+            _: Option<&AtomicBool>,
+        ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
+            Ok((call("c1", tools::BASH, &json!({"command": "sleep 30"})), None))
         }
     }
 
@@ -2810,7 +2847,12 @@ mod tests {
     fn a_panicking_agent_does_not_keep_the_swarm_busy() {
         struct Panic;
         impl Llm for Panic {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
                 panic!("boom")
             }
         }

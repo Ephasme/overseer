@@ -1,3 +1,4 @@
+use crate::bounds;
 use crate::config;
 use crate::event::UiEvent;
 use crate::llm::Models;
@@ -33,6 +34,7 @@ pub(crate) fn run(
     ui: Sender<UiEvent>,
     mcp: Arc<mcp::Registry>,
     shutdown: Arc<AtomicBool>,
+    bounds: Arc<bounds::Bounds>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
     let swarm = Arc::new(Mutex::new(Swarm::new(
@@ -43,6 +45,7 @@ pub(crate) fn run(
         log_dir,
         input,
         Arc::clone(&mcp),
+        Arc::clone(&bounds),
     )));
     if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
         let _ = ui.send(UiEvent::Error(e.clone()));
@@ -54,11 +57,39 @@ pub(crate) fn run(
     let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
     // Set when stdin closes: the run ends at the first moment no agent is busy.
     let mut draining = false;
+    // Set once a bound trips: one notice per session, not one per poll.
+    let mut tripped = false;
     while !shutdown.load(Ordering::Relaxed) {
         let event = match events.recv_timeout(SHUTDOWN_POLL) {
-            Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+        // The watchdog rides the same poll: a bound blown while agents are busy is caught here.
+        if !tripped && let Some(reason) = bounds.exceeded() {
+            tripped = true;
+            let (agents, busy) = {
+                let mut tree = lock(&swarm);
+                tree.stop_all();
+                (tree.snapshot(), tree.busy())
+            };
+            let _ = ui.send(UiEvent::Error(format!("session budget exceeded: {reason}; every agent stopped")));
+            let _ = ui.send(UiEvent::Agents(agents));
+            let _ = ui.send(UiEvent::Busy(busy));
+            let unbilled = bounds.unbilled();
+            if unbilled > 0 {
+                let _ = ui.send(UiEvent::Notice(format!(
+                    "{unbilled} model call(s) reported no token counts and were not billed"
+                )));
+            }
+            // Same exit rule as every other busy-falsifying arm: with stdin closed the run ends
+            // here, not after a poll that will never fire.
+            if draining && !busy {
+                break;
+            }
+        }
+        let Some(event) = event else {
+            continue;
         };
         match event {
             Event::Exit => break,
@@ -120,21 +151,29 @@ pub(crate) fn run(
                             let _ = ui.send(UiEvent::Error(format!("not an agent id: {id}")));
                         }
                     },
-                    [name] => match Swarm::start_pipeline(&swarm, Swarm::ROOT, name) {
-                        Ok(id) => {
-                            draining = false;
-                            let (label, agents, busy) = {
-                                let tree = lock(&swarm);
-                                (tree.label(id), tree.snapshot(), tree.busy())
-                            };
-                            let _ = ui.send(UiEvent::Notice(format!("pipeline {name} started as {label}")));
-                            let _ = ui.send(UiEvent::Agents(agents));
-                            let _ = ui.send(UiEvent::Busy(busy));
+                    [name] => {
+                        // A pipeline agent never passes through `Turn`, so the bound cannot stop
+                        // it: once the session is blown, starting one would run unbounded.
+                        if tripped {
+                            let _ = ui.send(UiEvent::Error("session budget exceeded: pipelines are refused".into()));
+                        } else {
+                            match Swarm::start_pipeline(&swarm, Swarm::ROOT, name) {
+                                Ok(id) => {
+                                    draining = false;
+                                    let (label, agents, busy) = {
+                                        let tree = lock(&swarm);
+                                        (tree.label(id), tree.snapshot(), tree.busy())
+                                    };
+                                    let _ = ui.send(UiEvent::Notice(format!("pipeline {name} started as {label}")));
+                                    let _ = ui.send(UiEvent::Agents(agents));
+                                    let _ = ui.send(UiEvent::Busy(busy));
+                                }
+                                Err(line) => {
+                                    let _ = ui.send(UiEvent::Error(line));
+                                }
+                            }
                         }
-                        Err(line) => {
-                            let _ = ui.send(UiEvent::Error(line));
-                        }
-                    },
+                    }
                     _ => {
                         let _ = ui.send(UiEvent::Notice(USAGE.into()));
                     }
@@ -249,6 +288,7 @@ mod tests {
     use super::*;
     use crate::config::{self, Theme};
     use crate::llm::testing::{Scripted, text};
+    use std::collections::HashMap;
     use std::fs;
     use std::sync::mpsc::{Receiver, channel};
     use std::thread;
@@ -265,6 +305,9 @@ mod tests {
             model: "m".into(),
             theme: Theme::Auto,
             max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
@@ -286,6 +329,7 @@ mod tests {
                 ui,
                 mcp,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
         });
         frontend.send(Event::User("hello".into())).unwrap();
@@ -315,6 +359,9 @@ mod tests {
             model: "m".into(),
             theme: Theme::Auto,
             max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
@@ -337,6 +384,7 @@ mod tests {
                 ui,
                 mcp,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
         });
         let mut seen: Vec<String> = Vec::new();
@@ -382,6 +430,9 @@ mod tests {
             model: "m".into(),
             theme: Theme::Auto,
             max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
@@ -404,6 +455,7 @@ mod tests {
                 ui,
                 mcp,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             )
         });
         frontend.send(Event::from_line("/pipeline list").unwrap()).unwrap();
