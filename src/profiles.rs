@@ -211,7 +211,14 @@ impl Catalogue {
         self.by_name.get(name).and_then(|index| self.profiles.get(*index))
     }
 
-    /// The known names, for an error a model reads; the catalogue is never empty.
+    /// Every model the catalogue's profiles name, deduplicated and sorted; `None`s dropped.
+    pub(crate) fn models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self.profiles.iter().filter_map(|profile| profile.model.clone()).collect();
+        models.sort();
+        models.dedup();
+        models
+    }
+
     pub(crate) fn names(&self) -> String {
         self.profiles.iter().map(|profile| profile.name.as_str()).collect::<Vec<&str>>().join(", ")
     }

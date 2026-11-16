@@ -1,11 +1,14 @@
+use crate::bounds;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# Where the root agent starts.\ndir = \"~/code\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +22,20 @@ struct RawConfig {
     dir: Option<String>,
     /// Omitted means `ask`: whether a project `.mcp.json` may start servers.
     mcp_project: Option<String>,
+    /// Whole seconds of wall clock for the session.
+    max_time: Option<u64>,
+    /// Spend ceiling in USD.
+    max_cost: Option<f64>,
+    pricing: Option<HashMap<String, RawPrice>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPrice {
+    #[serde(rename = "in")]
+    input: f64,
+    #[serde(rename = "out")]
+    output: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +56,12 @@ pub(crate) struct Config {
     pub(crate) home: PathBuf,
     /// Whether a project `.mcp.json` may start servers: `off`, `ask` (default) or `on`.
     pub(crate) mcp_project: McpProject,
+    /// Whole seconds of wall clock for the session; `None` runs unbounded.
+    pub(crate) max_time: Option<Duration>,
+    /// Spend ceiling in USD; `None` runs unbounded.
+    pub(crate) max_cost: Option<f64>,
+    /// USD per 1M tokens, keyed by the exact model string.
+    pub(crate) pricing: HashMap<String, bounds::Price>,
 }
 
 /// The gate on a project's `.mcp.json`: cloning into an untrusted repository must not start
@@ -114,7 +137,19 @@ pub(crate) fn describe(cfg: &Config) -> String {
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
 pub(crate) const SETTINGS: &[&str] =
-    &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir", "mcp_project"];
+    &[
+        "roots",
+        "base_url",
+        "model",
+        "theme",
+        "max_depth",
+        "max_time",
+        "max_cost",
+        "dir",
+        "home",
+        "state_dir",
+        "mcp_project",
+    ];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -125,6 +160,8 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "theme" => cfg.theme.name().to_string(),
         "mcp_project" => cfg.mcp_project.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
+        "max_time" => cfg.max_time.map_or_else(|| "unset".to_string(), |time| time.as_secs().to_string()),
+        "max_cost" => cfg.max_cost.map_or_else(|| "unset".to_string(), |cost| format!("${cost}")),
         "dir" => cfg.dir.display().to_string(),
         "home" => cfg.home.display().to_string(),
         "state_dir" => state_dir(&cfg.home).display().to_string(),
@@ -234,6 +271,20 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
     // `ask` is the gate: a cloned repository must not start commands without the user's say.
     let mcp_project = raw.mcp_project.as_deref().map_or(Ok(McpProject::Ask), McpProject::parse)?;
+    let pricing = match raw.pricing {
+        None => HashMap::new(),
+        Some(table) => table
+            .into_iter()
+            .map(|(model, price)| {
+                for (key, value) in [("in", price.input), ("out", price.output)] {
+                    if !value.is_finite() || value <= 0.0 {
+                        bail!("pricing {model:?} {key} must be a positive USD per 1M tokens, got {value:?}");
+                    }
+                }
+                Ok((model, bounds::Price { input: price.input, output: price.output }))
+            })
+            .collect::<Result<HashMap<String, bounds::Price>>>()?,
+    };
     Ok(Config {
         roots,
         base_url: raw.base_url,
@@ -244,7 +295,23 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         rule_dir: path(home).parent().map_or_else(|| home.to_path_buf(), Path::to_path_buf),
         home: home.to_path_buf(),
         mcp_project,
+        max_time: raw.max_time.map(Duration::from_secs),
+        max_cost: raw.max_cost,
+        pricing,
     })
+}
+
+/// Models a `max_cost` session would bill but the pricing table does not name: `cfg.model` plus
+/// every profile's model, deduplicated and sorted. Empty when there is no cost bound at all.
+pub(crate) fn unpriced(cfg: &Config, models: &[String]) -> Vec<String> {
+    if cfg.max_cost.is_none() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = models.iter().chain(std::iter::once(&cfg.model)).cloned().collect();
+    names.sort();
+    names.dedup();
+    names.retain(|model| !cfg.pricing.contains_key(model));
+    names
 }
 
 fn expand_home(path: &str, home: &Path) -> PathBuf {
@@ -381,5 +448,67 @@ model = "m"
 dir = "/nonexistent/x""#;
         let error = parse(text, Path::new("/Users/nobody")).unwrap_err().to_string();
         assert!(error.contains("/nonexistent/x"), "{error}");
+    }
+
+    #[test]
+    fn max_time_max_cost_and_pricing_are_read_when_present() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+max_time = 60
+max_cost = 2.5
+[pricing."gpt-4.1"]
+in = 3.0
+out = 15.0"#;
+        let home = tempfile::tempdir().unwrap();
+        let resolved = parse(text, home.path()).unwrap();
+        assert_eq!(resolved.max_time, Some(Duration::from_secs(60)));
+        assert_eq!(resolved.max_cost, Some(2.5));
+        let price = resolved.pricing.get("gpt-4.1").unwrap();
+        assert_eq!(price.input, 3.0);
+        assert_eq!(price.output, 15.0);
+        assert!(!resolved.pricing.contains_key("missing"));
+    }
+
+    #[test]
+    fn bounds_and_pricing_default_when_absent() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m""#;
+        let home = tempfile::tempdir().unwrap();
+        let resolved = parse(text, home.path()).unwrap();
+        assert_eq!(resolved.max_time, None);
+        assert_eq!(resolved.max_cost, None);
+        assert!(resolved.pricing.is_empty());
+    }
+
+    #[test]
+    fn unpriced_lists_only_the_models_the_table_omits() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "gpt-4.1"
+max_cost = 2.5
+[pricing."gpt-4.1"]
+in = 3.0
+out = 15.0"#;
+        let home = tempfile::tempdir().unwrap();
+        let cfg = parse(text, home.path()).unwrap();
+        let models = vec!["gpt-4.1".to_string(), "main/coding".to_string(), "a-cheap".to_string()];
+        assert_eq!(unpriced(&cfg, &models), ["a-cheap", "main/coding"]);
+        // No cost bound, no notice, whatever the table holds.
+        let unbounded = Config { max_cost: None, ..cfg.clone() };
+        assert_eq!(unpriced(&unbounded, &models), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_pricing_table_refuses_unknown_keys() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+[pricing."gpt-4.1"]
+input = 3.0
+output = 15.0"#;
+        let error = parse(text, tempfile::tempdir().unwrap().path()).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
     }
 }

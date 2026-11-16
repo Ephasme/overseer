@@ -7,13 +7,17 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
-/// How the line-mode frontend was asked to run.
-#[derive(Debug, Clone, PartialEq)]
+/// How the run was asked for on the command line.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Args {
     /// A prompt given with `-p`/`--print`: one turn, then exit.
     pub(crate) print: Option<String>,
     /// An explicit `--mode`: JSON lines, or text, which also takes line mode.
     pub(crate) mode: Option<Mode>,
+    /// `--max-time`: whole seconds of wall clock for the session.
+    pub(crate) max_time: Option<u64>,
+    /// `--max-cost`: spend ceiling in USD.
+    pub(crate) max_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +341,7 @@ mod tests {
         ui_tx.send(UiEvent::Answer("hello".into())).unwrap();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: None }).unwrap();
+        run(ui_rx, input_tx, &Args { print: Some("hi".into()), ..Args::default() }).unwrap();
         // The prompt went to the core verbatim, followed by the idle quit.
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
         assert_eq!(input_rx.recv().unwrap(), Event::Eof);
@@ -349,7 +353,7 @@ mod tests {
         let (input_tx, input_rx) = mpsc::channel();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        let error = run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: None }).unwrap_err();
+        let error = run(ui_rx, input_tx, &Args { print: Some("hi".into()), ..Args::default() }).unwrap_err();
         assert_eq!(error.to_string(), "the root did not answer");
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
     }
@@ -359,7 +363,7 @@ mod tests {
         let (ui_tx, ui_rx) = mpsc::channel();
         let (input_tx, _) = mpsc::channel();
         ui_tx.send(UiEvent::Done).unwrap();
-        run(ui_rx, input_tx, &Args { print: None, mode: None }).unwrap();
+        run(ui_rx, input_tx, &Args { print: None, ..Args::default() }).unwrap();
     }
 
     #[test]
@@ -370,7 +374,7 @@ mod tests {
         ui_tx.send(UiEvent::Answer("hello".into())).unwrap();
         ui_tx.send(UiEvent::Done).unwrap();
         drop(ui_tx);
-        run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: Some(Mode::Json) }).unwrap();
+        run(ui_rx, input_tx, &Args { print: Some("hi".into()), mode: Some(Mode::Json), ..Args::default() }).unwrap();
         assert_eq!(input_rx.recv().unwrap(), Event::User("hi".into()));
     }
 }
