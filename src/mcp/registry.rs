@@ -141,6 +141,7 @@ impl Registry {
             return registry;
         }
         let mut unapproved = Vec::new();
+        let hold = gate == crate::config::McpProject::Ask;
         for index in 0..total {
             if hold && registry.is_unapproved(index) {
                 unapproved.push(index);
@@ -521,6 +522,7 @@ impl Registry {
                 Status::Connecting => "connecting".to_string(),
                 Status::Connected => format!("{} tools", server.tools.len()),
                 Status::OauthRequired { .. } => format!("oauth required (/login {})", server.name),
+                Status::Unapproved => format!("not approved (/approve {})", server.name),
                 Status::Failed(why) => why.lines().next().unwrap_or_default().to_string(),
             };
             let from_project = if server.source == config::Source::Project { " (project)" } else { "" };

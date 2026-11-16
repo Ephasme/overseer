@@ -267,6 +267,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -315,6 +316,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -380,6 +382,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            mcp_project: config::McpProject::On,
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();

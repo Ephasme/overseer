@@ -374,8 +374,6 @@ impl Event {
         if let Some(arg) = line.strip_prefix("/pipeline ") {
             return Some(Event::Pipeline(arg.trim().to_string()));
         }
-        if let Some(arg) = line.strip_prefix("/login") {
-            return Some(Event::Login(arg.trim().to_string()));
         if let Some(arg) = line.strip_prefix("/approve") {
             return Some(Event::Approve(arg.trim().to_string()));
         }
