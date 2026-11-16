@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# Warn once past this spend, in USD; stops nothing.\n# warn_cost = 1.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +29,8 @@ struct RawConfig {
     max_time: Option<u64>,
     /// Spend ceiling in USD.
     max_cost: Option<f64>,
+    /// Spend in USD past which the user is warned once; stops nothing.
+    warn_cost: Option<f64>,
     pricing: Option<HashMap<String, RawPrice>>,
     compaction: Option<RawCompaction>,
 }
@@ -139,6 +141,8 @@ pub(crate) struct Config {
     pub(crate) max_time: Option<Duration>,
     /// Spend ceiling in USD; `None` runs unbounded.
     pub(crate) max_cost: Option<f64>,
+    /// Spend in USD past which the user is warned once; `None` never warns, and nothing stops.
+    pub(crate) warn_cost: Option<f64>,
     /// USD per 1M tokens, keyed by the exact model string.
     pub(crate) pricing: HashMap<String, bounds::Price>,
     /// How and when the oldest messages are summarized.
@@ -226,6 +230,7 @@ pub(crate) const SETTINGS: &[&str] = &[
     "max_depth",
     "max_time",
     "max_cost",
+    "warn_cost",
     "dir",
     "compaction",
     "home",
@@ -245,6 +250,7 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "max_depth" => cfg.max_depth.to_string(),
         "max_time" => cfg.max_time.map_or_else(|| "unset".to_string(), |time| time.as_secs().to_string()),
         "max_cost" => cfg.max_cost.map_or_else(|| "unset".to_string(), |cost| format!("${cost}")),
+        "warn_cost" => cfg.warn_cost.map_or_else(|| "unset".to_string(), |cost| format!("${cost}")),
         "dir" => cfg.dir.display().to_string(),
         "compaction" => format!(
             "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={} threshold={}",
@@ -355,6 +361,16 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     {
         bail!("max_cost must be a positive number of dollars, got {max_cost:?}");
     }
+    if let Some(warn_cost) = raw.warn_cost
+        && (!warn_cost.is_finite() || warn_cost <= 0.0)
+    {
+        bail!("warn_cost must be a positive number of dollars, got {warn_cost:?}");
+    }
+    if let (Some(warn_cost), Some(max_cost)) = (raw.warn_cost, raw.max_cost)
+        && warn_cost >= max_cost
+    {
+        bail!("warn_cost ${warn_cost} must be below max_cost ${max_cost}: a warning past the ceiling never fires");
+    }
     let mut roots = Vec::new();
     for root in &raw.roots {
         let path = expand_home(root, home);
@@ -400,15 +416,16 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         mcp_project,
         max_time: raw.max_time.map(Duration::from_secs),
         max_cost: raw.max_cost,
+        warn_cost: raw.warn_cost,
         pricing,
         compaction: raw.compaction.map_or_else(CompactionSettings::default, CompactionSettings::from),
     })
 }
 
-/// Models a `max_cost` session would bill but the pricing table does not name: `cfg.model` plus
-/// every profile's model, deduplicated and sorted. Empty when there is no cost bound at all.
+/// Models a cost ceiling or warning would bill but the pricing table does not name: `cfg.model` plus
+/// every profile's model, deduplicated and sorted. Empty when neither limit is set.
 pub(crate) fn unpriced(cfg: &Config, models: &[String]) -> Vec<String> {
-    if cfg.max_cost.is_none() {
+    if cfg.max_cost.is_none() && cfg.warn_cost.is_none() {
         return Vec::new();
     }
     let mut names: Vec<String> = models.iter().chain(std::iter::once(&cfg.model)).cloned().collect();
@@ -578,6 +595,7 @@ base_url = "http://localhost:8080/v1"
 model = "m"
 max_time = 60
 max_cost = 2.5
+warn_cost = 1.0
 [pricing."gpt-4.1"]
 in = 3.0
 out = 15.0"#;
@@ -585,6 +603,8 @@ out = 15.0"#;
         let resolved = parse(text, home.path()).unwrap();
         assert_eq!(resolved.max_time, Some(Duration::from_secs(60)));
         assert_eq!(resolved.max_cost, Some(2.5));
+        assert_eq!(resolved.warn_cost, Some(1.0));
+        assert_eq!(value(&resolved, "warn_cost").unwrap(), "$1");
         let price = resolved.pricing.get("gpt-4.1").unwrap();
         assert_eq!(price.input, 3.0);
         assert_eq!(price.output, 15.0);
@@ -600,6 +620,8 @@ model = "m""#;
         let resolved = parse(text, home.path()).unwrap();
         assert_eq!(resolved.max_time, None);
         assert_eq!(resolved.max_cost, None);
+        assert_eq!(resolved.warn_cost, None);
+        assert_eq!(value(&resolved, "warn_cost").unwrap(), "unset");
         assert!(resolved.pricing.is_empty());
     }
 
@@ -619,6 +641,25 @@ out = 15.0"#;
         // No cost bound, no notice, whatever the table holds.
         let unbounded = Config { max_cost: None, ..cfg.clone() };
         assert_eq!(unpriced(&unbounded, &models), Vec::<String>::new());
+        // A warning alone reads the same table, so it needs the same notice.
+        let warning = Config { max_cost: None, warn_cost: Some(1.0), ..cfg.clone() };
+        assert_eq!(unpriced(&warning, &models), ["a-cheap", "main/coding"]);
+    }
+
+    /// A warning that cannot fire, or one past the ceiling, is a configuration mistake worth failing
+    /// on at startup rather than a session that quietly never warns.
+    #[test]
+    fn warn_cost_must_be_positive_and_below_the_ceiling() {
+        let home = tempfile::tempdir().unwrap();
+        let rest = "roots = [\"/\"]\nbase_url = \"u\"\nmodel = \"m\"";
+        for bad in ["0", "-1", "inf"] {
+            let error = parse(&format!("{rest}\nwarn_cost = {bad}"), home.path()).unwrap_err().to_string();
+            assert!(error.contains("warn_cost must be a positive number"), "{bad}: {error}");
+        }
+        let error = parse(&format!("{rest}\nwarn_cost = 5\nmax_cost = 5"), home.path()).unwrap_err().to_string();
+        assert!(error.contains("must be below max_cost"), "{error}");
+        let ok = parse(&format!("{rest}\nwarn_cost = 1\nmax_cost = 5"), home.path()).unwrap();
+        assert_eq!(ok.warn_cost, Some(1.0));
     }
 
     #[test]

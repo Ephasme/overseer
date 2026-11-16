@@ -33,6 +33,8 @@ pub(crate) enum UiEvent {
     ApprovalWithdrawn { request: u64 },
     /// The tree after a change.
     Agents(Vec<AgentView>),
+    /// What the session has spent: dollars, tokens, and each agent's own share.
+    Meter { cost: f64, tokens: u64, agents: Vec<(usize, crate::bounds::Spend)> },
     /// An agent turn started or finished.
     Busy(bool),
     /// The core loop ended; the frontend may quit.

@@ -89,6 +89,9 @@ pub(crate) fn run(
         }
     }
     let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
+    // What the frontend was last told the session spent: a charge that matches it has nothing new
+    // to show, and this poll runs ten times a second.
+    let (mut metered, mut billed_tokens) = (0.0_f64, 0_u64);
     // Set when stdin closes: the run ends at the first moment no agent is busy.
     let mut draining = false;
     // Set once a bound trips: one notice per session, not one per poll.
@@ -99,6 +102,19 @@ pub(crate) fn run(
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        // The soft ceiling and the meter ride the same poll. A charge only lands when a call
+        // returns, so a value that differs from the last one is one event per model call.
+        if let Some(notice) = bounds.warning() {
+            let _ = ui.send(UiEvent::Notice(notice));
+        }
+        let (cost, tokens) = (bounds.spent(), bounds.tokens());
+        // Bits, not `==`: the comparison only asks whether a charge landed, never whether two
+        // dollars are equal to some precision.
+        if cost.to_bits() != metered.to_bits() || tokens != billed_tokens {
+            metered = cost;
+            billed_tokens = tokens;
+            let _ = ui.send(UiEvent::Meter { cost, tokens, agents: bounds.agents() });
+        }
         // The watchdog rides the same poll: a bound blown while agents are busy is caught here.
         if !tripped && let Some(reason) = bounds.exceeded() {
             tripped = true;
@@ -383,6 +399,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -446,6 +463,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -504,6 +522,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -579,6 +598,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -638,6 +658,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -750,6 +771,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: std::collections::HashMap::new(),
             dir: root.path().to_path_buf(),
             rule_dir: root.path().to_path_buf(),
@@ -796,6 +818,79 @@ mod tests {
         }
         frontend.send(Event::Resolve { request: request.unwrap(), choice: crate::approvals::Choice::Once }).unwrap();
         assert_eq!(next_answer(&ui_rx), "done");
+        frontend.send(Event::Eof).unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
+    /// A charge reaches the frontend twice: once as the meter, once as the warn ceiling's notice,
+    /// and the notice never repeats.
+    #[test]
+    fn a_charge_reaches_the_meter_and_crosses_the_warn_ceiling_once() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            warn_cost: Some(1.0),
+            pricing: HashMap::from([("m".to_string(), crate::bounds::Price { input: 1.0, output: 0.0 })]),
+            dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
+            mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let frontend = input.clone();
+        // The meter is where a charge lands in this build; the model is scripted and reports none,
+        // so the test charges the same meter a real call would.
+        let meter = Arc::new(bounds::Bounds::new(None, None, cfg.pricing.clone()).with_warn_cost(cfg.warn_cost));
+        let charged = Arc::clone(&meter);
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(Vec::new())))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                meter,
+                None,
+            )
+        });
+        charged.account(1, "m", (1_000_000, 0));
+        assert_eq!(charged.spent(), 1.0);
+        let mut saw_meter = None;
+        let mut warn: Option<String> = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while saw_meter.is_none() || warn.is_none() {
+            assert!(Instant::now() < deadline, "the meter never reached the frontend");
+            match ui_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(UiEvent::Meter { cost, tokens, agents }) => saw_meter = Some((cost, tokens, agents)),
+                Ok(UiEvent::Notice(text)) if text.contains("warn_cost") => warn = Some(text),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        let (cost, tokens, agents) = saw_meter.expect("the meter");
+        assert_eq!(cost, 1.0);
+        assert_eq!(tokens, 1_000_000);
+        assert_eq!(agents.len(), 1);
+        let warn = warn.expect("the warn notice");
+        assert!(warn.contains("$1.00"), "{warn}");
+        // A second crossing of the same ceiling says nothing more.
+        charged.account(1, "m", (1_000_000, 0));
         frontend.send(Event::Eof).unwrap();
         handle.join().unwrap().unwrap();
     }

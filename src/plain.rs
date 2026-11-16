@@ -18,6 +18,8 @@ pub(crate) struct Args {
     pub(crate) max_time: Option<u64>,
     /// `--max-cost`: spend ceiling in USD.
     pub(crate) max_cost: Option<f64>,
+    /// `--warn-cost`: spend in USD past which the user is warned once; stops nothing.
+    pub(crate) warn_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +119,8 @@ fn plain_event(agents: &mut Vec<AgentView>, event: UiEvent) {
         | UiEvent::Busy(_)
         | UiEvent::Approvals(_)
         | UiEvent::ApprovalRequest { .. }
-        | UiEvent::ApprovalWithdrawn { .. } => {}
+        | UiEvent::ApprovalWithdrawn { .. }
+        | UiEvent::Meter { .. } => {}
         UiEvent::Agents(roster) => *agents = roster,
         UiEvent::Answer(_) | UiEvent::Done => unreachable!("handled by run"),
     }
@@ -165,7 +168,8 @@ fn json_event(
         | UiEvent::Busy(_)
         | UiEvent::Approvals(_)
         | UiEvent::ApprovalRequest { .. }
-        | UiEvent::ApprovalWithdrawn { .. } => {
+        | UiEvent::ApprovalWithdrawn { .. }
+        | UiEvent::Meter { .. } => {
             return None;
         }
     })

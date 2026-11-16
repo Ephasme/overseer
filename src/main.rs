@@ -101,26 +101,28 @@ fn resume_source(state: &std::path::Path, wanted: &Session) -> Result<Start> {
     }
 }
 
+/// A CLI flag overrides the file's bound; the merge happens here so every reader of the config —
+/// the bounds, the startup notice, `cfg://` — sees the same effective value.
+fn apply_flags(cfg: &mut config::Config, args: &Args) {
+    cfg.max_time = args.max_time.map(Duration::from_secs).or(cfg.max_time);
+    cfg.max_cost = args.max_cost.or(cfg.max_cost);
+    cfg.warn_cost = args.warn_cost.or(cfg.warn_cost);
+}
+
 fn main() -> Result<()> {
     let (args, wanted) = match parse_args(env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("overseer: {error}");
             eprintln!(
-                "usage: overseer [-c | -r [session id]] [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>]"
+                "usage: overseer [-c | -r [session id]] [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>] [--warn-cost <usd>]"
             );
             std::process::exit(2);
         }
     };
-    let flag_time = args.max_time.map(Duration::from_secs);
-    let flag_cost = args.max_cost;
     let home = config::home()?;
-    let cfg = config::load(&home)?;
-    // A CLI flag overrides the file's bound; the merge happens here so every reader of `cfg` —
-    // the bounds, the startup notice, `cfg://` — sees the same effective value.
-    let mut cfg = cfg;
-    cfg.max_time = flag_time.or(cfg.max_time);
-    cfg.max_cost = flag_cost.or(cfg.max_cost);
+    let mut cfg = config::load(&home)?;
+    apply_flags(&mut cfg, &args);
     let api_key = secrets::api_key(&home)?;
     let state = config::state_dir(&cfg.home);
     // Resolved before the new session dir exists, so the picker never lists the session it is
@@ -146,12 +148,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let bounds = Arc::new(Bounds::new(cfg.max_time, cfg.max_cost, cfg.pricing.clone()));
-    let models =
-        Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink, Some(Arc::clone(&bounds)))?);
+    let bounds = Arc::new(Bounds::new(cfg.max_time, cfg.max_cost, cfg.pricing.clone()).with_warn_cost(cfg.warn_cost));
+    let models = Arc::new(llm::Backend::new(&cfg.base_url, api_key, cfg.model.clone(), sink, bounds.wants_usage())?);
     let profiles = Arc::new(profiles::Catalogue::load(&cfg.home));
     // A model the pricing table does not name still runs, but its tokens cannot be billed.
-    if cfg.max_cost.is_some() {
+    if cfg.max_cost.is_some() || cfg.warn_cost.is_some() {
         let unpriced = config::unpriced(&cfg, &profiles.models());
         if !unpriced.is_empty() {
             let _ = ui_tx
@@ -220,6 +221,7 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, S
     let mut mode_seen = false;
     let mut max_time: Option<u64> = None;
     let mut max_cost: Option<f64> = None;
+    let mut warn_cost: Option<f64> = None;
     let mut wanted = Session::Fresh;
     let mut items = args.peekable();
     while let Some(arg) = items.next() {
@@ -289,11 +291,19 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, S
             }
             "--max-cost" => {
                 let value = next_value(&mut items, "--max-cost")?;
-                max_cost = Some(dollars(&value)?);
+                max_cost = Some(dollars("--max-cost", &value)?);
             }
             "--max-cost=" => anyhow::bail!("--max-cost needs a value"),
-            value if let Some(dollars) = value.strip_prefix("--max-cost=") => {
-                max_cost = Some(self::dollars(dollars)?);
+            value if let Some(amount) = value.strip_prefix("--max-cost=") => {
+                max_cost = Some(dollars("--max-cost", amount)?);
+            }
+            "--warn-cost" => {
+                let value = next_value(&mut items, "--warn-cost")?;
+                warn_cost = Some(dollars("--warn-cost", &value)?);
+            }
+            "--warn-cost=" => anyhow::bail!("--warn-cost needs a value"),
+            value if let Some(amount) = value.strip_prefix("--warn-cost=") => {
+                warn_cost = Some(dollars("--warn-cost", amount)?);
             }
             "-c" | "--continue" => wanted = Session::Continue,
             "-r" | "--resume" => {
@@ -311,7 +321,7 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, S
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
-    Ok((Args { print, mode, max_time, max_cost }, wanted))
+    Ok((Args { print, mode, max_time, max_cost, warn_cost }, wanted))
 }
 
 /// The value of a flag given as its own argument; the next item, which may start with `-`.
@@ -333,10 +343,10 @@ fn seconds(value: &str) -> Result<u64> {
 }
 
 /// Dollars for `--max-cost`: a non-finite or non-positive ceiling would never trip, or trip at once.
-fn dollars(value: &str) -> Result<f64> {
+fn dollars(flag: &str, value: &str) -> Result<f64> {
     match value.parse::<f64>() {
         Ok(cost) if cost.is_finite() && cost > 0.0 => Ok(cost),
-        _ => anyhow::bail!("--max-cost expects a positive number of dollars, got {value:?}"),
+        _ => anyhow::bail!("{flag} expects a positive number of dollars, got {value:?}"),
     }
 }
 
@@ -445,6 +455,38 @@ mod tests {
             other => panic!("continue resolved to {other:?}"),
         }
         assert!(matches!(resume_source(state.path(), &Session::Fresh).unwrap(), Start::Fresh));
+    }
+
+    /// The flags a run can carry, and what `apply_flags` does with them: the tested merge is the
+    /// one `main` calls, not a copy of it.
+    #[test]
+    fn the_cost_flags_parse_and_outrank_the_file() {
+        let args = parse(&["--warn-cost", "0.5", "--max-cost=2"]).unwrap();
+        assert_eq!((args.warn_cost, args.max_cost), (Some(0.5), Some(2.0)));
+        assert_eq!(parse(&["--warn-cost=0.25"]).unwrap().warn_cost, Some(0.25));
+        for bad in ["--warn-cost", "--warn-cost=", "--warn-cost=0", "--warn-cost=-1", "--warn-cost=inf"] {
+            assert!(parse(&[bad]).is_err(), "{bad} was accepted");
+        }
+        // A flag wins, and only the flags given: a key the command line omits keeps the file's value.
+        let mut cfg = config::Config {
+            roots: Vec::new(),
+            base_url: String::new(),
+            model: "m".into(),
+            theme: config::Theme::Auto,
+            max_depth: 0,
+            dir: std::path::PathBuf::new(),
+            rule_dir: std::path::PathBuf::new(),
+            home: std::path::PathBuf::new(),
+            approvals: crate::approvals::Tier::Ask,
+            mcp_project: config::McpProject::On,
+            max_time: None,
+            max_cost: Some(9.0),
+            warn_cost: Some(3.0),
+            pricing: std::collections::HashMap::new(),
+            compaction: config::CompactionSettings::default(),
+        };
+        apply_flags(&mut cfg, &parse(&["--warn-cost", "0.5"]).unwrap());
+        assert_eq!((cfg.warn_cost, cfg.max_cost), (Some(0.5), Some(9.0)));
     }
 
     #[test]

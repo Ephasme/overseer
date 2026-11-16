@@ -1328,6 +1328,7 @@ mod tests {
             max_depth: 3,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: std::collections::HashMap::new(),
             dir: dir.to_path_buf(),
             rule_dir: dir.to_path_buf(),
