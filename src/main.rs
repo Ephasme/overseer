@@ -24,6 +24,7 @@ mod repos;
 mod rules;
 mod secrets;
 mod session;
+mod session_store;
 mod skills;
 mod slash;
 mod swarm;
@@ -36,6 +37,7 @@ mod version;
 use anyhow::{Context, Result};
 use bounds::Bounds;
 use event::UiEvent;
+use session_store::ResumeSource;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -44,12 +46,68 @@ use std::{env, fs, thread};
 
 use plain::Args;
 
+/// What the command line asks the session to start from. `flags` is the CLI's own name: `mode` is
+/// already taken by line mode.
+#[derive(Debug, Default, PartialEq)]
+enum Session {
+    #[default]
+    Fresh,
+    Continue,
+    Resume(Option<String>),
+}
+
+/// What the run starts from. Cancelled is a clean exit, not a failure: a picker the user backed out
+/// of must not look like an error in a `&&` chain or a launcher.
+#[derive(Debug)]
+enum Start {
+    Fresh,
+    Resume(ResumeSource),
+    Cancelled,
+}
+
+/// A session id is one directory name under `state/sessions`: no separators, no relative component.
+fn session_dir(state: &std::path::Path, id: &str) -> Result<std::path::PathBuf> {
+    let invalid = id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\');
+    if invalid {
+        anyhow::bail!("not a session id: {id:?}");
+    }
+    let dir = state.join("sessions").join(id);
+    if !session_store::resumable(&dir) {
+        anyhow::bail!("no such session: {id}");
+    }
+    Ok(dir)
+}
+
+/// Resolves the session a `-c` / `-r` asks for, before anything new is created. `state` is already
+/// resolved so a test can point it at a temp dir.
+fn resume_source(state: &std::path::Path, wanted: &Session) -> Result<Start> {
+    match wanted {
+        Session::Fresh => Ok(Start::Fresh),
+        Session::Continue => match session_store::newest(state) {
+            Some(info) => Ok(Start::Resume(ResumeSource { id: info.id, dir: info.dir })),
+            None => anyhow::bail!("no previous session"),
+        },
+        Session::Resume(Some(id)) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, id)? })),
+        Session::Resume(None) => {
+            if !tui_available(&Args::default()) {
+                anyhow::bail!("-r needs a terminal; pass the session id instead");
+            }
+            match tui::picker::run(state)? {
+                Some(id) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, &id)? })),
+                None => Ok(Start::Cancelled),
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    let args = match parse_args(env::args_os().skip(1)) {
-        Ok(args) => args,
+    let (args, wanted) = match parse_args(env::args_os().skip(1)) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("overseer: {error}");
-            eprintln!("usage: overseer [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>]");
+            eprintln!(
+                "usage: overseer [-c | -r [session id]] [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>]"
+            );
             std::process::exit(2);
         }
     };
@@ -63,9 +121,17 @@ fn main() -> Result<()> {
     cfg.max_time = flag_time.or(cfg.max_time);
     cfg.max_cost = flag_cost.or(cfg.max_cost);
     let api_key = secrets::api_key(&home)?;
+    let state = config::state_dir(&cfg.home);
+    // Resolved before the new session dir exists, so the picker never lists the session it is
+    // about to start. A cancelled picker exits cleanly, before any MCP server or thread came up.
+    let resume = match resume_source(&state, &wanted)? {
+        Start::Cancelled => return Ok(()),
+        Start::Fresh => None,
+        Start::Resume(source) => Some(source),
+    };
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     // Two runs started in the same second must not share, and truncate, each other's worker logs.
-    let log_dir = config::state_dir(&cfg.home).join("sessions").join(format!("{started}-{}", std::process::id()));
+    let log_dir = state.join("sessions").join(format!("{started}-{}", std::process::id()));
     fs::create_dir_all(&log_dir).with_context(|| format!("cannot create {}", log_dir.display()))?;
     let (input_tx, input_rx) = mpsc::channel();
     let (ui_tx, ui_rx) = mpsc::channel();
@@ -121,6 +187,7 @@ fn main() -> Result<()> {
             gate,
             shutdown,
             bounds,
+            resume,
         )
     });
 
@@ -144,13 +211,15 @@ fn tui_available(args: &Args) -> bool {
         && std::io::stdout().is_terminal()
 }
 
-/// The whole CLI: only `-p`/`--print` and `--mode`. Hand-rolled, no arg crate.
-fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
+/// The whole CLI: `-p`/`--print`, `--mode`, the two bounds and the session to start from.
+/// Hand-rolled, no arg crate.
+fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, Session)> {
     let mut print: Option<String> = None;
     let mut mode: Option<plain::Mode> = None;
     let mut mode_seen = false;
     let mut max_time: Option<u64> = None;
     let mut max_cost: Option<f64> = None;
+    let mut wanted = Session::Fresh;
     let mut items = args.peekable();
     while let Some(arg) = items.next() {
         let arg = arg.into_string().map_err(|_| anyhow::anyhow!("arguments must be UTF-8"))?;
@@ -225,10 +294,23 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
             value if let Some(dollars) = value.strip_prefix("--max-cost=") => {
                 max_cost = Some(self::dollars(dollars)?);
             }
+            "-c" | "--continue" => wanted = Session::Continue,
+            "-r" | "--resume" => {
+                // Only a token that is not a flag can be an id: `-r -c` asks for the picker and
+                // then continues.
+                let id = items.next_if(|next| !next.to_string_lossy().starts_with('-'));
+                match id {
+                    Some(id) => {
+                        let id = id.into_string().map_err(|_| anyhow::anyhow!("arguments must be UTF-8"))?;
+                        wanted = Session::Resume(Some(id));
+                    }
+                    None => wanted = Session::Resume(None),
+                }
+            }
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
-    Ok(Args { print, mode, max_time, max_cost })
+    Ok((Args { print, mode, max_time, max_cost }, wanted))
 }
 
 /// The value of a flag given as its own argument; the next item, which may start with `-`.
@@ -262,7 +344,106 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args> {
-        parse_args(args.iter().copied().map(std::ffi::OsString::from))
+        parse_args(args.iter().copied().map(std::ffi::OsString::from)).map(|(args, _)| args)
+    }
+
+    fn flags(args: &[&str]) -> Result<Session> {
+        parse_args(args.iter().copied().map(std::ffi::OsString::from)).map(|(_, wanted)| wanted)
+    }
+
+    /// One session dir's `session.jsonl`: a header and the root's agent record.
+    fn session_log() -> String {
+        let policy = r#"{"allow_tools":["bash"],"read_only":true,"allow_commands":[],"deny_commands":[],"deny_all_commands":false}"#;
+        format!(
+            "{{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}}\n{{\"kind\":\"agent\",\"id\":1,\"depth\":0,\"dir\":\"/tmp\",\"task\":\"\",\"profile\":\"supervisor\",\"role\":\"supervisor\",\"policy\":{policy},\"stopped\":false,\"archived\":false,\"pipeline\":false}}\n",
+        )
+    }
+
+    #[test]
+    fn no_flag_is_a_fresh_session() {
+        assert_eq!(flags(&[]).unwrap(), Session::Fresh);
+    }
+
+    #[test]
+    fn the_continue_flags_ask_for_the_newest_session() {
+        assert_eq!(flags(&["-c"]).unwrap(), Session::Continue);
+        assert_eq!(flags(&["--continue"]).unwrap(), Session::Continue);
+    }
+
+    #[test]
+    fn resume_takes_an_optional_id() {
+        assert_eq!(flags(&["-r"]).unwrap(), Session::Resume(None));
+        assert_eq!(flags(&["--resume"]).unwrap(), Session::Resume(None));
+        assert_eq!(flags(&["-r", "1700000000-42"]).unwrap(), Session::Resume(Some("1700000000-42".into())));
+    }
+
+    #[test]
+    fn resume_does_not_swallow_the_next_flag() {
+        // `-r -c` asks for the picker and then continues: an id never starts with a dash.
+        assert_eq!(flags(&["-r", "-c"]).unwrap(), Session::Continue);
+        assert_eq!(flags(&["-r", "--continue"]).unwrap(), Session::Continue);
+    }
+
+    #[test]
+    fn resume_mixes_with_the_other_flags_in_any_order() {
+        let parsed = parse_args(["--mode=json", "-r", "1700000000-42"].into_iter().map(std::ffi::OsString::from));
+        let (args, wanted) = parsed.unwrap();
+        assert_eq!(args.mode, Some(plain::Mode::Json));
+        assert_eq!(wanted, Session::Resume(Some("1700000000-42".into())));
+    }
+
+    #[test]
+    fn a_missing_session_is_named() {
+        let state = tempfile::tempdir().unwrap();
+        let err = resume_source(state.path(), &Session::Resume(Some("nope".into()))).unwrap_err().to_string();
+        assert_eq!(err, "no such session: nope");
+    }
+
+    #[test]
+    fn an_id_cannot_leave_the_state_dir() {
+        let state = tempfile::tempdir().unwrap();
+        for id in ["../..", "/etc", ".", "..", "", "a/b"] {
+            let err = resume_source(state.path(), &Session::Resume(Some(id.into()))).unwrap_err().to_string();
+            assert!(err.starts_with("not a session id:"), "{id:?} gave {err}");
+        }
+    }
+
+    #[test]
+    fn a_session_without_agents_is_not_resumable() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("sessions").join("1700000000-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session.jsonl"), "{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}\n").unwrap();
+        let err = resume_source(state.path(), &Session::Resume(Some("1700000000-1".into()))).unwrap_err().to_string();
+        assert_eq!(err, "no such session: 1700000000-1");
+    }
+
+    #[test]
+    fn continue_without_any_session_says_so() {
+        let state = tempfile::tempdir().unwrap();
+        let err = resume_source(state.path(), &Session::Continue).unwrap_err().to_string();
+        assert_eq!(err, "no previous session");
+    }
+
+    #[test]
+    fn continue_takes_the_newest_resumable_session() {
+        let state = tempfile::tempdir().unwrap();
+        let sessions = state.path().join("sessions");
+        for id in ["1700000000-1", "1700000001-2"] {
+            let dir = sessions.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("session.jsonl"), session_log()).unwrap();
+        }
+        // A newer dir with only the header is not resumable and is passed over.
+        fs::create_dir_all(sessions.join("1700000009-9")).unwrap();
+        fs::write(sessions.join("1700000009-9/session.jsonl"), "{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}\n")
+            .unwrap();
+
+        match resume_source(state.path(), &Session::Continue).unwrap() {
+            Start::Resume(source) => assert_eq!(source.id, "1700000001-2"),
+            other => panic!("continue resolved to {other:?}"),
+        }
+        assert!(matches!(resume_source(state.path(), &Session::Fresh).unwrap(), Start::Fresh));
     }
 
     #[test]
