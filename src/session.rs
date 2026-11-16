@@ -2,9 +2,10 @@ use crate::config;
 use crate::event::UiEvent;
 use crate::llm::Models;
 use crate::mcp;
+use crate::names;
 use crate::pipelines;
 use crate::profiles;
-use crate::swarm::{AgentEvent, Event, Swarm, lock};
+use crate::swarm::{AgentEvent, CompactionNotice, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
 use crate::version;
@@ -228,12 +229,22 @@ pub(crate) fn run(
                     break;
                 }
             }
-            Event::Compacted { id, before, after, over_band } => {
-                let mut line = format!("compacted agent-{id}: {before} → {after} tokens");
-                if over_band {
-                    line.push_str("; still above the recovery band");
-                }
-                let _ = ui.send(UiEvent::Notice(line));
+            Event::Compaction { id, notice } => {
+                let label = names::label(id, None);
+                let event = match notice {
+                    CompactionNotice::Compacted { before, after, over_band } => {
+                        let mut line = format!("compacted {label}: {before} → {after} tokens");
+                        if over_band {
+                            line.push_str("; still above the recovery band");
+                        }
+                        UiEvent::Notice(line)
+                    }
+                    CompactionNotice::Skipped => UiEvent::Notice(format!("nothing older to summarize for {label}")),
+                    CompactionNotice::Failed(error) => {
+                        UiEvent::Error(format!("compaction failed for {label}: {error}"))
+                    }
+                };
+                let _ = ui.send(event);
             }
             Event::User(text) => {
                 draining = false;
@@ -302,10 +313,23 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
         });
-        frontend.send(Event::Compacted { id: 1, before: 900, after: 100, over_band: false }).unwrap();
-        assert_eq!(next_notice(&ui_rx), "compacted agent-1: 900 → 100 tokens");
-        frontend.send(Event::Compacted { id: 2, before: 900, after: 800, over_band: true }).unwrap();
-        assert_eq!(next_notice(&ui_rx), "compacted agent-2: 900 → 800 tokens; still above the recovery band");
+        frontend
+            .send(Event::Compaction {
+                id: 1,
+                notice: CompactionNotice::Compacted { before: 900, after: 100, over_band: false },
+            })
+            .unwrap();
+        assert_eq!(next_notice(&ui_rx), format!("compacted {}: 900 → 100 tokens", names::label(1, None)));
+        frontend
+            .send(Event::Compaction {
+                id: 2,
+                notice: CompactionNotice::Compacted { before: 900, after: 800, over_band: true },
+            })
+            .unwrap();
+        assert_eq!(
+            next_notice(&ui_rx),
+            format!("compacted {}: 900 → 800 tokens; still above the recovery band", names::label(2, None))
+        );
         frontend.send(Event::Eof).unwrap();
         handle.join().unwrap().unwrap();
     }
@@ -473,7 +497,6 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
-    /// The first answer the frontend prints; on a timeout it names everything else that arrived.
     /// The first notice about a compaction: startup notices come before it.
     fn next_notice(ui: &Receiver<UiEvent>) -> String {
         let mut seen: Vec<String> = Vec::new();
@@ -486,6 +509,7 @@ mod tests {
         }
     }
 
+    /// The first answer the frontend prints; on a timeout it names everything else that arrived.
     fn next_answer(ui: &Receiver<UiEvent>) -> String {
         let mut seen: Vec<String> = Vec::new();
         loop {

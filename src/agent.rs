@@ -36,22 +36,28 @@ impl Turn<'_> {
         let mut base = history.len();
         history.push(Message::user(input));
         let mut rounds = 0;
+        let mut compacted = false;
         loop {
             if cancelled(self.cancel) {
                 history.truncate(base);
                 bail!(INTERRUPTED);
             }
-            let forced = self.force_compact.is_some_and(|flag| flag.swap(false, Ordering::SeqCst));
-            if let Some(compaction) = &self.compaction
-                && (forced || should_compact(context_tokens(history), compaction.settings))
-            {
-                let outcome = compaction.run(history, self.llm, self.cancel, base);
-                if let CompactionOutcome::Compacted(report) = &outcome {
-                    // The cut never passes `base`, so the current turn's user message keeps its index.
-                    base = base + 2 - report.cut;
-                }
-                if let Some(on_compact) = self.on_compact.as_deref_mut() {
-                    on_compact(outcome);
+            if let Some(compaction) = &self.compaction {
+                // Read inside the guard: with compaction off the request must not be consumed, so
+                // `Swarm::compact` can refuse it instead of acking a no-op.
+                let forced = self.force_compact.is_some_and(|flag| flag.swap(false, Ordering::SeqCst));
+                // One compaction per turn: the keep budget lands the context under the recovery
+                // band, so a second attempt in the same turn would only pay for another summary.
+                if forced || (!compacted && should_compact(context_tokens(history), compaction.settings)) {
+                    let outcome = compaction.run(history, self.llm, self.cancel, base);
+                    if let CompactionOutcome::Compacted(report) = &outcome {
+                        // The cut never passes `base`: the current turn's user message keeps its index.
+                        base = base + 2 - report.cut;
+                        compacted = true;
+                    }
+                    if let Some(on_compact) = self.on_compact.as_deref_mut() {
+                        on_compact(outcome);
+                    }
                 }
             }
             let reply = match self.llm.chat(history, self.tool_defs, self.cancel) {
@@ -273,8 +279,8 @@ mod tests {
         }
         assert_eq!(reports.len(), 1, "one compaction, one report");
         let CompactionOutcome::Compacted(report) = &reports[0] else { panic!("no compaction: {:?}", reports[0]) };
-        assert_eq!(report.cut, 4, "the cut stopped at the newest assistant group");
-        assert_eq!(history.len(), 5, "system + summary + the kept group + the current turn");
+        assert_eq!(report.cut, 5, "the keep budget is under the threshold, so the whole span goes");
+        assert_eq!(history.len(), 4, "system + summary + the current turn");
         assert_eq!(history[1].summary.as_deref(), Some("the summary"));
     }
 
@@ -355,7 +361,7 @@ mod tests {
         };
         let err = turn.run(&mut history, "go").unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
-        assert_eq!(history.len(), 3, "the current turn is gone and the summary stays");
+        assert_eq!(history.len(), 2, "the current turn is gone and the summary stays");
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].summary.as_deref(), Some("the summary"));
         assert!(

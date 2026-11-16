@@ -3750,7 +3750,7 @@ mod tests {
         let rows = menu_rows(&app);
         assert_eq!(rows.len(), slash::COMMANDS.len(), "/ offers every command: {rows:?}");
         assert!(rows[0].starts_with("/resume <id>"), "{rows:?}");
-        assert!(rows[1].starts_with("/compact <id>"), "{rows:?}");
+        assert!(rows[1].starts_with("/compact [id]"), "{rows:?}");
         assert!(rows[2].starts_with("/pipeline <name|list|stop>"), "{rows:?}");
         assert!(rows[5].starts_with("/login <server>"), "the table's order is the popup's: {rows:?}");
         type_key(&mut app, KeyCode::Char('m'));

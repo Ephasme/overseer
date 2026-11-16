@@ -26,7 +26,7 @@ struct RawCompaction {
     enabled: Option<bool>,
     /// The model's context window in tokens; 0 means unknown.
     context_window: Option<u64>,
-    /// A fixed trigger threshold; negative means derive it from the window.
+    /// A fixed trigger threshold; zero or negative derives it from the window.
     threshold_tokens: Option<i64>,
     keep_recent_tokens: Option<u64>,
     reserve_tokens: Option<u64>,
@@ -55,28 +55,28 @@ impl Default for CompactionSettings {
 }
 
 impl CompactionSettings {
-    /// The token count above which history is compacted, or `None` when compaction is off.
+    /// The token count above which history is compacted, or `None` when compaction is off or
+    /// there is no window to derive one from.
     ///
-    /// A fixed `threshold_tokens` overrides the window math; otherwise the threshold is the
-    /// window minus the larger of 15% of the window and `reserve_tokens`.
+    /// The reserve is the larger of 15% of the window and `reserve_tokens`, capped at half the
+    /// window: a reserve that ate the whole window would leave a threshold of zero and compact on
+    /// every round. A fixed `threshold_tokens` overrides the reserve but is capped the same way,
+    /// so a compaction always has room to be asked for and summarized.
     pub(crate) fn threshold(&self) -> Option<u64> {
         if !self.enabled {
             return None;
         }
-        if self.threshold_tokens > 0 {
-            let fixed = u64::try_from(self.threshold_tokens).unwrap_or(u64::MAX);
-            return Some(if self.context_window > 0 {
-                fixed.min(self.context_window.saturating_sub(1))
-            } else {
-                fixed
-            });
+        let fixed = (self.threshold_tokens > 0).then(|| u64::try_from(self.threshold_tokens).unwrap_or(u64::MAX));
+        if self.context_window == 0 {
+            return fixed;
         }
-        if self.context_window > 0 {
-            let reserve = self.context_window * 15 / 100;
-            let reserve = reserve.max(self.reserve_tokens);
-            return Some(self.context_window.saturating_sub(reserve));
-        }
-        None
+        let reserve =
+            (self.context_window.saturating_mul(15) / 100).max(self.reserve_tokens).min(self.context_window / 2);
+        let usable = self.context_window.saturating_sub(reserve);
+        Some(match fixed {
+            Some(fixed) => fixed.min(usable),
+            None => usable,
+        })
     }
 }
 
@@ -166,12 +166,14 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "max_depth" => cfg.max_depth.to_string(),
         "dir" => cfg.dir.display().to_string(),
         "compaction" => format!(
-            "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={}",
+            "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={} threshold={}",
             cfg.compaction.enabled,
             cfg.compaction.context_window,
             cfg.compaction.threshold_tokens,
             cfg.compaction.keep_recent_tokens,
-            cfg.compaction.reserve_tokens
+            cfg.compaction.reserve_tokens,
+            // The derived trigger, so `cfg://compaction` answers "why does nothing compact?".
+            cfg.compaction.threshold().map_or_else(|| "off".to_string(), |tokens| tokens.to_string())
         ),
         "home" => cfg.home.display().to_string(),
         "state_dir" => state_dir(&cfg.home).display().to_string(),
@@ -358,6 +360,23 @@ mod tests {
         assert!(parse("roots = [\"/\"]\nmodel = \"m\"", home.path()).unwrap_err().to_string().contains("base_url"));
         let blank = parse("roots = [\"/\"]\nbase_url = \" \"\nmodel = \"m\"", home.path()).unwrap_err().to_string();
         assert!(blank.contains("must not be empty"), "{blank}");
+    }
+
+    #[test]
+    fn the_compaction_table_defaults_when_absent_and_is_read_when_present() {
+        let home = tempfile::tempdir().unwrap();
+        let rest = "roots = [\"/\"]\nbase_url = \"u\"\nmodel = \"m\"";
+        assert!(parse(rest, home.path()).unwrap().compaction.enabled, "compaction defaults on");
+        assert_eq!(parse(rest, home.path()).unwrap().compaction.threshold(), None, "no window, no trigger");
+        let text = format!(
+            "{rest}\ncompaction = {{ enabled = false, context_window = 200000, threshold_tokens = -1, keep_recent_tokens = 1, reserve_tokens = 2 }}"
+        );
+        let settings = parse(&text, home.path()).unwrap().compaction;
+        assert!(!settings.enabled);
+        assert_eq!(settings.context_window, 200_000);
+        assert_eq!(settings.keep_recent_tokens, 1);
+        let unknown = format!("{rest}\ncompaction = {{ nonsense = 1 }}");
+        assert!(parse(&unknown, home.path()).is_err(), "an unknown sub-key is refused");
     }
 
     #[test]

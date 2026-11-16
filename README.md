@@ -30,7 +30,7 @@ The first three keys are required; `theme` is optional. `auto` follows a non-emp
 OVERSEER_API_KEY=...
 ```
 
-`compaction` decides when a conversation's oldest messages are summarized so the model keeps working past its context window. It is on by default and compacts nothing until you name `context_window` or `threshold_tokens`: the trigger is the window minus the larger of 15% of it and `reserve_tokens` (16384), or `threshold_tokens` alone when you set it. `keep_recent_tokens` (20000) is how much of the newest conversation is never summarized, and `enabled = false` turns the whole thing off. `/compact [id]` forces one at the agent's next safe point. A summary call that fails is logged and the turn carries on un-compacted.
+`compaction` decides when a conversation's oldest messages are summarized so the model keeps working past its context window. It is on by default and compacts nothing until you name `context_window` or `threshold_tokens`: the trigger is the window minus the larger of 15% of it and `reserve_tokens` (16384), or `threshold_tokens` when you set it, and the reserve never takes more than half the window. `keep_recent_tokens` (20000) caps how much of the newest conversation is never summarized, itself capped under the trigger so one compaction lands the context under its recovery band and a turn compacts at most once. `enabled = false` turns the whole thing off. `/compact [id]` forces one at the agent's next safe point. A summary that is skipped or fails is reported in the transcript and in the agent log, and the turn carries on.
 
 ## Run
 

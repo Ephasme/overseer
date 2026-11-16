@@ -297,6 +297,20 @@ impl AgentEvent {
 }
 
 /// Everything that wakes the overseer.
+/// What one compaction attempt did, as the frontend shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CompactionNotice {
+    Compacted {
+        before: u64,
+        after: u64,
+        /// The context still sits above the recovery band, so the trigger will fire again.
+        over_band: bool,
+    },
+    /// Nothing older than the keep budget, or nothing but an earlier summary, so nothing ran.
+    Skipped,
+    Failed(String),
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Event {
     User(String),
@@ -354,12 +368,10 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
-    /// An agent's history was compacted.
-    Compacted {
+    /// A compaction attempt finished: it compacted, found nothing to summarize, or failed.
+    Compaction {
         id: usize,
-        before: u64,
-        after: u64,
-        over_band: bool,
+        notice: CompactionNotice,
     },
     /// An agent wrote to `out://`: the text belongs in the user's transcript as it stands.
     Out {
@@ -385,7 +397,11 @@ impl Event {
         if let Some(arg) = line.strip_prefix("/resume") {
             return Some(Event::Resume(arg.to_string()));
         }
-        if let Some(arg) = line.strip_prefix("/compact") {
+        // `/compactfoo` stays a user message: only the bare command and its spaced argument count.
+        if line == "/compact" {
+            return Some(Event::Compact(String::new()));
+        }
+        if let Some(arg) = line.strip_prefix("/compact ") {
             return Some(Event::Compact(arg.trim().to_string()));
         }
         if line == "/mcp" {
@@ -811,8 +827,12 @@ impl Swarm {
     }
 
     /// `/compact [id]`: queue a compaction at the agent's next safe point, the root when no id is
-    /// named. The user owns every agent, so any id works.
+    /// named. The user owns every agent, so any id works, but only one that can still run a turn:
+    /// a request queued on a thread that never reads the flag would be a lie.
     pub(crate) fn compact(&mut self, arg: &str) -> Result<String, String> {
+        if !self.config.compaction.enabled {
+            return Err("compaction is off in config; set compaction.enabled = true".into());
+        }
         let id = if arg.trim().is_empty() {
             Swarm::ROOT
         } else {
@@ -824,6 +844,12 @@ impl Swarm {
         let Some(agent) = self.agent(id) else {
             return Err(format!("no agent {}; agent ids: {}", names::label(id, None), self.ids()));
         };
+        if agent.archived || agent.stopped || agent.finished() {
+            return Err(format!("{} runs no turn, so nothing would compact", agent.label()));
+        }
+        if agent.profile == profiles::PIPELINE {
+            return Err(format!("{} is a pipeline run, which never compacts", agent.label()));
+        }
         let label = agent.label();
         agent.control.request_compaction();
         Ok(format!("compaction queued for {label}"))
@@ -1744,7 +1770,7 @@ impl AgentRun<'_> {
                     mcp: mcp.as_ref(),
                     scope: Some(&scope),
                 };
-                let mut compaction_outcome: Option<CompactionOutcome> = None;
+                let mut compactions: Vec<CompactionOutcome> = Vec::new();
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
@@ -1752,23 +1778,29 @@ impl AgentRun<'_> {
                     cancel: Some(control.flag()),
                     compaction: settings.enabled.then_some(Compaction { settings: &settings }),
                     force_compact: Some(control.force_compact_flag()),
-                    on_compact: Some(&mut |outcome| compaction_outcome = Some(outcome)),
+                    on_compact: Some(&mut |outcome| compactions.push(outcome)),
                 };
                 let outcome = turn.run(&mut history, &input);
-                match compaction_outcome {
-                    Some(CompactionOutcome::Compacted(report)) => {
-                        let _ = writeln!(self.log, "= Compacted {} → {} tokens", report.before, report.after);
-                        let _ = self.sender.send(Event::Compacted {
-                            id: self.id,
-                            before: report.before,
-                            after: report.after,
-                            over_band: report.over_band,
-                        });
-                    }
-                    Some(CompactionOutcome::Failed(error)) => {
-                        let _ = writeln!(self.log, "= Compaction failed: {error}");
-                    }
-                    Some(CompactionOutcome::Skipped) | None => {}
+                for attempt in compactions {
+                    let notice = match attempt {
+                        CompactionOutcome::Compacted(report) => {
+                            let _ = writeln!(self.log, "= Compacted {} → {} tokens", report.before, report.after);
+                            CompactionNotice::Compacted {
+                                before: report.before,
+                                after: report.after,
+                                over_band: report.over_band,
+                            }
+                        }
+                        CompactionOutcome::Skipped => {
+                            let _ = writeln!(self.log, "= Compaction skipped: nothing older to summarize");
+                            CompactionNotice::Skipped
+                        }
+                        CompactionOutcome::Failed(error) => {
+                            let _ = writeln!(self.log, "= Compaction failed: {error}");
+                            CompactionNotice::Failed(error)
+                        }
+                    };
+                    let _ = self.sender.send(Event::Compaction { id: self.id, notice });
                 }
                 outcome
             };
@@ -2861,6 +2893,19 @@ mod tests {
         assert_eq!(h.swarm.lock().unwrap().compact("2").unwrap(), format!("compaction queued for {}", codename(2)));
         while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
         assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err(), "no model call, no event");
+    }
+
+    #[test]
+    fn compact_refuses_an_agent_that_runs_no_turn() {
+        let h = harness(vec![text("first")]);
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        next_event(&h.queue);
+        h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
+        assert!(h.swarm.lock().unwrap().stop(2).is_ok());
+        let refused = h.swarm.lock().unwrap().compact("2").unwrap_err();
+        assert!(refused.contains("runs no turn"), "{refused}");
+        assert!(refused.contains(&codename(2)), "the refusal names the agent: {refused}");
+        while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
     }
 
     #[test]
