@@ -14,7 +14,7 @@ pub(crate) const RESUME: &str = "/resume";
 pub(crate) const PIPELINE: &str = "/pipeline";
 
 /// Most rows the popup shows at once.
-pub(crate) const LIMIT: usize = 6;
+pub(crate) const LIMIT: usize = 7;
 
 /// One slash command: what it is called, the argument it takes, and what it does.
 pub(crate) struct Command {
@@ -45,8 +45,9 @@ impl Command {
 }
 
 /// Every slash command `Event::from_line` recognises, in the order the popup lists them.
-pub(crate) const COMMANDS: [Command; 6] = [
+pub(crate) const COMMANDS: [Command; 7] = [
     Command { name: RESUME, hint: Some("<id>"), about: "retask an agent without a model call" },
+    Command { name: "/compact", hint: Some("[id]"), about: "force context compaction" },
     Command { name: PIPELINE, hint: Some("<name|list|stop>"), about: "run or manage a Rhai pipeline" },
     Command { name: "/schemes", hint: None, about: "list the internal URI schemes" },
     Command { name: "/mcp", hint: None, about: "show the MCP servers" },

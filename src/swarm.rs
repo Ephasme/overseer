@@ -1,6 +1,7 @@
 use crate::agent::{INTERRUPTED, Turn};
 use crate::approvals;
 use crate::bounds;
+use crate::compaction::{Compaction, CompactionOutcome};
 use crate::config;
 use crate::conflict;
 use crate::edit;
@@ -133,6 +134,9 @@ struct Control {
     /// Set to abandon the running turn; the worker clears it when it starts an instruction. Shared
     /// with a pipeline's host so a running command or a sleep stops with the agent.
     interrupted: Arc<AtomicBool>,
+    /// Set by `/compact`: the next safe point compacts regardless of the threshold, and the flag
+    /// is then cleared so the request fires once.
+    force_compact: Arc<AtomicBool>,
     policy: Mutex<tools::Policy>,
 }
 
@@ -207,6 +211,16 @@ impl Control {
 
     fn flag(&self) -> &AtomicBool {
         self.interrupted.as_ref()
+    }
+
+    /// The `/compact` flag: read and cleared by the turn, set by [`Swarm::compact`].
+    fn force_compact_flag(&self) -> &AtomicBool {
+        self.force_compact.as_ref()
+    }
+
+    /// Requests a compaction at the next safe point.
+    fn request_compaction(&self) {
+        self.force_compact.store(true, Ordering::SeqCst);
     }
 
     /// The same flag, owned: a pipeline's host and watchdog outlive this borrow.
@@ -304,6 +318,20 @@ impl From<AgentEvent> for records::Outcome {
 }
 
 /// Everything that wakes the overseer.
+/// What one compaction attempt did, as the frontend shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CompactionNotice {
+    Compacted {
+        before: u64,
+        after: u64,
+        /// The context still sits above the recovery band, so the trigger will fire again.
+        over_band: bool,
+    },
+    /// Nothing older than the keep budget, or nothing but an earlier summary, so nothing ran.
+    Skipped,
+    Failed(String),
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Event {
     User(String),
@@ -313,6 +341,8 @@ pub(crate) enum Event {
     Eof,
     /// User typed `/resume <id>`: the argument, handled without a model call.
     Resume(String),
+    /// User typed `/compact <id>`: the argument, handled without a model call.
+    Compact(String),
     /// The frontend's stop key: one agent and everything below it, without a model call.
     Stop {
         id: usize,
@@ -361,6 +391,11 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
+    /// A compaction attempt finished: it compacted, found nothing to summarize, or failed.
+    Compaction {
+        id: usize,
+        notice: CompactionNotice,
+    },
     /// An agent wrote to `out://`: the text belongs in the user's transcript as it stands.
     Out {
         id: usize,
@@ -403,6 +438,13 @@ impl Event {
         }
         if let Some(arg) = line.strip_prefix("/resume") {
             return Some(Event::Resume(arg.to_string()));
+        }
+        // `/compactfoo` stays a user message: only the bare command and its spaced argument count.
+        if line == "/compact" {
+            return Some(Event::Compact(String::new()));
+        }
+        if let Some(arg) = line.strip_prefix("/compact ") {
+            return Some(Event::Compact(arg.trim().to_string()));
         }
         if line == "/mcp" {
             return Some(Event::Mcp);
@@ -884,6 +926,35 @@ impl Swarm {
             Ok(_) => format!("{label} resumed"),
             Err(e) => format!("error: {e}; agent ids: {}", self.ids()),
         }
+    }
+
+    /// `/compact [id]`: queue a compaction at the agent's next safe point, the root when no id is
+    /// named. The user owns every agent, so any id works, but only one that can still run a turn:
+    /// a request queued on a thread that never reads the flag would be a lie.
+    pub(crate) fn compact(&mut self, arg: &str) -> Result<String, String> {
+        if !self.config.compaction.enabled {
+            return Err("compaction is off in config; set compaction.enabled = true".into());
+        }
+        let id = if arg.trim().is_empty() {
+            Swarm::ROOT
+        } else {
+            match resume_id(arg) {
+                Ok(id) => id,
+                Err(e) => return Err(format!("{e}; agent ids: {}", self.ids())),
+            }
+        };
+        let Some(agent) = self.agent(id) else {
+            return Err(format!("no agent {}; agent ids: {}", names::label(id, None), self.ids()));
+        };
+        if agent.archived || agent.stopped || agent.finished() {
+            return Err(format!("{} runs no turn, so nothing would compact", agent.label()));
+        }
+        if agent.profile == profiles::PIPELINE {
+            return Err(format!("{} is a pipeline run, which never compacts", agent.label()));
+        }
+        let label = agent.label();
+        agent.control.request_compaction();
+        Ok(format!("compaction queued for {label}"))
     }
 
     /// Ids that exist, so an error can name the ones `/resume` accepts.
@@ -1970,6 +2041,7 @@ impl AgentRun<'_> {
         // Discovered once per agent, like the skills: a rule file changed mid-session reaches the
         // agent through `rule://`.
         let rules = rules::Rules::load(&config.rule_dir, self.working_dir);
+        let settings = config.compaction;
         let mut history = std::mem::take(&mut self.history);
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
@@ -2029,6 +2101,7 @@ impl AgentRun<'_> {
                 // `Writer::write` takes `&self`, so both closures below share one copied
                 // reference: the execute closure keeps `&mut self` capture without a conflict.
                 let records = self.records;
+                let mut compactions: Vec<CompactionOutcome> = Vec::new();
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
@@ -2038,8 +2111,24 @@ impl AgentRun<'_> {
                         records.write(&records::Record::Assistant { message: message.clone() });
                     }),
                     bounds: Some(&bounds),
+                    compaction: settings.enabled.then_some(Compaction { settings: &settings }),
+                    force_compact: Some(control.force_compact_flag()),
+                    on_compact: Some(&mut |outcome| compactions.push(outcome)),
                 };
-                turn.run(&mut history, &input)
+                let outcome = turn.run(&mut history, &input);
+                for attempt in compactions {
+                    let notice = match attempt {
+                        CompactionOutcome::Compacted(report) => CompactionNotice::Compacted {
+                            before: report.before,
+                            after: report.after,
+                            over_band: report.over_band,
+                        },
+                        CompactionOutcome::Skipped => CompactionNotice::Skipped,
+                        CompactionOutcome::Failed(error) => CompactionNotice::Failed(error),
+                    };
+                    let _ = self.sender.send(Event::Compaction { id: self.id, notice });
+                }
+                outcome
             };
             // `close` cut this turn and already sent the report: the interrupt it raised must not
             // also be reported as an interruption, and the thread waits for its owner.
@@ -2384,6 +2473,7 @@ mod tests {
             // The harness's gate starts at `yolo`: existing tests must not stop on a prompt.
             approvals: approvals::Tier::Yolo,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         }
     }
 
@@ -3296,6 +3386,46 @@ mod tests {
         assert!(!h.swarm.lock().unwrap().busy());
         while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
         assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn compact_queues_the_request_and_names_the_agent() {
+        let h = harness(vec![text("first")]);
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        next_event(&h.queue);
+        h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
+        assert_eq!(h.swarm.lock().unwrap().compact("2").unwrap(), format!("compaction queued for {}", codename(2)));
+        while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
+        assert!(h.queue.recv_timeout(Duration::from_millis(100)).is_err(), "no model call, no event");
+    }
+
+    #[test]
+    fn compact_refuses_an_agent_that_runs_no_turn() {
+        let h = harness(vec![text("first")]);
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        next_event(&h.queue);
+        h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
+        assert!(h.swarm.lock().unwrap().stop(2).is_ok());
+        let refused = h.swarm.lock().unwrap().compact("2").unwrap_err();
+        assert!(refused.contains("runs no turn"), "{refused}");
+        assert!(refused.contains(&codename(2)), "the refusal names the agent: {refused}");
+        while h.queue.recv_timeout(Duration::from_millis(100)).is_ok() {}
+    }
+
+    #[test]
+    fn compact_rejects_bad_arguments_without_messaging() {
+        let h = harness(vec![text("first")]);
+        assert_eq!(
+            h.swarm.lock().unwrap().compact("9").unwrap_err(),
+            format!("no agent {}; agent ids: 1", codename(9))
+        );
+        assert_eq!(
+            h.swarm.lock().unwrap().compact("").unwrap(),
+            format!("compaction queued for {}", codename(1)),
+            "no id means the root"
+        );
+        assert_eq!(h.swarm.lock().unwrap().compact("x").unwrap_err(), "not an agent id: x; agent ids: 1");
+        assert!(!h.swarm.lock().unwrap().busy());
     }
 
     #[test]

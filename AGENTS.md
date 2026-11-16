@@ -61,6 +61,7 @@
 | `src/forge.rs` | `gh` and `glab` invocations, behind `issue://`, `pr://` and `mr://` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
+| `src/compaction.rs` | summarizing the oldest messages: the cut point, the serialized request, the injected `<summary>` message |
 | `src/config.rs` | `config.toml`, roots, `max_depth`, the root's `dir`, `home`, `resolve_dir`, state directory, `io_error` |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
 | `.github/scripts/update-formula.sh` | rewrites the tap's formula from a release |
@@ -89,6 +90,9 @@
 - A session is durable: `Swarm` records each agent entering the tree, each rename and each transition to dead into `session.jsonl`, and `AgentRun` saves an agent's committed history (system messages out) before it reports a successful turn. `-c` / `-r` replay those records through `Swarm::resume_tree`: live agents come back idle with that history, stopped, archived and pipeline agents come back as dead rows, and each resumed policy is the stored one, never re-merged. An interrupted turn is not re-delivered, and instructions still queued in an inbox at exit are gone.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
+- Compaction's trigger lives in `config::CompactionSettings::threshold` alone; `compaction::should_compact` delegates to it. The reserve never takes more than half the window, and `compaction::keep_budget` caps `keep_recent_tokens` under the trigger: without that cap a cut keeps a span still over the threshold and the trigger re-fires on every round. A turn compacts at most once for the same reason.
+- The cut never passes the current turn's user message, so `Turn::run`'s `history.truncate(base)` rollback stays exact: a turn larger than the window is not compacted, and the next turn reclaims it. A summary message is `Message::summary`, tested by `summary.is_some()`; both `usage` and `summary` are `#[serde(skip)]`, so neither reaches the wire.
+- A compaction attempt always has an outcome the user can see: `Compaction::run` answers `CompactionOutcome::{Compacted,Skipped,Failed}`, `AgentRun` sends one `Event::Compaction` per attempt, and a failure never fails the turn. `/compact` refuses up front — compaction off in config, or an agent that runs no further turn — rather than acking a request nothing will read.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
 - Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build`, a background `bash` job or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.

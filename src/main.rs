@@ -3,6 +3,7 @@ mod approvals;
 mod artifacts;
 mod bounds;
 mod clipboard;
+mod compaction;
 mod config;
 mod conflict;
 mod diff;

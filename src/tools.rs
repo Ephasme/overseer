@@ -1334,6 +1334,7 @@ mod tests {
             home: dir.to_path_buf(),
             approvals: crate::approvals::Tier::Yolo,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         }
     }
 

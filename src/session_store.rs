@@ -369,6 +369,8 @@ mod tests {
             llm::Message::system("you are a supervisor".into()),
             llm::Message::user("list the files"),
             llm::Message {
+                usage: None,
+                summary: None,
                 role: "assistant".into(),
                 content: None,
                 tool_calls: Some(vec![llm::ToolCall {

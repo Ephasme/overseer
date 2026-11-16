@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +30,7 @@ struct RawConfig {
     /// Spend ceiling in USD.
     max_cost: Option<f64>,
     pricing: Option<HashMap<String, RawPrice>>,
+    compaction: Option<RawCompaction>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +40,79 @@ struct RawPrice {
     input: f64,
     #[serde(rename = "out")]
     output: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompaction {
+    enabled: Option<bool>,
+    /// The model's context window in tokens; 0 means unknown.
+    context_window: Option<u64>,
+    /// A fixed trigger threshold; zero or negative derives it from the window.
+    threshold_tokens: Option<i64>,
+    keep_recent_tokens: Option<u64>,
+    reserve_tokens: Option<u64>,
+}
+
+/// How and when conversation history is compacted into a summary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionSettings {
+    pub(crate) enabled: bool,
+    pub(crate) context_window: u64,
+    pub(crate) threshold_tokens: i64,
+    pub(crate) keep_recent_tokens: u64,
+    pub(crate) reserve_tokens: u64,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_window: 0,
+            threshold_tokens: -1,
+            keep_recent_tokens: 20_000,
+            reserve_tokens: 16_384,
+        }
+    }
+}
+
+impl CompactionSettings {
+    /// The token count above which history is compacted, or `None` when compaction is off or
+    /// there is no window to derive one from.
+    ///
+    /// The reserve is the larger of 15% of the window and `reserve_tokens`, capped at half the
+    /// window: a reserve that ate the whole window would leave a threshold of zero and compact on
+    /// every round. A fixed `threshold_tokens` overrides the reserve but is capped the same way,
+    /// so a compaction always has room to be asked for and summarized.
+    pub(crate) fn threshold(&self) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        let fixed = (self.threshold_tokens > 0).then(|| u64::try_from(self.threshold_tokens).unwrap_or(u64::MAX));
+        if self.context_window == 0 {
+            return fixed;
+        }
+        let reserve =
+            (self.context_window.saturating_mul(15) / 100).max(self.reserve_tokens).min(self.context_window / 2);
+        let usable = self.context_window.saturating_sub(reserve);
+        Some(match fixed {
+            Some(fixed) => fixed.min(usable),
+            None => usable,
+        })
+    }
+}
+
+impl From<RawCompaction> for CompactionSettings {
+    fn from(raw: RawCompaction) -> Self {
+        let default = CompactionSettings::default();
+        Self {
+            enabled: raw.enabled.unwrap_or(default.enabled),
+            context_window: raw.context_window.unwrap_or(default.context_window),
+            threshold_tokens: raw.threshold_tokens.unwrap_or(default.threshold_tokens),
+            keep_recent_tokens: raw.keep_recent_tokens.unwrap_or(default.keep_recent_tokens),
+            reserve_tokens: raw.reserve_tokens.unwrap_or(default.reserve_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +141,8 @@ pub(crate) struct Config {
     pub(crate) max_cost: Option<f64>,
     /// USD per 1M tokens, keyed by the exact model string.
     pub(crate) pricing: HashMap<String, bounds::Price>,
+    /// How and when the oldest messages are summarized.
+    pub(crate) compaction: CompactionSettings,
 }
 
 /// The gate on a project's `.mcp.json`: cloning into an untrusted repository must not start
@@ -151,6 +227,7 @@ pub(crate) const SETTINGS: &[&str] = &[
     "max_time",
     "max_cost",
     "dir",
+    "compaction",
     "home",
     "state_dir",
     "mcp_project",
@@ -169,6 +246,16 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "max_time" => cfg.max_time.map_or_else(|| "unset".to_string(), |time| time.as_secs().to_string()),
         "max_cost" => cfg.max_cost.map_or_else(|| "unset".to_string(), |cost| format!("${cost}")),
         "dir" => cfg.dir.display().to_string(),
+        "compaction" => format!(
+            "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={} threshold={}",
+            cfg.compaction.enabled,
+            cfg.compaction.context_window,
+            cfg.compaction.threshold_tokens,
+            cfg.compaction.keep_recent_tokens,
+            cfg.compaction.reserve_tokens,
+            // The derived trigger, so `cfg://compaction` answers "why does nothing compact?".
+            cfg.compaction.threshold().map_or_else(|| "off".to_string(), |tokens| tokens.to_string())
+        ),
         "home" => cfg.home.display().to_string(),
         "state_dir" => state_dir(&cfg.home).display().to_string(),
         other => return Err(format!("unknown setting {other}; settings are {}", SETTINGS.join(", "))),
@@ -314,6 +401,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         max_time: raw.max_time.map(Duration::from_secs),
         max_cost: raw.max_cost,
         pricing,
+        compaction: raw.compaction.map_or_else(CompactionSettings::default, CompactionSettings::from),
     })
 }
 
@@ -397,6 +485,23 @@ mod tests {
         assert!(parse("roots = [\"/\"]\nmodel = \"m\"", home.path()).unwrap_err().to_string().contains("base_url"));
         let blank = parse("roots = [\"/\"]\nbase_url = \" \"\nmodel = \"m\"", home.path()).unwrap_err().to_string();
         assert!(blank.contains("must not be empty"), "{blank}");
+    }
+
+    #[test]
+    fn the_compaction_table_defaults_when_absent_and_is_read_when_present() {
+        let home = tempfile::tempdir().unwrap();
+        let rest = "roots = [\"/\"]\nbase_url = \"u\"\nmodel = \"m\"";
+        assert!(parse(rest, home.path()).unwrap().compaction.enabled, "compaction defaults on");
+        assert_eq!(parse(rest, home.path()).unwrap().compaction.threshold(), None, "no window, no trigger");
+        let text = format!(
+            "{rest}\ncompaction = {{ enabled = false, context_window = 200000, threshold_tokens = -1, keep_recent_tokens = 1, reserve_tokens = 2 }}"
+        );
+        let settings = parse(&text, home.path()).unwrap().compaction;
+        assert!(!settings.enabled);
+        assert_eq!(settings.context_window, 200_000);
+        assert_eq!(settings.keep_recent_tokens, 1);
+        let unknown = format!("{rest}\ncompaction = {{ nonsense = 1 }}");
+        assert!(parse(&unknown, home.path()).is_err(), "an unknown sub-key is refused");
     }
 
     #[test]

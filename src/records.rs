@@ -177,6 +177,8 @@ mod tests {
             Record::Assistant {
                 message: Message {
                     role: "assistant".into(),
+                    usage: None,
+                    summary: None,
                     content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".into(),

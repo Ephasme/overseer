@@ -4,10 +4,11 @@ use crate::config;
 use crate::event::UiEvent;
 use crate::llm::Models;
 use crate::mcp;
+use crate::names;
 use crate::pipelines;
 use crate::profiles;
 use crate::session_store::{ResumeSource, SessionLog, TreeRecord};
-use crate::swarm::{AgentEvent, Event, Swarm, lock};
+use crate::swarm::{AgentEvent, CompactionNotice, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
 use crate::version;
@@ -222,6 +223,35 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
             }
+            Event::Compact(arg) => {
+                let (result, agents) = {
+                    let mut tree = lock(&swarm);
+                    let result = tree.compact(&arg);
+                    (result, tree.snapshot())
+                };
+                let _ = ui.send(match result {
+                    Ok(line) => UiEvent::Notice(line),
+                    Err(line) => UiEvent::Error(line),
+                });
+                let _ = ui.send(UiEvent::Agents(agents));
+            }
+            Event::Compaction { id, notice } => {
+                let label = names::label(id, None);
+                let event = match notice {
+                    CompactionNotice::Compacted { before, after, over_band } => {
+                        let mut line = format!("compacted {label}: {before} → {after} tokens");
+                        if over_band {
+                            line.push_str("; still above the recovery band");
+                        }
+                        UiEvent::Notice(line)
+                    }
+                    CompactionNotice::Skipped => UiEvent::Notice(format!("nothing older to summarize for {label}")),
+                    CompactionNotice::Failed(error) => {
+                        UiEvent::Error(format!("compaction failed for {label}: {error}"))
+                    }
+                };
+                let _ = ui.send(event);
+            }
             Event::Stop { id } => {
                 let (result, agents, busy) = {
                     let mut tree = lock(&swarm);
@@ -340,6 +370,69 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// A compaction reaches the user as a notice, with the recovery band named when it applies.
+    #[test]
+    fn a_compaction_reaches_the_user_as_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
+            dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
+            mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let frontend = input.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(Vec::new())))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
+            )
+        });
+        frontend
+            .send(Event::Compaction {
+                id: 1,
+                notice: CompactionNotice::Compacted { before: 900, after: 100, over_band: false },
+            })
+            .unwrap();
+        assert_eq!(next_notice(&ui_rx), format!("compacted {}: 900 → 100 tokens", names::label(1, None)));
+        frontend
+            .send(Event::Compaction {
+                id: 2,
+                notice: CompactionNotice::Compacted { before: 900, after: 800, over_band: true },
+            })
+            .unwrap();
+        assert_eq!(
+            next_notice(&ui_rx),
+            format!("compacted {}: 900 → 800 tokens; still above the recovery band", names::label(2, None))
+        );
+        frontend.send(Event::Eof).unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
     /// The whole wire: a user line reaches the root, its answer comes back, and the frontend quits.
     #[test]
     fn a_users_line_reaches_the_root_and_its_answer_comes_back() {
@@ -359,6 +452,7 @@ mod tests {
             home: root.path().to_path_buf(),
             approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -416,6 +510,7 @@ mod tests {
             home: root.path().to_path_buf(),
             approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -490,6 +585,7 @@ mod tests {
             home: root.path().to_path_buf(),
             approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -548,6 +644,7 @@ mod tests {
             home: root.path().to_path_buf(),
             mcp_project: config::McpProject::On,
             approvals: crate::approvals::Tier::Ask,
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -614,6 +711,18 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    /// The first notice about a compaction: startup notices come before it.
+    fn next_notice(ui: &Receiver<UiEvent>) -> String {
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match ui.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::Notice(text)) if text.starts_with("compacted ") => return text,
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("no notice reached the frontend ({e}); it saw {seen:?}"),
+            }
+        }
+    }
+
     /// The first answer the frontend prints; on a timeout it names everything else that arrived.
     fn next_answer(ui: &Receiver<UiEvent>) -> String {
         let mut seen: Vec<String> = Vec::new();
@@ -647,6 +756,7 @@ mod tests {
             home: root.path().to_path_buf(),
             approvals: crate::approvals::Tier::Ask,
             mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
