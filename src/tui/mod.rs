@@ -1,4 +1,5 @@
 mod app;
+pub(crate) mod picker;
 mod theme;
 
 use crate::clipboard;

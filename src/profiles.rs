@@ -4,7 +4,7 @@
 use crate::mcp;
 use crate::tools;
 use gray_matter::{Matter, engine::YAML};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -23,7 +23,7 @@ pub(crate) const PIPELINE: &str = "pipeline";
 pub(crate) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
 /// What an agent is for. A supervisor runs the tree and never writes; a worker does the work.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Role {
     #[default]

@@ -8,7 +8,7 @@ use crate::mcp;
 use crate::profiles;
 use crate::skills;
 use crate::url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::{
@@ -131,7 +131,7 @@ const WRAPPERS: &[&str] = &["env", "command", "exec", "nohup", "nice", "time", "
 ///
 /// A guard, not a sandbox: a `bash` command is matched word by word, so the lists are only as good
 /// as they are tight. Workers already run unsandboxed, with the user's own rights.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Policy {
     /// Tools this agent may call. An exact tool name, or `mcp__<server>` for that server's tools.
     /// Empty grants nothing. A profile that declares no list at all is refused at spawn.

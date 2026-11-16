@@ -519,6 +519,32 @@ pub(crate) mod testing {
             Arc::clone(&self.0)
         }
     }
+
+    /// A scripted client that also records every message list it is called with: a test asserts on
+    /// the history an agent actually sent.
+    pub(crate) struct Recording {
+        /// What every call so far received, in order.
+        pub(crate) seen: Mutex<Vec<Vec<Message>>>,
+        script: Scripted,
+    }
+
+    impl Recording {
+        pub(crate) fn new(replies: Vec<Message>) -> Self {
+            Self { seen: Mutex::new(Vec::new()), script: Scripted::new(replies) }
+        }
+
+        /// What every call so far received, in order.
+        pub(crate) fn calls(&self) -> Vec<Vec<Message>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Llm for Recording {
+        fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            self.script.chat(messages, tools, cancel)
+        }
+    }
 }
 
 #[cfg(test)]

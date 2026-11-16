@@ -29,11 +29,13 @@
 |------|----------|
 | `src/main.rs` | picks the frontend, creates both channels, connects the MCP servers, starts the session thread |
 | `src/session.rs` | the router: user input to the root, agent events to their owner and the frontends |
+| `src/session_store.rs` | durable session state: the append-only `session.jsonl` tree records and each agent's history file, behind `-c` / `-r` |
 | `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
 | `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
 | `src/tui/mod.rs` | terminal lifecycle and its panic hook, the event loop, key bindings, the mouse capture F5 hands back |
 | `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
+| `src/tui/picker.rs` | the `-r` session picker: an alternate-screen list, arrows and Enter, Esc cancels |
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
 | `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
@@ -71,13 +73,14 @@
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
-- `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- `Control::set_policy` has three callers, `start_root`, `Swarm::spawn` and `Swarm::resume_tree`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
 - The root always runs the built-in `supervisor` profile and `Role::Supervisor`; a `~/.overseer/agent/profiles/supervisor.md` replaces its text, model, effort and tool list, never its role or its read-only restriction.
 - A profile's `allow_tools` is the whole right: tools are granted one by one, `mcp__<server>` grants one server's tools, and an empty list leaves an agent able to think and answer only. No tool changes a policy after the agent starts.
 - A child gets the intersection of the two tool lists. `free_spawn` is a grant, not a callable tool: an owner that holds it may pass `spawn_agent(free: true)`, and the child then gets its profile's policy. The built-in supervisor grants `free_spawn`, so the read-only root can start full-rights children; a custom `supervisor.md` without it is strict.
 - `spawn_agent` requires a profile, so every agent's rights have one place to be read; `worker` is the generalist (code, configuration, commands).
 - Pipelines are `~/.overseer/pipelines/<name>.rhai`, loaded once at startup like profiles; `/pipeline <name>` or `start_pipeline` runs one as a child agent in the caller's directory, and it stops with the session. Each file opens with `//! requires: <tool>[, <tool>...]`, and every run is bounded by an operation count, a wall clock and the engine's data sizes.
 - `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
+- A session is durable: `Swarm` records each agent entering the tree, each rename and each transition to dead into `session.jsonl`, and `AgentRun` saves an agent's committed history (system messages out) before it reports a successful turn. `-c` / `-r` replay those records through `Swarm::resume_tree`: live agents come back idle with that history, stopped, archived and pipeline agents come back as dead rows, and each resumed policy is the stored one, never re-merged. An interrupted turn is not re-delivered, and instructions still queued in an inbox at exit are gone.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.

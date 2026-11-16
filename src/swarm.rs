@@ -10,6 +10,7 @@ use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
 use crate::repos;
+use crate::session_store::{self, ResumeSource, SessionLog, TreeRecord};
 use crate::skills;
 use crate::tools;
 use crate::url;
@@ -527,13 +528,14 @@ struct Agent {
     busy_since: Option<Instant>,
     /// The text of its last completed turn: what `agent://<id>` shows. A reply does not replace it.
     last_output: String,
-    /// The agent thread. Its exit is the authoritative liveness signal.
-    handle: JoinHandle<()>,
+    /// The agent thread. Its exit is the authoritative liveness signal. A dead row (stopped or
+    /// resumed so) has no thread: `None` reads as finished forever.
+    handle: Option<JoinHandle<()>>,
 }
 
 impl Agent {
     fn finished(&self) -> bool {
-        self.handle.is_finished()
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     fn label(&self) -> String {
@@ -594,6 +596,8 @@ pub(crate) struct Swarm {
     outs: VecDeque<(usize, String)>,
     /// The sequence the next `out://` write gets; never reused, so a stale id fails loudly.
     out_seq: usize,
+    /// The append-only session log, when this session is persistent: tree records land here.
+    session_log: Option<Mutex<SessionLog>>,
 }
 
 impl Swarm {
@@ -609,6 +613,7 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        session_log: Option<SessionLog>,
     ) -> Self {
         Self {
             models,
@@ -622,6 +627,15 @@ impl Swarm {
             local: HashMap::new(),
             outs: VecDeque::new(),
             out_seq: 0,
+            session_log: session_log.map(Mutex::new),
+        }
+    }
+
+    /// Records one tree record, best-effort: persistence never takes the session down.
+    fn record_tree_record(&mut self, record: &TreeRecord) {
+        if let Some(log) = self.session_log.as_mut() {
+            let Ok(file) = log.get_mut() else { return };
+            file.write(record);
         }
     }
 
@@ -674,13 +688,19 @@ impl Swarm {
 
     /// Gives an agent the name the user typed. A blank name drops it back to the codename.
     pub(crate) fn rename(&mut self, id: usize, name: &str) -> String {
-        let Some(agent) = self.agent_mut(id) else {
+        if self.agent(id).is_none() {
             return format!("error: no agent {}", names::label(id, None));
-        };
-        let before = agent.label();
+        }
+        let before = self.label(id);
         let name = name.trim();
-        agent.name = (!name.is_empty()).then(|| name.to_string());
-        format!("{before} is now {}", agent.label())
+        let next = (!name.is_empty()).then(|| name.to_string());
+        if next != self.agent(id).and_then(|agent| agent.name.clone()) {
+            self.record_tree_record(&TreeRecord::Rename { id, name: next.clone().unwrap_or_default() });
+        }
+        if let Some(agent) = self.agent_mut(id) {
+            agent.name.clone_from(&next);
+        }
+        format!("{before} is now {}", self.label(id))
     }
 
     /// Whether any agent is doing work: a paused one holds its instruction by order, so it does not
@@ -806,9 +826,9 @@ impl Swarm {
     /// It runs the built-in supervisor profile under `Role::Supervisor`, whatever the file of that
     /// name says. The policy is set before the thread exists, so nothing narrows a live agent
     /// mid-turn. The log and the thread start with the tree lock released, as in `spawn`.
-    pub(crate) fn start_root(swarm: &Arc<Mutex<Swarm>>, dir: PathBuf) -> Result<usize, String> {
+    pub(crate) fn start_root(swarm: &Arc<Mutex<Swarm>>, dir: &Path) -> Result<usize, String> {
         let _reserved = spawning();
-        let (id, log_path, control, llm, sender, profile) = {
+        let (id, log_path, history_path, control, llm, sender, profile, supervisor_policy) = {
             let tree = lock(swarm);
             if !tree.agents.is_empty() {
                 return Err("the root is already running".to_string());
@@ -827,10 +847,12 @@ impl Swarm {
             (
                 id,
                 tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.history.json")),
                 Arc::clone(&control),
                 tree.models.get(supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
                 supervisor.name.clone(),
+                supervisor.policy.clone(),
             )
         };
         let recorded = profile.clone();
@@ -840,33 +862,53 @@ impl Swarm {
             id,
             0,
             None,
-            &dir,
+            dir,
             Arc::clone(&control),
             None,
             profile,
             profiles::Role::Supervisor,
             &log_path,
+            history_path,
+            Vec::new(),
             swarm,
         )?;
-        lock(swarm).agents.push(Agent {
-            id,
-            name: None,
-            parent: None,
-            depth: 0,
-            working_dir: dir,
-            initial_task: String::new(),
-            profile: recorded,
-            role: profiles::Role::Supervisor,
-            archived: false,
-            pending: 0,
-            failed: false,
-            stopped: false,
-            control,
-            inbox: Some(inbox),
-            busy_since: None,
-            last_output: String::new(),
-            handle,
-        });
+        let working_dir = dir.to_path_buf();
+        {
+            let mut tree = lock(swarm);
+            tree.agents.push(Agent {
+                id,
+                name: None,
+                parent: None,
+                depth: 0,
+                working_dir: working_dir.clone(),
+                initial_task: String::new(),
+                profile: recorded.clone(),
+                role: profiles::Role::Supervisor,
+                archived: false,
+                pending: 0,
+                failed: false,
+                stopped: false,
+                control: Arc::clone(&control),
+                inbox: Some(inbox),
+                busy_since: None,
+                last_output: String::new(),
+                handle: Some(handle),
+            });
+            tree.record_tree_record(&TreeRecord::Agent {
+                id,
+                name: None,
+                parent: None,
+                depth: 0,
+                dir: working_dir.display().to_string(),
+                task: String::new(),
+                profile: recorded,
+                role: profiles::Role::Supervisor,
+                policy: supervisor_policy,
+                stopped: false,
+                archived: false,
+                pipeline: false,
+            });
+        }
         Ok(id)
     }
 
@@ -953,7 +995,7 @@ impl Swarm {
     /// both block and every other agent's dispatch, the session's events and `snapshot()` wait on it.
     pub(crate) fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
         let _reserved = spawning();
-        let (depth, dir, home, id, log_path, control, llm, sender, profile, role) = {
+        let (depth, dir, home, id, log_path, control, llm, sender, profile, role, record_policy) = {
             let tree = lock(swarm);
             let parent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let depth = parent.depth.saturating_add(1);
@@ -989,6 +1031,7 @@ impl Swarm {
             } else {
                 parent_policy.inherit(&profile.policy)
             };
+            let record_policy = policy.clone();
             control.set_policy(policy);
             let dir = args.path.clone().unwrap_or_else(|| parent.working_dir.display().to_string());
             let id = tree.agents.len() + 1;
@@ -1003,6 +1046,7 @@ impl Swarm {
                 tree.sender.clone(),
                 profile.name.clone(),
                 profile.role,
+                record_policy,
             )
         };
         let working_dir = config::resolve_dir(&dir, &home)?;
@@ -1019,27 +1063,47 @@ impl Swarm {
             profile,
             role,
             &log_path,
+            spawn_history_path(&log_path),
+            Vec::new(),
             swarm,
         )?;
-        lock(swarm).agents.push(Agent {
-            id,
-            name: None,
-            parent: Some(caller),
-            depth,
-            working_dir,
-            initial_task: args.task,
-            profile: recorded,
-            role,
-            archived: false,
-            pending: 1,
-            failed: false,
-            stopped: false,
-            control,
-            inbox: Some(inbox),
-            busy_since: Some(Instant::now()),
-            last_output: String::new(),
-            handle,
-        });
+        let record_dir = working_dir.display().to_string();
+        {
+            let mut tree = lock(swarm);
+            tree.agents.push(Agent {
+                id,
+                name: None,
+                parent: Some(caller),
+                depth,
+                working_dir: working_dir.clone(),
+                initial_task: args.task.clone(),
+                profile: recorded.clone(),
+                role,
+                archived: false,
+                pending: 1,
+                failed: false,
+                stopped: false,
+                control: Arc::clone(&control),
+                inbox: Some(inbox),
+                busy_since: Some(Instant::now()),
+                last_output: String::new(),
+                handle: Some(handle),
+            });
+            tree.record_tree_record(&TreeRecord::Agent {
+                id,
+                name: None,
+                parent: Some(caller),
+                depth,
+                dir: record_dir,
+                task: args.task,
+                profile: recorded,
+                role,
+                policy: record_policy,
+                stopped: false,
+                archived: false,
+                pipeline: false,
+            });
+        }
         Ok(id)
     }
 
@@ -1052,7 +1116,21 @@ impl Swarm {
     pub(crate) fn start_pipeline(swarm: &Arc<Mutex<Swarm>>, caller: usize, name: &str) -> Result<usize, String> {
         // Two starts must not allocate the same id while the tree lock is released.
         let _reserved = spawning();
-        let (depth, working_dir, policy, remaining_depth, id, log_path, control, sender, pipeline, cfg, profiles, mcp) = {
+        let (
+            depth,
+            working_dir,
+            policy,
+            record_policy,
+            remaining_depth,
+            id,
+            log_path,
+            control,
+            sender,
+            pipeline,
+            cfg,
+            profiles,
+            mcp,
+        ) = {
             let tree = lock(swarm);
             let caller_agent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let label = caller_agent.label();
@@ -1094,6 +1172,7 @@ impl Swarm {
             (
                 depth,
                 caller_agent.working_dir.clone(),
+                effective.clone(),
                 effective,
                 tree.config.max_depth.saturating_sub(depth),
                 id,
@@ -1157,27 +1236,177 @@ impl Swarm {
                 let _ = sender.send(Event::Agent { id, kind, text });
             })
         };
-        lock(swarm).agents.push(Agent {
-            id,
-            name: None,
-            parent: Some(caller),
-            depth,
-            working_dir,
-            initial_task: task,
-            profile: profiles::PIPELINE.into(),
-            role: profiles::Role::Worker,
-            archived: false,
-            pending: 1,
-            failed: false,
-            stopped: false,
-            control,
-            inbox: None,
-            busy_since: Some(Instant::now()),
-            last_output: String::new(),
-            handle,
-        });
+        let record_dir = working_dir.display().to_string();
+        {
+            let mut tree = lock(swarm);
+            tree.agents.push(Agent {
+                id,
+                name: None,
+                parent: Some(caller),
+                depth,
+                working_dir: working_dir.clone(),
+                initial_task: task.clone(),
+                profile: profiles::PIPELINE.into(),
+                role: profiles::Role::Worker,
+                archived: false,
+                pending: 1,
+                failed: false,
+                stopped: false,
+                control: Arc::clone(&control),
+                inbox: None,
+                busy_since: Some(Instant::now()),
+                last_output: String::new(),
+                handle: Some(handle),
+            });
+            tree.record_tree_record(&TreeRecord::Agent {
+                id,
+                name: None,
+                parent: Some(caller),
+                depth,
+                dir: record_dir,
+                task: task.clone(),
+                profile: profiles::PIPELINE.into(),
+                role: profiles::Role::Worker,
+                policy: record_policy,
+                stopped: false,
+                archived: false,
+                pipeline: true,
+            });
+        }
         let _ = start_tx.send(());
         Ok(id)
+    }
+
+    /// Rebuilds the tree of a previous session in this one: live agents come back idle with their
+    /// committed history, dead rows stay dead, pipeline agents stay stopped. `source` has already
+    /// been validated by the caller; the new session's header is already in the log.
+    pub(crate) fn resume_tree(swarm: &Arc<Mutex<Swarm>>, source: &ResumeSource) -> Result<String, String> {
+        let _reserved = spawning();
+        let records = session_store::read_tree(&source.dir)?;
+        let agents: Vec<TreeRecord> =
+            records.into_iter().filter(|record| matches!(record, TreeRecord::Agent { .. })).collect();
+        if agents.is_empty() {
+            return Err(format!("session {} has no agents to resume", source.id));
+        }
+        // Ids index the tree (`id - 1`), so a log whose ids skip one would scramble every lookup.
+        for (index, record) in agents.iter().enumerate() {
+            let TreeRecord::Agent { id, .. } = record else { continue };
+            if *id != index + 1 {
+                return Err(format!("cannot resume session {}: agent {id} is out of order", source.id));
+            }
+        }
+        let mut pipelines = 0;
+        for record in &agents {
+            let TreeRecord::Agent {
+                id,
+                name,
+                parent,
+                depth,
+                dir,
+                task,
+                profile,
+                role,
+                policy,
+                stopped: was_stopped,
+                archived,
+                pipeline,
+            } = record
+            else {
+                continue;
+            };
+            let home = lock(swarm).config.home.clone();
+            let working_dir =
+                config::resolve_dir(dir, &home).map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+            let history = session_store::load_history(&source.dir.join(format!("agent-{id}.history.json")))
+                .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+            let control = Arc::new(Control::default());
+            // The policy was fixed at spawn: set it directly, no parent merge.
+            control.set_policy(policy.clone());
+            // The profile decides the model and effort, as at spawn; a profile deleted since then
+            // falls back to the configured default and the agent still runs.
+            let (llm, sender, log_dir) = {
+                let tree = lock(swarm);
+                let found = tree.profiles.get(profile.as_str());
+                let model = found.and_then(|found| found.model.clone());
+                let effort = found.and_then(|found| found.effort().ok()).flatten();
+                (tree.models.get(model.as_deref(), effort), tree.sender.clone(), tree.log_dir.clone())
+            };
+            // A dead row has no thread and no inbox: `stop` dropped both in the original session,
+            // and a pipeline re-running its script would duplicate its side effects.
+            let dead = *was_stopped || *archived || *pipeline;
+            if *pipeline && !*was_stopped && !*archived {
+                pipelines += 1;
+            }
+            let log_path = log_dir.join(format!("agent-{id}.log"));
+            let history_path = spawn_history_path(&log_path);
+            let (inbox, handle) = if dead {
+                (None, None)
+            } else {
+                let (inbox, handle) = spawn_thread(
+                    llm,
+                    sender,
+                    *id,
+                    *depth,
+                    *parent,
+                    &working_dir,
+                    Arc::clone(&control),
+                    None,
+                    profile.clone(),
+                    *role,
+                    &log_path,
+                    history_path,
+                    history,
+                    swarm,
+                )
+                .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+                (Some(inbox), Some(handle))
+            };
+            let mut tree = lock(swarm);
+            tree.agents.push(Agent {
+                id: *id,
+                name: name.clone(),
+                parent: *parent,
+                depth: *depth,
+                working_dir: working_dir.clone(),
+                initial_task: task.clone(),
+                profile: profile.clone(),
+                role: *role,
+                archived: *archived,
+                pending: 0,
+                failed: false,
+                stopped: *was_stopped || *pipeline,
+                control,
+                inbox,
+                busy_since: None,
+                last_output: String::new(),
+                handle,
+            });
+            // Every record goes into the NEW session's log, so a second resume works too.
+            tree.record_tree_record(&TreeRecord::Agent {
+                id: *id,
+                name: name.clone(),
+                parent: *parent,
+                depth: *depth,
+                dir: dir.clone(),
+                task: task.clone(),
+                profile: profile.clone(),
+                role: *role,
+                policy: policy.clone(),
+                stopped: *was_stopped || *pipeline,
+                archived: *archived,
+                pipeline: *pipeline,
+            });
+            if *was_stopped || *archived {
+                tree.record_tree_record(&TreeRecord::State { id: *id, stopped: *was_stopped, archived: *archived });
+            }
+        }
+        let total = agents.len();
+        let id = lock(swarm).log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        Ok(if pipelines == 0 {
+            format!("resumed {} as {id}; {total} agent(s) back", source.id)
+        } else {
+            format!("resumed {} as {id}; {total} agent(s) back, {pipelines} pipeline agent(s) left stopped", source.id)
+        })
     }
 
     /// Stops one pipeline agent; refuses an agent that is not one.
@@ -1236,6 +1465,7 @@ impl Swarm {
                 self.stop(id)?;
                 let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {label}"))?;
                 agent.archived = true;
+                self.record_tree_record(&TreeRecord::State { id, stopped: true, archived: true });
                 Ok(format!("{label} archived; its entry and log stay"))
             }
         }
@@ -1265,6 +1495,7 @@ impl Swarm {
                 // them: the counter and the busy mark would stay set for good.
                 agent.pending = 0;
                 agent.busy_since = None;
+                self.record_tree_record(&TreeRecord::State { id: *target, stopped: true, archived: false });
             }
         }
         let below = stopped.len().saturating_sub(1);
@@ -1520,12 +1751,19 @@ impl Swarm {
     }
 }
 
+/// The history file path for one agent's log path: one `agent-<id>.log` beside one history file.
+fn spawn_history_path(log_path: &Path) -> PathBuf {
+    let name = log_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    log_path.with_file_name(name.replacen(".log", ".history.json", 1))
+}
+
 /// Starts one agent thread: its inbox, and the handle proving it lives. `task` is the first
-/// instruction; the root starts with none and waits for the user.
+/// instruction; the root starts with none and waits for the user. `history` is the committed
+/// model history the thread starts with: empty for a fresh agent, replayed for a resumed one.
 ///
 /// The tree is reached through a `Weak`: the tree holds this worker's inbox, so a strong handle back
 /// would keep the pair alive for the life of the process, once the session has let the tree go.
-#[allow(clippy::too_many_arguments)] // one call site each for the root and for a spawned agent.
+#[allow(clippy::too_many_arguments)] // one call site each for the root, a spawned agent and a resumed one.
 fn spawn_thread(
     llm: Arc<dyn Llm>,
     sender: Sender<Event>,
@@ -1538,6 +1776,8 @@ fn spawn_thread(
     profile: String,
     role: profiles::Role,
     log_path: &Path,
+    history_path: PathBuf,
+    history: Vec<Message>,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
     let log = OpenOptions::new()
@@ -1575,6 +1815,9 @@ fn spawn_thread(
             working_dir: &agent_dir,
             sender: &sender,
             log: &mut log,
+            history_path,
+            history,
+            title_written: false,
             calls: 0,
             control: &control,
             conflicts: conflict::Registry::default(),
@@ -1624,8 +1867,13 @@ struct AgentRun<'a> {
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
     log: &'a mut File,
+    /// Where this agent's committed history is stored: written after every successful turn.
+    history_path: PathBuf,
+    /// The committed history the agent starts with: empty when fresh, replayed when resumed.
+    history: Vec<Message>,
+    /// Whether the session's Title record was written from one of this agent's turns.
+    title_written: bool,
     control: &'a Control,
-    /// Conflict blocks this agent has read, by id: resolving one writes only its marker lines.
     conflicts: conflict::Registry,
     /// What this agent has read or written, by canonical path: `edit` refuses anything else.
     seen: edit::Store,
@@ -1645,7 +1893,7 @@ impl AgentRun<'_> {
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&config.home, self.working_dir);
-        let mut history: Vec<Message> = Vec::new();
+        let mut history = std::mem::take(&mut self.history);
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
             // `Control` keeps what the profile granted; the role is what the agent actually runs
@@ -1672,10 +1920,12 @@ impl AgentRun<'_> {
                 (facts, config.max_depth.saturating_sub(self.depth))
             };
             let prompt = prompt::agent_prompt(&facts);
-            if let Some(first) = history.first_mut() {
-                first.content = Some(prompt);
-            } else {
-                history.push(Message::system(prompt));
+            // Resumed history has no system slot: fresh history is empty. Whichever it is, the
+            // prompt is always slot 0.
+            match history.first_mut() {
+                Some(first) if first.role == "system" => first.content = Some(prompt),
+                Some(_) => history.insert(0, Message::system(prompt)),
+                None => history.push(Message::system(prompt)),
             }
             let scope = url::Scope {
                 caller: self.id,
@@ -1712,13 +1962,26 @@ impl AgentRun<'_> {
                 let _ = writeln!(self.log, "= Closed");
                 continue;
             }
-            let (kind, text) = match result {
-                Ok(answer) => (AgentEvent::Finished, answer),
+            let (kind, text, ok) = match result {
+                Ok(answer) => (AgentEvent::Finished, answer, true),
                 Err(e) if e.to_string() == INTERRUPTED => {
-                    (AgentEvent::Interrupted, "your owner cut this turn short".to_string())
+                    (AgentEvent::Interrupted, "your owner cut this turn short".to_string(), false)
                 }
-                Err(e) => (AgentEvent::Failed, format!("{e:#}")),
+                Err(e) => (AgentEvent::Failed, format!("{e:#}"), false),
             };
+            // Only an Ok turn commits: an Err turn already truncated `history` back to `base`, so
+            // the last good file is exactly the committed state. Written before the event, so a
+            // frontend that sees the answer can quit and resume from it. Best-effort, like the log.
+            if ok {
+                let non_system: Vec<Message> = history.iter().filter(|m| m.role != "system").cloned().collect();
+                let _ = session_store::save_history(&self.history_path, &non_system);
+                if self.parent.is_none() && !self.title_written {
+                    self.title_written = true;
+                    if let Some(swarm) = self.swarm.upgrade() {
+                        lock(&swarm).record_tree_record(&TreeRecord::Title { text: input.chars().take(100).collect() });
+                    }
+                }
+            }
             let _ = writeln!(self.log, "= {kind:?}: {text}");
             let _ = self.sender.send(Event::Agent { id: self.id, kind, text });
         }
@@ -1964,8 +2227,9 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            None,
         )));
-        Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
+        Swarm::start_root(&swarm, root.path()).unwrap();
         Harness { swarm, queue, repo, logs, root }
     }
 
@@ -3136,5 +3400,123 @@ mod tests {
         assert!(line.contains("stopped"), "{line}");
         assert_eq!(h.swarm.lock().unwrap().agent_state(Swarm::ROOT, id), Ok(State::Stopped));
         assert!(!h.swarm.lock().unwrap().busy(), "a stopped pipeline stops counting as work");
+    }
+
+    /// A Models that hands every caller the same Recording client: a test asserts the history an
+    /// agent actually sent.
+    struct RecorderModels(Arc<llm::testing::Recording>);
+
+    #[allow(clippy::as_conversions)] // the one coercion an `Arc<Concrete>` to `Arc<dyn Llm>` needs
+    impl llm::Models for RecorderModels {
+        fn get(&self, _: Option<&str>, _: Option<&str>) -> Arc<dyn Llm> {
+            Arc::clone(&self.0) as Arc<dyn Llm>
+        }
+    }
+
+    /// A root spawns a child, both finish turns, the child is stopped; a second Swarm resumes the
+    /// tree from the recorded log: the roster matches, dead rows stay dead, and the replayed
+    /// history reaches the resumed root's next model call.
+    #[test]
+    fn a_resumed_tree_replays_histories_and_keeps_dead_rows_dead() {
+        let h = harness(vec![text("first answer"), text("second answer")]);
+        tool(
+            &h.swarm,
+            Swarm::ROOT,
+            prompt::SPAWN_AGENT,
+            &json!({"path": h.repo, "task": "dig", "profile": "worker", "free": true}),
+        );
+        wait_idle(&h);
+        h.swarm.lock().unwrap().tell_root("second question").unwrap();
+        wait_idle(&h);
+        // A stopped child: a dead row on resume.
+        h.swarm.lock().unwrap().stop(2).unwrap();
+
+        // The harness tree kept no log: write the records it would have written, with the exact
+        // policies and dirs the tree held, into a fresh session dir.
+        let source = tempfile::tempdir().unwrap();
+        let mut log = session_store::SessionLog::open(source.path()).unwrap();
+        log.write(&TreeRecord::Session { at: 1, dir: h.root.path().display().to_string(), resumed_from: None });
+        for id in [1usize, 2] {
+            let tree = h.swarm.lock().unwrap();
+            let agent = tree.agent(id).unwrap();
+            log.write(&TreeRecord::Agent {
+                id,
+                name: agent.name.clone(),
+                parent: agent.parent,
+                depth: agent.depth,
+                dir: agent.working_dir.display().to_string(),
+                task: agent.initial_task.clone(),
+                profile: agent.profile.clone(),
+                role: agent.role,
+                policy: agent.control.policy(),
+                stopped: agent.stopped,
+                archived: agent.archived,
+                pipeline: false,
+            });
+            if agent.stopped {
+                log.write(&TreeRecord::State { id, stopped: true, archived: false });
+            }
+        }
+        // The committed histories, as the AgentRun would have saved them: system messages out.
+        let replay = vec![llm::Message::user("second question")];
+        session_store::save_history(&source.path().join("agent-1.history.json"), &replay).unwrap();
+        session_store::save_history(&source.path().join("agent-2.history.json"), &[llm::Message::user("dig")]).unwrap();
+        drop(log);
+
+        // A fresh tree that records what its model receives.
+        let recorder = Arc::new(llm::testing::Recording::new(vec![text("resumed answer")]));
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let (sender, _queue) = mpsc::channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let profiles = catalogue(root.path(), &[]);
+        let pipelines = Arc::new(pipelines::Catalogue::default());
+        let config = Arc::new(test_config(root.path(), 3));
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            Arc::new(RecorderModels(Arc::clone(&recorder))),
+            profiles,
+            pipelines,
+            config,
+            logs.path().to_path_buf(),
+            sender,
+            mcp,
+            None,
+        )));
+        let source_id = source.path().file_name().unwrap().to_string_lossy().into_owned();
+        let notice = Swarm::resume_tree(
+            &swarm,
+            &session_store::ResumeSource { id: source_id, dir: source.path().to_path_buf() },
+        )
+        .unwrap();
+        assert!(notice.contains("2 agent(s) back"), "{notice}");
+
+        // The roster: the root live and idle, the child a dead stopped row.
+        let tree = swarm.lock().unwrap();
+        assert_eq!(tree.snapshot().len(), 2);
+        assert_eq!(tree.agent(1).unwrap().state(), State::Idle);
+        assert_eq!(tree.agent(2).unwrap().state(), State::Stopped);
+        // No re-merge: the child's policy is the stored one, byte for byte.
+        assert_eq!(tree.agent(2).unwrap().control.policy(), h.swarm.lock().unwrap().agent(2).unwrap().control.policy());
+        drop(tree);
+
+        // The resumed root's next model call carries the replayed history: system slot first, then
+        // the committed user turn.
+        swarm.lock().unwrap().tell_root("next instruction").unwrap();
+        let deadline = Instant::now() + WAIT;
+        while recorder.calls().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1, "the resumed root made one call: {calls:?}");
+        let history = &calls[0];
+        assert_eq!(history[0].role, "system");
+        assert!(history.iter().any(|m| m.role == "user" && m.content.as_deref() == Some("second question")));
+    }
+
+    fn wait_idle(h: &Harness) {
+        let deadline = Instant::now() + WAIT;
+        while h.swarm.lock().unwrap().busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
