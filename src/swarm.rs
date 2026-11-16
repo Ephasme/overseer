@@ -1,4 +1,5 @@
 use crate::agent::{INTERRUPTED, Turn};
+use crate::bounds;
 use crate::config;
 use crate::conflict;
 use crate::edit;
@@ -9,15 +10,15 @@ use crate::names;
 use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
+use crate::records;
 use crate::repos;
+use crate::rules;
 use crate::session_store::{self, ResumeSource, SessionLog, TreeRecord};
 use crate::skills;
 use crate::tools;
 use crate::url;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
@@ -145,6 +146,12 @@ struct Gate {
 }
 
 impl Control {
+    /// Ends the running turn only, without changing lifecycle flags.
+    fn cut(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Gate> {
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -283,6 +290,18 @@ impl AgentEvent {
     }
 }
 
+/// The record outcome a turn-ending event writes. `Reply` never ends a turn; it maps with
+/// `Finished` only because the match must be exhaustive.
+impl From<AgentEvent> for records::Outcome {
+    fn from(kind: AgentEvent) -> Self {
+        match kind {
+            AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
+            AgentEvent::Failed => records::Outcome::Failed,
+            AgentEvent::Interrupted => records::Outcome::Interrupted,
+        }
+    }
+}
+
 /// Everything that wakes the overseer.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Event {
@@ -306,6 +325,8 @@ pub(crate) enum Event {
     Schemes,
     /// User typed `/mcp`: the server list, handled without a model call.
     Mcp,
+    /// User typed `/approve <server>`: the argument, handled without a model call.
+    Approve(String),
     /// User typed `/login <server>`: the argument, handled without a model call.
     Login(String),
     /// User typed `/pipeline <name|list|stop <id>>`: the argument, handled without a model call.
@@ -372,6 +393,9 @@ impl Event {
         }
         if let Some(arg) = line.strip_prefix("/pipeline ") {
             return Some(Event::Pipeline(arg.trim().to_string()));
+        }
+        if let Some(arg) = line.strip_prefix("/approve") {
+            return Some(Event::Approve(arg.trim().to_string()));
         }
         if let Some(arg) = line.strip_prefix("/login") {
             return Some(Event::Login(arg.trim().to_string()));
@@ -452,6 +476,8 @@ struct Described {
     text: Option<String>,
     command: Option<String>,
     action: Option<String>,
+    pattern: Option<String>,
+    code: Option<String>,
     id: Option<u64>,
     #[serde(default)]
     urgent: bool,
@@ -492,6 +518,9 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => field(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE | tools::EDIT => field(args.path.as_ref()).to_string(),
+        tools::GLOB | tools::GREP | tools::PYTHON => {
+            first_line(args.pattern.as_ref().or(args.code.as_ref())).to_string()
+        }
         _ => String::new(),
     };
     if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT | tools::BASH) {
@@ -535,11 +564,21 @@ struct Agent {
 
 impl Agent {
     fn finished(&self) -> bool {
-        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     fn label(&self) -> String {
         names::label(self.id, self.name.as_deref())
+    }
+
+    /// One place the stop flags become a state: the thread takes no more work, the queued
+    /// instructions are dropped, and the counter and busy mark would otherwise stay set for good.
+    fn retire(&mut self) {
+        self.control.stop();
+        self.inbox = None;
+        self.stopped = true;
+        self.pending = 0;
+        self.busy_since = None;
     }
 
     /// The one place the flags become a state. Precedence is the order of `State`'s variants.
@@ -579,6 +618,7 @@ impl Agent {
 /// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
     models: Arc<dyn llm::Models>,
+    pub(crate) bounds: Arc<bounds::Bounds>,
     profiles: Arc<profiles::Catalogue>,
     /// The pipelines loaded at startup; a start reads it, nothing writes it.
     pipelines: Arc<pipelines::Catalogue>,
@@ -613,10 +653,12 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        bounds: Arc<bounds::Bounds>,
         session_log: Option<SessionLog>,
     ) -> Self {
         Self {
             models,
+            bounds,
             profiles,
             pipelines,
             config,
@@ -633,9 +675,7 @@ impl Swarm {
 
     /// Records one tree record, best-effort: persistence never takes the session down.
     fn record_tree_record(&mut self, record: &TreeRecord) {
-        if let Some(log) = self.session_log.as_mut() {
-            log.write(record);
-        }
+        self.record_tree_records(std::slice::from_ref(record));
     }
 
     /// Records several tree records in one write: `stop` writes one per descendant.
@@ -852,7 +892,7 @@ impl Swarm {
             control.set_policy(supervisor.policy.clone());
             (
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 tree.log_dir.join(format!("agent-{id}.history.json")),
                 Arc::clone(&control),
                 tree.models.get(supervisor.model.as_deref(), effort),
@@ -1001,7 +1041,7 @@ impl Swarm {
     /// both block and every other agent's dispatch, the session's events and `snapshot()` wait on it.
     pub(crate) fn spawn(swarm: &Arc<Mutex<Swarm>>, caller: usize, args: SpawnArgs) -> Result<usize, String> {
         let _reserved = spawning();
-        let (depth, dir, home, id, log_path, control, llm, sender, profile, role, record_policy) = {
+        let (depth, dir, home, id, log_path, log_dir, control, llm, sender, profile, role, record_policy) = {
             let tree = lock(swarm);
             let parent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let depth = parent.depth.saturating_add(1);
@@ -1046,7 +1086,8 @@ impl Swarm {
                 dir,
                 tree.config.home.clone(),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
+                tree.log_dir.clone(),
                 Arc::clone(&control),
                 llm,
                 tree.sender.clone(),
@@ -1069,7 +1110,7 @@ impl Swarm {
             profile,
             role,
             &log_path,
-            spawn_history_path(&log_path),
+            history_path(&log_dir, id),
             Vec::new(),
             swarm,
         )?;
@@ -1182,7 +1223,7 @@ impl Swarm {
                 effective,
                 tree.config.max_depth.saturating_sub(depth),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 control,
                 tree.sender.clone(),
                 pipeline,
@@ -1191,11 +1232,8 @@ impl Swarm {
                 Arc::clone(&tree.mcp),
             )
         };
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| config::io_error(log_path.display(), &error))?;
+        let records =
+            records::Writer::create(&log_path).map_err(|error| config::io_error(log_path.display(), &error))?;
         let skills = Arc::new(skills::Catalogue::in_dir(&cfg.home, &working_dir));
         let task = format!("pipeline {name}");
         // The thread waits for its `Agent` entry: a fast pipeline must not report `Finished` before
@@ -1208,11 +1246,12 @@ impl Swarm {
             let instruction = task.clone();
             let working_dir = working_dir.clone();
             thread::spawn(move || {
-                let mut log = log;
+                let records = &records;
                 if start_rx.recv().is_err() {
                     return;
                 }
-                let _ = sender.send(Event::Instruction { id, text: instruction });
+                let _ = sender.send(Event::Instruction { id, text: instruction.clone() });
+                records.write(&records::Record::Instruction { text: instruction });
                 let run_flag = Arc::new(AtomicBool::new(false));
                 let host = pipelines::SwarmHost {
                     swarm: tree,
@@ -1238,7 +1277,8 @@ impl Swarm {
                     }
                     Err(text) => (AgentEvent::Failed, text),
                 };
-                let _ = writeln!(log, "= {}: {text}", kind.verb());
+                let outcome = records::Outcome::from(kind);
+                records.write(&records::Record::Outcome { outcome, text: text.clone() });
                 let _ = sender.send(Event::Agent { id, kind, text });
             })
         };
@@ -1313,8 +1353,8 @@ impl Swarm {
             if row.pipeline && !row.stopped && !row.archived {
                 pipelines += 1;
             }
-            let log_path = log_dir.join(format!("agent-{}.log", row.id));
-            let history_path = spawn_history_path(&log_path);
+            let records_path = log_dir.join(format!("agent-{}.jsonl", row.id));
+            let history_file = history_path(&log_dir, row.id);
             let control = Arc::new(Control::default());
             // The policy was fixed at spawn: set it directly, no parent merge.
             control.set_policy(row.policy.clone());
@@ -1333,7 +1373,7 @@ impl Swarm {
                 let llm = models.get(model.as_deref(), effort);
                 // The new session dir gets the replayed history now, so quitting before the next
                 // turn still leaves a session that resumes with its conversation.
-                let _ = session_store::save_history(&history_path, &history);
+                let _ = session_store::save_history(&history_file, &history);
                 let (inbox, handle) = spawn_thread(
                     llm,
                     sender.clone(),
@@ -1345,8 +1385,8 @@ impl Swarm {
                     None,
                     row.profile.clone(),
                     row.role,
-                    &log_path,
-                    history_path,
+                    &records_path,
+                    history_file,
                     history,
                     swarm,
                 )
@@ -1476,27 +1516,33 @@ impl Swarm {
         let label = self.label(id);
         let mut stopped = self.descendants(id);
         stopped.push(id);
-        let mut records = Vec::with_capacity(stopped.len());
+        let mut states = Vec::with_capacity(stopped.len());
         for target in &stopped {
             if let Some(agent) = self.agent_mut(*target) {
-                agent.control.stop();
-                agent.inbox = None;
-                agent.stopped = true;
-                // Nothing will run the instructions still queued, so nothing will ever finish
-                // them: the counter and the busy mark would stay set for good.
-                agent.pending = 0;
-                agent.busy_since = None;
-                records.push(TreeRecord::State { id: *target, stopped: true, archived: false });
+                agent.retire();
+                states.push(TreeRecord::State { id: *target, stopped: true, archived: false });
             }
         }
         // One write and one sync for the whole subtree: every record write blocks the tree lock.
-        self.record_tree_records(&records);
+        self.record_tree_records(&states);
         let below = stopped.len().saturating_sub(1);
         Ok(if below == 0 {
             format!("{label} stopped")
         } else {
             format!("{label} stopped, with {below} agent(s) below it")
         })
+    }
+
+    /// Cuts the root's turn and stops every worker. The root thread must survive so the user can
+    /// still type, and each later instruction's turn reports the bound rather than reaching a model.
+    pub(crate) fn stop_all(&mut self) {
+        for agent in &mut self.agents {
+            if agent.id == Swarm::ROOT {
+                agent.control.cut();
+            } else {
+                agent.retire();
+            }
+        }
     }
 
     /// Queues `text` for one agent, counting it as pending work.
@@ -1633,7 +1679,7 @@ impl Swarm {
             let lines: Vec<String> = mine
                 .iter()
                 .map(|agent| {
-                    let path = self.log_dir.join(format!("agent-{}.log", agent.id));
+                    let path = self.log_dir.join(format!("agent-{}.jsonl", agent.id));
                     match std::fs::metadata(&path) {
                         Ok(meta) => format!("agent {} {} ({} bytes)", agent.label(), path.display(), meta.len()),
                         Err(_) => format!("agent {} {} (no log)", agent.label(), path.display()),
@@ -1647,10 +1693,11 @@ impl Swarm {
         if !self.visible(caller, id) {
             return Err(format!("agent {} is not under your command", agent.label()));
         }
-        let path = self.log_dir.join(format!("agent-{id}.log"));
+        let path = self.log_dir.join(format!("agent-{id}.jsonl"));
         let label = format!("history://{id}");
-        match tools::read_limited(&path, &label) {
-            Ok((text, cut)) => Ok(tools::with_note(text, cut)),
+        match tools::read_limited_bounded(&path, &label, false) {
+            Ok((Ok(text), cut)) => Ok(tools::with_note(records::render(&text), cut)),
+            Ok((Err(e), _)) => Err(e),
             Err(_) => Err(format!("agent {} has no log yet", agent.label())),
         }
     }
@@ -1744,10 +1791,9 @@ impl Swarm {
     }
 }
 
-/// The history file path for one agent's log path: one `agent-<id>.log` beside one history file.
-fn spawn_history_path(log_path: &Path) -> PathBuf {
-    let name = log_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    log_path.with_file_name(name.replacen(".log", ".history.json", 1))
+/// One agent's committed history, beside its record file: `agent-<id>.history.json`.
+fn history_path(log_dir: &Path, id: usize) -> PathBuf {
+    log_dir.join(format!("agent-{id}.history.json"))
 }
 
 /// Starts one agent thread: its inbox, and the handle proving it lives. `task` is the first
@@ -1768,16 +1814,12 @@ fn spawn_thread(
     task: Option<String>,
     profile: String,
     role: profiles::Role,
-    log_path: &Path,
+    records_path: &Path,
     history_path: PathBuf,
     history: Vec<Message>,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_err(|e| config::io_error(log_path.display(), &e))?;
+    let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
     let tree = Arc::downgrade(me);
     let stream_sender = sender.clone();
@@ -1797,7 +1839,7 @@ fn spawn_thread(
     ));
     let agent_dir = working_dir.to_path_buf();
     let handle = thread::spawn(move || {
-        let mut log = log;
+        let records = &records;
         let mut run = AgentRun {
             swarm: &tree,
             id,
@@ -1807,7 +1849,7 @@ fn spawn_thread(
             role,
             working_dir: &agent_dir,
             sender: &sender,
-            log: &mut log,
+            records,
             history_path,
             history,
             title_written: false,
@@ -1859,7 +1901,7 @@ struct AgentRun<'a> {
     role: profiles::Role,
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
-    log: &'a mut File,
+    records: &'a records::Writer,
     /// Where this agent's committed history is stored: written after every successful turn.
     history_path: PathBuf,
     /// The committed history the agent starts with: empty when fresh, replayed when resumed.
@@ -1878,14 +1920,17 @@ impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let (config, mcp, catalogue) = {
+        let (config, mcp, catalogue, bounds) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
             let tree = lock(&swarm);
-            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles))
+            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles), Arc::clone(&tree.bounds))
         };
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&config.home, self.working_dir);
+        // Discovered once per agent, like the skills: a rule file changed mid-session reaches the
+        // agent through `rule://`.
+        let rules = rules::Rules::load(&config.rule_dir, self.working_dir);
         let mut history = std::mem::take(&mut self.history);
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
@@ -1904,6 +1949,7 @@ impl AgentRun<'_> {
                     policy: &policy,
                     children: tree.children(self.id),
                     skills: &skills,
+                    rules: &rules,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
                     profile,
@@ -1933,7 +1979,7 @@ impl AgentRun<'_> {
             let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
             // Sent before the turn's first delta, so a frontend always reads the instruction first.
             let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
-            let _ = writeln!(self.log, "> {input}");
+            self.records.write(&records::Record::Instruction { text: input.clone() });
             let result = {
                 let context = tools::Context {
                     skills: &skills,
@@ -1941,18 +1987,26 @@ impl AgentRun<'_> {
                     mcp: mcp.as_ref(),
                     scope: Some(&scope),
                 };
+                // `Writer::write` takes `&self`, so both closures below share one copied
+                // reference: the execute closure keeps `&mut self` capture without a conflict.
+                let records = self.records;
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
                     execute: &mut |call: &ToolCall| self.execute(call, control, &context),
                     cancel: Some(control.flag()),
+                    on_commit: Some(&mut |message: &Message| {
+                        records.write(&records::Record::Assistant { message: message.clone() });
+                    }),
+                    bounds: Some(&bounds),
                 };
                 turn.run(&mut history, &input)
             };
             // `close` cut this turn and already sent the report: the interrupt it raised must not
             // also be reported as an interruption, and the thread waits for its owner.
             if control.is_closed() {
-                let _ = writeln!(self.log, "= Closed");
+                self.records
+                    .write(&records::Record::Outcome { outcome: records::Outcome::Closed, text: String::new() });
                 continue;
             }
             let (kind, text, ok) = match result {
@@ -1964,7 +2018,7 @@ impl AgentRun<'_> {
             };
             // Only an Ok turn commits: an Err turn already truncated `history` back to `base`, so
             // the last good file is exactly the committed state. Written before the event, so a
-            // frontend that sees the answer can quit and resume from it. Best-effort, like the log.
+            // frontend that sees the answer can quit and resume from it. Best-effort.
             if ok {
                 let non_system: Vec<Message> = history.iter().filter(|m| m.role != "system").cloned().collect();
                 let _ = session_store::save_history(&self.history_path, &non_system);
@@ -1975,7 +2029,8 @@ impl AgentRun<'_> {
                     }
                 }
             }
-            let _ = writeln!(self.log, "= {kind:?}: {text}");
+            let outcome = records::Outcome::from(kind);
+            self.records.write(&records::Record::Outcome { outcome, text: text.clone() });
             let _ = self.sender.send(Event::Agent { id: self.id, kind, text });
         }
     }
@@ -1991,23 +2046,28 @@ impl AgentRun<'_> {
     fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
         // `close` ends the turn and the agent with it, so it is answered here before any dispatch.
         if call.function.name == tools::CLOSE {
-            let Ok(args) = tools::parse_args::<CloseArgs>(&call.function.arguments) else {
-                return "error: invalid arguments: close takes one `report` string".to_string();
+            let output = match tools::parse_args::<CloseArgs>(&call.function.arguments) {
+                Err(_) => "error: invalid arguments: close takes one `report` string".to_string(),
+                Ok(args) if args.report.trim().is_empty() => {
+                    "error: a close needs a report; say what you did and what you did not test".to_string()
+                }
+                Ok(_) if self.parent.is_none() => "error: the root has no owner and cannot close itself".to_string(),
+                Ok(args) => {
+                    let _ =
+                        self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
+                    control.close();
+                    "closed; your report is on its way".to_string()
+                }
             };
-            if args.report.trim().is_empty() {
-                return "error: a close needs a report; say what you did and what you did not test".to_string();
-            }
-            if self.parent.is_none() {
-                return "error: the root has no owner and cannot close itself".to_string();
-            }
-            let _ = self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
-            control.close();
-            return "closed; your report is on its way".to_string();
+            // A close answers its own call: without a Tool record the assistant message would
+            // name a call that never has a result, which a replay would read as a dangling turn.
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
+            return output;
         }
-        // The log keeps the capped summary, never the raw arguments: a `write_file` carries a whole
-        // file, whose content would land on disk in plain text.
+        // The session record keeps the full fidelity the plaintext log never had: raw arguments
+        // live in the assistant record this call follows, the output lands as its own `Tool`
+        // record. The capped summary still goes to the user's progress card.
         let summary = describe(&call.function.name, &call.function.arguments);
-        let _ = writeln!(self.log, "· {} ({} bytes) {summary}", call.function.name, call.function.arguments.len());
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
             let seq = self.calls;
@@ -2024,7 +2084,7 @@ impl AgentRun<'_> {
             && let Some(refusal) = policy.refuse(&call.function.name, &call.function.arguments)
         {
             let output = format!("error: {refusal}");
-            let _ = writeln!(self.log, "{output}");
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
             if let Some(seq) = seq {
                 progress(
                     self.sender,
@@ -2060,7 +2120,7 @@ impl AgentRun<'_> {
                 context,
             )
         };
-        let _ = writeln!(self.log, "{output}");
+        self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
         if let Some(seq) = seq {
             let preview = tools::preview(&call.function.name, &output);
             let secs = started.elapsed().as_secs_f64();
@@ -2220,6 +2280,7 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             None,
         )));
         Swarm::start_root(&swarm, root.path()).unwrap();
@@ -2234,8 +2295,13 @@ mod tests {
             model: "m".into(),
             theme: config::Theme::Auto,
             max_depth,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.to_path_buf(),
+            rule_dir: root.join("overseer").clone(),
             home: root.to_path_buf(),
+            mcp_project: config::McpProject::On,
         }
     }
 
@@ -2500,7 +2566,7 @@ mod tests {
         assert!(log.contains("> one"), "{log}");
         assert!(log.contains("= Finished: done"), "{log}");
         assert!(
-            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.log"),
+            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.jsonl"),
             "{}",
             read_uri(&h, Swarm::ROOT, "history://")
         );
@@ -2624,7 +2690,7 @@ mod tests {
             parent: Some(1),
             depth: 1,
             max_depth: 3,
-            dir: Path::new("/tmp"),
+            dir: home.path(),
             policy: &policy,
             profile: None,
             role: profiles::Role::Worker,
@@ -2632,6 +2698,7 @@ mod tests {
             children: vec![3],
             skills: &skills,
             mcp: &mcp,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             root: false,
         };
         let rendered = prompt::agent_prompt(&facts);
@@ -2684,6 +2751,39 @@ mod tests {
         let deepest = advertised(&narrow, 0);
         assert!(!deepest.contains(&prompt::SPAWN_AGENT.to_string()), "spawn_agent offered with no depth left");
         assert!(deepest.contains(&prompt::MESSAGE_AGENT.to_string()));
+    }
+
+    /// The rule files of the directory an agent starts in reach its system prompt without anyone
+    /// reading them: the first recorded request's system message carries the file's text and path.
+    #[test]
+    fn the_rules_of_the_root_directory_reach_the_first_request() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("AGENTS.md"), "be brief").unwrap();
+        fs::create_dir(root.path().join("logs")).unwrap();
+        let (sender, queue) = mpsc::channel();
+        let recording = Arc::new(llm::testing::Recording::new(Arc::new(Scripted::new(vec![text("hi")]))));
+        let llm: Arc<dyn llm::Llm> = recording.clone();
+        let models = Arc::new(llm::testing::Fixed(llm));
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            models,
+            Arc::new(profiles::Catalogue::default()),
+            Arc::new(pipelines::Catalogue::default()),
+            Arc::new(test_config(root.path(), 3)),
+            root.path().join("logs"),
+            sender,
+            Arc::new(mcp::Registry::load(root.path())),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+            None,
+        )));
+        Swarm::start_root(&swarm, root.path()).unwrap();
+        assert_eq!(swarm.lock().unwrap().tell_root("go").unwrap(), format!("sent to {}", codename(1)));
+        let _ = next_event(&queue);
+        let requests = recording.requests.lock().unwrap().clone();
+        let system = requests[0].iter().find(|m| m.role == "system").unwrap();
+        let content = system.content.as_deref().unwrap();
+        let path = fs::canonicalize(root.path()).unwrap().join("AGENTS.md").display().to_string();
+        assert!(content.contains("be brief"), "{content}");
+        assert!(content.contains(&path), "{content}");
     }
 
     #[test]
@@ -2843,8 +2943,13 @@ mod tests {
     struct Sleepy;
 
     impl Llm for Sleepy {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
-            Ok(call("c1", tools::BASH, &json!({"command": "sleep 30"})))
+        fn chat(
+            &self,
+            _: &[Message],
+            _: &Value,
+            _: Option<&AtomicBool>,
+        ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
+            Ok((call("c1", tools::BASH, &json!({"command": "sleep 30"})), None))
         }
     }
 
@@ -2900,8 +3005,71 @@ mod tests {
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("> do it") && log.contains("· reply") && log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn a_turns_records_keep_full_fidelity_and_render_back_to_legacy_lines() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "echo hi"})), text("done")]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "run it"), format!("{} started", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Finished, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        // (a) Every line parses as a record.
+        let parsed: Vec<records::Record> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}"))).collect();
+        let kinds: Vec<&str> = parsed
+            .iter()
+            .map(|record| match record {
+                records::Record::Instruction { .. } => "instruction",
+                records::Record::Assistant { .. } => "assistant",
+                records::Record::Tool { .. } => "tool",
+                records::Record::Outcome { .. } => "outcome",
+            })
+            .collect();
+        // The final answer is itself an assistant record (text, no calls).
+        assert_eq!(kinds, ["instruction", "assistant", "tool", "assistant", "outcome"]);
+        // (b) The assistant record carries the raw arguments verbatim: full fidelity.
+        let Some(records::Record::Assistant { message }) =
+            parsed.iter().find(|r| matches!(r, records::Record::Assistant { .. }))
+        else {
+            panic!("no assistant record");
+        };
+        let calls = message.tool_calls.as_deref().unwrap_or_default();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].function.arguments, json!({"command": "echo hi"}).to_string());
+        // (c) history:// renders the legacy lines from those records.
+        let log = read_uri(&h, Swarm::ROOT, "history://2");
+        assert!(log.contains("> run it"), "{log}");
+        assert!(log.contains("· bash"), "{log}");
+        assert!(log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_records_its_outcome_and_no_finished() {
+        // The second turn gets its own long command: with an instant scripted reply it could
+        // finish before this test reads the file, adding a Finished outcome it never saw written.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "sleep 30"})),
+            call("c2", tools::BASH, &json!({"command": "sleep 30"})),
+            text("done"),
+        ]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
+        let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
+        let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "now", "urgent": true}));
+        assert_eq!(sent, format!("interrupted {}; it reads your message now", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Interrupted, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        let parsed: Vec<records::Record> = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        let outcomes: Vec<&records::Outcome> = parsed
+            .iter()
+            .filter_map(|record| match record {
+                records::Record::Outcome { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, [&records::Outcome::Interrupted]);
     }
 
     #[test]
@@ -2935,7 +3103,12 @@ mod tests {
     fn a_panicking_agent_does_not_keep_the_swarm_busy() {
         struct Panic;
         impl Llm for Panic {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
                 panic!("boom")
             }
         }
@@ -3066,7 +3239,7 @@ mod tests {
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "urgent done".into() };
         assert_eq!(next_event(&h.queue), finished);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("interrupted by overseer"), "{log}");
         assert!(log.contains("> now"), "{log}");
     }
@@ -3267,7 +3440,7 @@ mod tests {
         let mut log = String::new();
         while !log.contains("finished] built and tested") {
             assert!(Instant::now() < deadline, "the root never read the report: {log}");
-            log = fs::read_to_string(h.logs.path().join("agent-1.log")).unwrap_or_default();
+            log = records::render(&fs::read_to_string(h.logs.path().join("agent-1.jsonl")).unwrap_or_default());
             thread::sleep(Duration::from_millis(10));
         }
         let archived = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "archive"}));
@@ -3429,14 +3602,12 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let mut log = session_store::SessionLog::open(source.path()).unwrap();
         log.write(&TreeRecord::Session { at: 1, dir: h.root.path().display().to_string(), resumed_from: None });
-        // Production always writes `stopped: false` at spawn and a separate `State` on the way to
-        // dead, so the fixture does too: the fold, not the fixture, has to bring the stop back.
         for id in [1usize, 2] {
             let tree = h.swarm.lock().unwrap();
             let agent = tree.agent(id).unwrap();
             log.write(&TreeRecord::Agent {
                 id,
-                name: None,
+                name: agent.name.clone(),
                 parent: agent.parent,
                 depth: agent.depth,
                 dir: agent.working_dir.display().to_string(),
@@ -3444,14 +3615,14 @@ mod tests {
                 profile: agent.profile.clone(),
                 role: agent.role,
                 policy: agent.control.policy(),
-                stopped: false,
-                archived: false,
+                stopped: agent.stopped,
+                archived: agent.archived,
                 pipeline: false,
             });
-            assert!(agent.stopped || id == 1, "the fixture stops agent 2 first");
+            if agent.stopped {
+                log.write(&TreeRecord::State { id, stopped: true, archived: false });
+            }
         }
-        log.write(&TreeRecord::Rename { id: 2, name: "kept name".into() });
-        log.write(&TreeRecord::State { id: 2, stopped: true, archived: false });
         // The committed histories, as the AgentRun would have saved them: system messages out.
         let replay = vec![llm::Message::user("second question")];
         session_store::save_history(&source.path().join("agent-1.history.json"), &replay).unwrap();
@@ -3459,7 +3630,8 @@ mod tests {
         drop(log);
 
         // A fresh tree that records what its model receives.
-        let recorder = Arc::new(llm::testing::Recording::new(vec![text("resumed answer")]));
+        let recorder =
+            Arc::new(llm::testing::Recording::new(Arc::new(llm::testing::Scripted::new(vec![text("resumed answer")]))));
         let root = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let (sender, _queue) = mpsc::channel();
@@ -3475,6 +3647,7 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
             None,
         )));
         let source_id = source.path().file_name().unwrap().to_string_lossy().into_owned();
@@ -3492,21 +3665,16 @@ mod tests {
         assert_eq!(tree.agent(2).unwrap().state(), State::Stopped);
         // No re-merge: the child's policy is the stored one, byte for byte.
         assert_eq!(tree.agent(2).unwrap().control.policy(), h.swarm.lock().unwrap().agent(2).unwrap().control.policy());
-        assert_eq!(tree.agent(2).unwrap().name.as_deref(), Some("kept name"), "a rename survives the resume");
         drop(tree);
-        // The replayed history lands in the NEW session dir, so quitting before the next turn
-        // still leaves a session that resumes with its conversation.
-        let seeded = session_store::load_history(&logs.path().join("agent-1.history.json")).unwrap();
-        assert_eq!(seeded, replay, "the resumed session seeds its own history file");
 
         // The resumed root's next model call carries the replayed history: system slot first, then
         // the committed user turn.
         swarm.lock().unwrap().tell_root("next instruction").unwrap();
         let deadline = Instant::now() + WAIT;
-        while recorder.calls().is_empty() && Instant::now() < deadline {
+        while recorder.requests.lock().unwrap().is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        let calls = recorder.calls();
+        let calls = recorder.requests.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "the resumed root made one call: {calls:?}");
         let history = &calls[0];
         assert_eq!(history[0].role, "system");

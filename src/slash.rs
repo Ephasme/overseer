@@ -45,11 +45,12 @@ impl Command {
 }
 
 /// Every slash command `Event::from_line` recognises, in the order the popup lists them.
-pub(crate) const COMMANDS: [Command; 5] = [
+pub(crate) const COMMANDS: [Command; 6] = [
     Command { name: RESUME, hint: Some("<id>"), about: "retask an agent without a model call" },
     Command { name: PIPELINE, hint: Some("<name|list|stop>"), about: "run or manage a Rhai pipeline" },
     Command { name: "/schemes", hint: None, about: "list the internal URI schemes" },
     Command { name: "/mcp", hint: None, about: "show the MCP servers" },
+    Command { name: "/approve", hint: Some("<server>"), about: "start a project MCP server for this session" },
     Command { name: "/login", hint: Some("<server>"), about: "log in to an MCP server" },
 ];
 

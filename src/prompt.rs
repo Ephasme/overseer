@@ -1,5 +1,6 @@
 use crate::mcp;
 use crate::profiles;
+use crate::rules;
 use crate::skills;
 use crate::tools;
 use serde_json::{Value, json};
@@ -28,6 +29,9 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     tools::READ_FILE,
     tools::WRITE_FILE,
     tools::EDIT,
+    tools::GLOB,
+    tools::GREP,
+    tools::PYTHON,
     SPAWN_AGENT,
     MESSAGE_AGENT,
     CONTROL_AGENT,
@@ -206,6 +210,8 @@ pub(crate) struct AgentFacts<'a> {
     pub(crate) role: profiles::Role,
     /// The agent the user talks to.
     pub(crate) root: bool,
+    /// The instruction files loaded at thread start, carried by every prompt rebuild.
+    pub(crate) rules: &'a rules::Rules,
 }
 
 /// What a supervisor is for. It never changes anything itself: every change belongs to an agent it
@@ -280,6 +286,9 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
             "Skills you can read: when a task matches one, read `skill://<name>` with `read_file` first; `skill://<name>/<path>` reaches that skill's other files.\n<skills>\n{catalogue}\n</skills>\n"
         );
     }
+    if !facts.rules.is_empty() {
+        out.push_str(&rules_section(facts.rules));
+    }
     // A read-only agent is offered no MCP tool, so notes about them would describe calls it cannot
     // make. The servers' prose is fenced: it is theirs, not an instruction of yours.
     if !policy.read_only {
@@ -291,7 +300,7 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
         "Ownership is one way: you may message, pause, resume or stop any agent below you, and nobody below you may do any of that to you. You cannot command your parent, your siblings, or any agent outside your own subtree.\n\
 Your rights are fixed: nothing can widen or narrow them while you run, and the same holds for the agents you own.\n\
 Messages that start with [agent N · <name> ...] come from an agent you own, and a renamed agent shows its new name there: \"says\" is a progress note or a question, \"finished\" carries its final report, \"failed\" an error, \"interrupted\" a turn you cut short. Answer a question yourself when you can.\n\
-Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
+Searching: the `glob` and `grep` tools first; `rg` (or `git grep`) through `bash` only for a flag the tools lack, scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
 If you need a decision to continue, end your turn with the question as your final answer.\n",
     );
     let defs = agent_tool_definitions(facts.mcp, &policy, remaining);
@@ -313,6 +322,43 @@ If you need a decision to continue, end your turn with the question as your fina
         out.push_str(&lines.join("\n"));
         out.push('\n');
     }
+    out
+}
+
+/// The loaded instruction files, in discovery order, keeping loaded files under a 64 KiB budget that
+/// counts headers, content and separators; a file past the budget, or one a read error skipped, gets
+/// one pointer line instead, and the pointer lines and closing tag are not counted against it.
+fn rules_section(r: &rules::Rules) -> String {
+    const BUDGET: usize = 64 * 1024;
+    let mut out = String::from(
+        "Instruction files that govern your working directory: follow them. `rule://` lists every \
+         rule file, `rule://<path>` reads one.\n\n<rules>\n",
+    );
+    for (path, loaded) in r.iter() {
+        let header = format!("# {}\n", path.display());
+        let Some((text, cut)) = loaded else {
+            let _ = writeln!(out, "[not loaded: {} — read rule://{}]", path.display(), path.display());
+            continue;
+        };
+        if out.len() + header.len() + text.len() > BUDGET {
+            let _ = writeln!(out, "[not loaded: {} — read rule://{}]", path.display(), path.display());
+            continue;
+        }
+        out.push_str(&header);
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+        if *cut {
+            let _ = writeln!(
+                out,
+                "[truncated: the first {} bytes only; rule://{} returns the same head, so read the rest with bash]",
+                text.len(),
+                path.display()
+            );
+        }
+    }
+    out.push_str("</rules>\n");
     out
 }
 
@@ -366,6 +412,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: Some(reviewer),
@@ -399,6 +446,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: None,
@@ -439,6 +487,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: true,
             profile: profiles.get(profiles::SUPERVISOR),
@@ -472,6 +521,7 @@ mod tests {
             policy: &policy,
             children: Vec::new(),
             skills: &skills,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             mcp: &mcp,
             root: false,
             profile: None,
@@ -483,5 +533,92 @@ mod tests {
         assert!(prompt.contains("Do not rewrite source through `bash`"), "{prompt}");
         assert!(prompt.contains("- edit: Change an existing file"), "{prompt}");
         assert!(prompt.contains("- read_file:"), "{prompt}");
+    }
+
+    /// A minimal facts bundle over an empty rules cache, so a test names only what it varies.
+    fn facts_with<'a>(
+        home: &'a Path,
+        policy: &'a tools::Policy,
+        skills: &'a skills::Catalogue,
+        mcp: &'a mcp::Registry,
+        profiles: &'a profiles::Catalogue,
+        rules: &'a rules::Rules,
+    ) -> AgentFacts<'a> {
+        AgentFacts {
+            id: 2,
+            parent: Some(1),
+            depth: 1,
+            max_depth: 3,
+            dir: home,
+            policy,
+            children: Vec::new(),
+            skills,
+            rules,
+            mcp,
+            root: false,
+            profile: None,
+            profiles,
+            role: profiles::Role::Worker,
+        }
+    }
+
+    #[test]
+    fn loaded_rules_reach_the_prompt_and_empty_ones_do_not() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("AGENTS.md"), "be brief").unwrap();
+        let rules = rules::Rules::load(&home.path().join("config"), home.path());
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let profiles = profiles::Catalogue::default();
+        let policy = tools::Policy::default();
+        let prompt = agent_prompt(&facts_with(home.path(), &policy, &skills, &mcp, &profiles, &rules));
+        assert!(prompt.contains("<rules>"), "{prompt}");
+        let header = format!("# {}", home.path().canonicalize().unwrap().join("AGENTS.md").display());
+        assert!(prompt.contains(&header), "{prompt}");
+        assert!(prompt.contains("be brief"), "{prompt}");
+
+        let bare = tempfile::tempdir().unwrap();
+        fs::create_dir(bare.path().join(".git")).unwrap();
+        let empty = rules::Rules::load(&bare.path().join("config"), bare.path());
+        let prompt = agent_prompt(&facts_with(bare.path(), &policy, &skills, &mcp, &profiles, &empty));
+        assert!(!prompt.contains("<rules>"), "{prompt}");
+    }
+
+    #[test]
+    fn the_rules_budget_drops_whole_files_and_names_them() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().canonicalize().unwrap();
+        fs::create_dir(base.join(".git")).unwrap();
+        for (name, size) in [("AGENTS.md", 25_000), ("CLAUDE.md", 25_000), ("RULES.md", 25_000)] {
+            fs::write(base.join(name), "x".repeat(size)).unwrap();
+        }
+        let rules = rules::Rules::load(&base.join("config"), &base);
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let profiles = profiles::Catalogue::default();
+        let policy = tools::Policy::default();
+        let prompt = agent_prompt(&facts_with(home.path(), &policy, &skills, &mcp, &profiles, &rules));
+        let a = base.join("AGENTS.md").display().to_string();
+        let c = base.join("RULES.md").display().to_string();
+        assert!(prompt.contains(&format!("# {a}")), "the first file fits: {prompt}");
+        assert!(!prompt.contains(&format!("# {c}")), "the third file is over budget");
+        assert!(prompt.contains(&format!("[not loaded: {c} — read rule://{c}]")), "{prompt}");
+    }
+
+    #[test]
+    fn an_oversized_rule_file_keeps_its_head_and_names_the_rest() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().canonicalize().unwrap();
+        fs::write(base.join("AGENTS.md"), "y".repeat(30_000)).unwrap();
+        fs::create_dir(base.join(".git")).unwrap();
+        let rules = rules::Rules::load(&base.join("config"), &base);
+        let skills = skills::Catalogue::in_dir(home.path(), home.path());
+        let mcp = mcp::Registry::load(home.path());
+        let profiles = profiles::Catalogue::default();
+        let policy = tools::Policy::default();
+        let prompt = agent_prompt(&facts_with(home.path(), &policy, &skills, &mcp, &profiles, &rules));
+        let path = base.join("AGENTS.md").display().to_string();
+        assert!(prompt.contains("yyyy"), "the head is carried: {prompt}");
+        assert!(prompt.contains(&format!("[truncated: the first 28000 bytes only; rule://{path}")), "{prompt}");
     }
 }
