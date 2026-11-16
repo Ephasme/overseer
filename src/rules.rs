@@ -48,16 +48,11 @@ pub(crate) struct Rules {
 }
 
 impl Rules {
-    /// Reads every discovered rule file. A file that cannot be read is skipped, not fatal: the
-    /// prompt names it and `rule://` still surfaces the error on demand.
+    /// Reads every discovered rule file. A file that cannot be read as text is skipped, not fatal:
+    /// the prompt names it and `rule://` still surfaces the error on demand. A rule file feeds a
+    /// prompt, not a log: no lossy decode, no binary acceptance.
     pub(crate) fn load(config_dir: &Path, dir: &Path) -> Self {
-        let entries = found(config_dir, dir)
-            .into_iter()
-            .map(|path| match crate::tools::read_limited(&path, &path.display().to_string()) {
-                Ok((text, cut)) => (path, Some((text, cut))),
-                Err(_) => (path, None),
-            })
-            .collect();
+        let entries = found(config_dir, dir).into_iter().map(|path| (path.clone(), load_one(&path))).collect();
         Self { entries }
     }
 
@@ -71,6 +66,23 @@ impl Rules {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter()
     }
+}
+
+/// One rule file: `None` when its bytes are not UTF-8 or the read fails, the text and a cut flag
+/// otherwise. `read_limited` decodes lossily since SPC-313–316, so the loader reads the bytes
+/// itself and keeps the strictness a prompt needs.
+fn load_one(path: &Path) -> Option<(String, bool)> {
+    let mut bytes = fs::read(path).ok()?;
+    let cut = bytes.len() > crate::edit::MAX_READ_BYTES;
+    if cut {
+        // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
+        let end = bytes
+            .get(..crate::edit::MAX_READ_BYTES)
+            .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
+        bytes.truncate(end);
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    Some((text, cut))
 }
 
 /// What `rule://` lists: every rule file that governs `dir`, with its size.
