@@ -974,6 +974,13 @@ impl Swarm {
         id.checked_sub(1).and_then(|index| self.agents.get(index))
     }
 
+    /// The client one agent calls: the model its profile names, or the configured default, billed to
+    /// that agent's own row of the session meter.
+    fn client(tree: &Swarm, id: usize, model: Option<&str>, effort: Option<&str>) -> Arc<dyn Llm> {
+        let name = model.unwrap_or(&tree.config.model).to_string();
+        Arc::new(llm::Metered::new(tree.models.get(model, effort), Arc::clone(&tree.bounds), id, name))
+    }
+
     /// Starts the agent the user talks to: id 1, depth 0, no parent and no first instruction.
     ///
     /// It runs the built-in supervisor profile under `Role::Supervisor`, whatever the file of that
@@ -1002,7 +1009,7 @@ impl Swarm {
                 tree.log_dir.join(format!("agent-{id}.jsonl")),
                 tree.log_dir.join(format!("agent-{id}.history.json")),
                 Arc::clone(&control),
-                tree.models.get(supervisor.model.as_deref(), effort),
+                Swarm::client(&tree, id, supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
                 supervisor.name.clone(),
                 supervisor.policy.clone(),
@@ -1165,7 +1172,8 @@ impl Swarm {
                 .ok_or_else(|| format!("unknown profile {}; available: {}", args.profile, tree.profiles.names()))?;
             let effort = profile.effort()?;
             profile.tools(prompt::GRANTABLE_TOOLS)?;
-            let llm = tree.models.get(profile.model.as_deref(), effort);
+            let id = tree.agents.len() + 1;
+            let llm = Swarm::client(&tree, id, profile.model.as_deref(), effort);
             let control = Arc::new(Control::default());
             // A child tightens to the intersection of the two tool lists, unless its owner holds the
             // `free_spawn` grant and asks for the child profile's own policy.
@@ -1187,7 +1195,6 @@ impl Swarm {
             let record_policy = policy.clone();
             control.set_policy(policy);
             let dir = args.path.clone().unwrap_or_else(|| parent.working_dir.display().to_string());
-            let id = tree.agents.len() + 1;
             (
                 depth,
                 dir,
@@ -1444,7 +1451,7 @@ impl Swarm {
         }
         // Session-invariant, so read once instead of per row: every one of these takes the tree
         // lock, which every other agent thread waits on.
-        let (home, models, profiles, sender, log_dir) = {
+        let (home, models, profiles, sender, log_dir, bounds, default_model) = {
             let tree = lock(swarm);
             (
                 tree.config.home.clone(),
@@ -1452,6 +1459,8 @@ impl Swarm {
                 Arc::clone(&tree.profiles),
                 tree.sender.clone(),
                 tree.log_dir.clone(),
+                Arc::clone(&tree.bounds),
+                tree.config.model.clone(),
             )
         };
         let mut pipelines = 0;
@@ -1480,7 +1489,13 @@ impl Swarm {
                 let found = profiles.get(row.profile.as_str());
                 let model = found.and_then(|found| found.model.clone());
                 let effort = found.and_then(|found| found.effort().ok()).flatten();
-                let llm = models.get(model.as_deref(), effort);
+                let named = model.clone().unwrap_or_else(|| default_model.clone());
+                let llm: Arc<dyn Llm> = Arc::new(llm::Metered::new(
+                    models.get(model.as_deref(), effort),
+                    Arc::clone(&bounds),
+                    row.id,
+                    named,
+                ));
                 // The new session dir gets the replayed history now, so quitting before the next
                 // turn still leaves a session that resumes with its conversation.
                 let _ = session_store::save_history(&history_file, &history);
@@ -2466,6 +2481,7 @@ mod tests {
             max_depth,
             max_time: None,
             max_cost: None,
+            warn_cost: None,
             pricing: HashMap::new(),
             dir: root.to_path_buf(),
             rule_dir: root.join("overseer").clone(),

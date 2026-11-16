@@ -23,6 +23,11 @@ model = "gpt-4.1"
 theme = "auto"                        # auto | dark | light | mono; omitted means auto
 compaction = { context_window = 200000 } # optional: see below
 approvals = "ask"                     # ask | cached-ask | write | yolo; omitted means ask
+warn_cost = 1.0                       # warn once past this spend, in USD; stops nothing
+max_cost = 5.0                        # stop every agent past this spend, in USD
+[pricing."gpt-4.1"]                   # USD per 1M tokens, keyed by the exact model name
+in = 2.0
+out = 8.0
 ```
 
 The first three keys are required; `theme` and `approvals` are optional. `approvals` gates `bash`, `write_file` and `edit` in the TUI: `ask` prompts on every gated call, `cached-ask` prompts the first time each distinct call appears and replays the answer for the rest of the session, `write` lets the two file tools through and applies cached-ask to bash, and `yolo` never prompts. At a prompt, `y` allows that call once, `n` refuses it and `esc` refuses too; `a` allows the call for the rest of the session whatever the tier, so a repeated call stops asking. Line mode has no terminal to answer in, so there a gated call is refused unless the tier is `yolo`. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
@@ -33,13 +38,18 @@ OVERSEER_API_KEY=...
 
 `compaction` decides when a conversation's oldest messages are summarized so the model keeps working past its context window. It is on by default and compacts nothing until you name `context_window` or `threshold_tokens`: the trigger is the window minus the larger of 15% of it and `reserve_tokens` (16384), or `threshold_tokens` when you set it, and the reserve never takes more than half the window. `keep_recent_tokens` (20000) caps how much of the newest conversation is never summarized, itself capped under the trigger so one compaction lands the context under its recovery band and a turn compacts at most once. `enabled = false` turns the whole thing off. `/compact [id]` forces one at the agent's next safe point. A summary that is skipped or fails is reported in the transcript and in the agent log, and the turn carries on.
 
+`warn_cost` and `max_cost` are dollars per session, and `[pricing]` is what turns tokens into dollars: a model the table does not name costs $0 there, so its tokens are counted and shown while neither limit fires on it, and a run with a limit set says at startup which models those are. `--warn-cost` and `--max-cost` override both for one run.
+
 ## Run
 
 ```sh
 overseer          # a fresh session
 overseer -c       # resume the newest session
 overseer -r [id]  # resume a named session, or pick one from a list
+overseer --warn-cost 1 --max-cost 5   # this run only: overrides config.toml
 ```
+
+The status line carries the session's dollars and tokens as they accrue, and each agent's panel row its own share: a model the price table leaves at $0 shows its token count there instead. Crossing `warn_cost` prints one notice and nothing else; the run carries on.
 
 A session outlives its process: the tree and every agent's committed history are written to `~/.local/state/overseer/sessions/<start time>/` as it runs, so `-c` and `-r` bring the whole tree back idle, each live agent with its history in front of the model. An interrupted turn is not re-delivered, instructions queued in an inbox at exit are lost, and a resumed session gets a new directory whose header records the one it came from. `-r` with no id needs a terminal; line mode takes `-c` or `-r <id>`.
 

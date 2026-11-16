@@ -1275,6 +1275,8 @@ pub(super) struct App {
     approvals: Vec<ApprovalPrompt>,
     /// The current approval tier, corrected by the first `UiEvent::Approvals`.
     tier: approvals::Tier,
+    /// What the session spent: dollars, tokens, and each agent's share, from the last `Meter`.
+    meter: Meter,
     busy: bool,
     busy_since: Instant,
     last_tick: Instant,
@@ -1299,6 +1301,7 @@ impl App {
             model: model.to_string(),
             history: Vec::new(),
             tier: approvals::Tier::Ask,
+            meter: Meter::default(),
             recall: None,
             completion: None,
             calls: Vec::new(),
@@ -1402,6 +1405,9 @@ impl App {
                 self.approvals.push(ApprovalPrompt { agent, request, tool, call });
             }
             UiEvent::Approvals(tier) => self.tier = tier,
+            UiEvent::Meter { cost, tokens, agents } => {
+                self.meter = Meter { cost, tokens, agents: agents.into_iter().collect() };
+            }
             UiEvent::ApprovalWithdrawn { request } => self.approvals.retain(|prompt| prompt.request != request),
         }
     }
@@ -1889,6 +1895,16 @@ impl App {
             let reserved = text_width(&indent) + text_width(glyph) + 1 + text_width(&state);
             let label = truncate(&worker.label, usize::from(inner.width).saturating_sub(reserved));
             let marker = if unread == 0 { String::new() } else { format!(" · {unread} new") };
+            // The suffix says what this agent cost. A token count stands in when the price table
+            // leaves the model at $0: a worker that burned 400k tokens is never the idle row.
+            let cost = match self.meter.agents.get(&worker.id) {
+                Some(spend) if spend.cost > 0.0 => format!(" · {}", fmt_cost(spend.cost)),
+                Some(spend) if spend.tokens() > 0 => format!(" · {} tok", fmt_tokens(spend.tokens())),
+                _ => String::new(),
+            };
+            // The directory gives way to the suffix: a row that loses the money says less.
+            let dir_room = usize::from(inner.width).saturating_sub(text_width(&marker) + text_width(&cost));
+            let dir = truncate(&short_dir(&worker.dir), dir_room);
             let lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{indent}{glyph} "), Style::new().fg(colour)),
@@ -1903,8 +1919,9 @@ impl App {
                     Span::styled(format!(" {state}"), Style::new().fg(theme::muted())),
                 ]),
                 Line::from(vec![
-                    Span::styled(short_dir(&worker.dir), Style::new().fg(theme::faint())),
+                    Span::styled(dir, Style::new().fg(theme::faint())),
                     Span::styled(marker, Style::new().fg(theme::warning())),
+                    Span::styled(cost, Style::new().fg(theme::faint())),
                 ]),
                 Line::default(),
             ];
@@ -1977,6 +1994,13 @@ impl App {
         spans
             .push(Span::styled(format!(" · {working} working · {paused}{idle} idle"), Style::new().fg(theme::muted())));
         spans.push(Span::styled(format!(" · {}", self.tier.name()), Style::new().fg(theme::muted())));
+        if !self.meter.is_empty() {
+            spans.push(Span::styled(format!(" · {}", fmt_cost(self.meter.cost)), Style::new().fg(theme::muted())));
+            spans.push(Span::styled(
+                format!(" · {} tok", fmt_tokens(self.meter.tokens)),
+                Style::new().fg(theme::muted()),
+            ));
+        }
         if let Some(scroll) = self.scrolled() {
             spans.push(Span::styled(format!(" · ↑{scroll} lines"), Style::new().fg(theme::warning())));
         }
@@ -2614,6 +2638,37 @@ fn worker_state(worker: &AgentView) -> (&'static str, Color, String) {
     }
 }
 
+/// What the session has spent, as the last `UiEvent::Meter` reported it.
+#[derive(Default)]
+struct Meter {
+    cost: f64,
+    tokens: u64,
+    /// Each agent's own share, by id.
+    agents: std::collections::HashMap<usize, crate::bounds::Spend>,
+}
+
+impl Meter {
+    fn is_empty(&self) -> bool {
+        self.tokens == 0 && self.cost == 0.0
+    }
+}
+
+/// Dollars as the meter shows them: two decimals, and four below a cent, so a cheap model's first
+/// calls do not all read `$0.00`.
+fn fmt_cost(cost: f64) -> String {
+    if cost > 0.0 && cost < 0.01 { format!("${cost:.4}") } else { format!("${cost:.2}") }
+}
+
+/// Tokens as the meter shows them: `934`, `12.3k`, `4.6M`. A count that never leaves three digits
+/// says nothing about how fast the bill is moving.
+fn fmt_tokens(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=999_999 => format!("{}.{}k", tokens / 1_000, tokens % 1_000 / 100),
+        _ => format!("{}.{}M", tokens / 1_000_000, tokens % 1_000_000 / 100_000),
+    }
+}
+
 /// The last component of the worker's directory, so a narrow panel stays readable.
 fn short_dir(dir: &Path) -> String {
     dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
@@ -3160,6 +3215,66 @@ mod tests {
         assert!(screen.contains("Ask agent 1"), "{screen}");
         assert!(screen.contains("test-model"), "the status line names the model: {screen}");
         assert!(screen.contains(version::VERSION), "{screen}");
+    }
+
+    #[test]
+    fn the_meter_formats_cheap_calls_and_big_counts_readably() {
+        assert_eq!(fmt_cost(0.004), "$0.0040", "a sub-cent spend is not $0.00");
+        assert_eq!(fmt_cost(1.25), "$1.25");
+        assert_eq!(fmt_tokens(934), "934");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
+        assert_eq!(fmt_tokens(4_600_000), "4.6M");
+    }
+
+    /// The session's spend rides in the status line, and each agent's own share on its row: a worker
+    /// on an unpriced model still shows the tokens it burned rather than the idle row's blank.
+    #[test]
+    fn the_meter_shows_the_session_total_and_each_agents_share() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![root_view(), agent_view(2, "run the tests")]));
+        app.apply(UiEvent::Meter {
+            cost: 1.25,
+            tokens: 2_400_000,
+            agents: vec![
+                (1, crate::bounds::Spend { input: 100_000, output: 100_000, cost: 0.2 }),
+                (2, crate::bounds::Spend { input: 2_000_000, output: 200_000, cost: 1.05 }),
+            ],
+        });
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains("$1.25"), "{rendered}");
+        assert!(rendered.contains("2.4M tok"), "{rendered}");
+        assert!(rendered.contains("$1.05"), "the child's row prices its own calls: {rendered}");
+        // A model the table leaves at $0 shows its tokens instead of nothing.
+        app.apply(UiEvent::Meter {
+            cost: 0.0,
+            tokens: 400_100,
+            agents: vec![(2, crate::bounds::Spend { input: 400_000, output: 100, cost: 0.0 })],
+        });
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.contains("400.1k tok"), "{rendered}");
+    }
+
+    /// At the panel's minimum width the directory gives way: a row that loses the money says less.
+    #[test]
+    fn a_narrow_row_keeps_the_cost_and_cuts_the_directory() {
+        let mut app = App::new("m");
+        app.workers_width = WORKERS_MIN;
+        let mut child = agent_view(2, "run the tests");
+        child.dir = PathBuf::from("/tmp/a-very-long-repository-name");
+        app.apply(UiEvent::Agents(vec![root_view(), child]));
+        app.apply(UiEvent::Meter {
+            cost: 12.5,
+            tokens: 9_000_000,
+            agents: vec![(2, crate::bounds::Spend { input: 9_000_000, output: 0, cost: 12.5 })],
+        });
+        let rendered = screen(&mut app, 100, 24);
+        // The panel's own row, not the lead's `started` line, which carries the whole path.
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("a-very") && !line.contains("started"))
+            .expect("the agent's row");
+        assert!(row.contains("$12.50"), "the cost survives a narrow panel: {row}");
+        assert!(!row.contains("repository"), "the directory is cut instead: {row}");
     }
 
     #[test]

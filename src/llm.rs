@@ -177,7 +177,8 @@ pub(crate) struct Backend {
     api_key: String,
     default_model: String,
     debug: Option<DebugSink>,
-    meter: Option<Arc<crate::bounds::Bounds>>,
+    /// Whether a client asks its provider for token counts: a cost ceiling or a warning needs them.
+    wants_usage: bool,
     clients: Clients,
 }
 
@@ -187,7 +188,7 @@ impl Backend {
         api_key: String,
         default_model: String,
         debug: Option<DebugSink>,
-        meter: Option<Arc<crate::bounds::Bounds>>,
+        wants_usage: bool,
     ) -> Result<Self> {
         // reqwest's 30 s default is shorter than a long model answer.
         let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
@@ -197,7 +198,7 @@ impl Backend {
             api_key,
             default_model,
             debug,
-            meter,
+            wants_usage,
             clients: Mutex::new(HashMap::new()),
         })
     }
@@ -216,9 +217,62 @@ impl Models for Backend {
                 model,
                 effort.map(str::to_string),
                 self.debug.clone(),
-                self.meter.clone(),
+                self.wants_usage,
             ))
         }))
+    }
+}
+
+/// One agent's client, billed to that agent: a client is shared by every agent on its model, so the
+/// id cannot live on the client itself.
+///
+/// This is the only place a model call is accounted, `chat_capped` and the compaction summaries
+/// included — the client underneath keeps no meter.
+pub(crate) struct Metered {
+    inner: Arc<dyn Llm>,
+    bounds: Arc<crate::bounds::Bounds>,
+    agent: usize,
+    model: String,
+}
+
+impl Metered {
+    pub(crate) fn new(inner: Arc<dyn Llm>, bounds: Arc<crate::bounds::Bounds>, agent: usize, model: String) -> Self {
+        Self { inner, bounds, agent, model }
+    }
+
+    /// Bills one answer. A call that reported no counts is counted as unbilled instead of silently
+    /// escaping the ceiling.
+    fn account(&self, usage: Option<Usage>) {
+        match usage {
+            Some(usage) => self.bounds.account(self.agent, &self.model, usage.counts()),
+            None if self.bounds.wants_usage() => self.bounds.note_unbilled(),
+            None => {}
+        }
+    }
+}
+
+impl Llm for Metered {
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)> {
+        let answer = self.inner.chat(messages, tools, cancel)?;
+        self.account(answer.1);
+        Ok(answer)
+    }
+
+    fn chat_capped(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        max_tokens: u64,
+    ) -> Result<(Message, Option<Usage>)> {
+        let answer = self.inner.chat_capped(messages, tools, cancel, max_tokens)?;
+        self.account(answer.1);
+        Ok(answer)
     }
 }
 
@@ -230,7 +284,8 @@ pub(crate) struct OpenAiClient {
     /// Sent as `reasoning_effort`; `None` leaves the provider's own default.
     effort: Option<String>,
     debug: Option<DebugSink>,
-    meter: Option<Arc<crate::bounds::Bounds>>,
+    /// Whether a streamed call asks for its token counts.
+    wants_usage: bool,
 }
 
 impl OpenAiClient {
@@ -241,9 +296,9 @@ impl OpenAiClient {
         model: String,
         effort: Option<String>,
         debug: Option<DebugSink>,
-        meter: Option<Arc<crate::bounds::Bounds>>,
+        wants_usage: bool,
     ) -> Self {
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug, meter }
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug, wants_usage }
     }
 }
 
@@ -256,7 +311,6 @@ impl Llm for OpenAiClient {
     ) -> Result<(Message, Option<Usage>)> {
         let body = self.post(messages, tools, None, false)?;
         let (message, usage) = parse_response(&body)?;
-        self.charge(usage);
         Ok((message, usage))
     }
 
@@ -280,7 +334,7 @@ impl Llm for OpenAiClient {
             model: self.model.clone(),
             effort: self.effort.clone(),
             debug: self.debug.clone(),
-            meter: self.meter.clone(),
+            wants_usage: self.wants_usage,
         };
         let messages = messages.to_vec();
         let tools = tools.clone();
@@ -319,27 +373,14 @@ impl Llm for OpenAiClient {
             let body = response.text().context("reading model response failed")?;
             let (message, usage) = parse_response(&body)?;
             report(&message, on_piece);
-            self.charge(usage);
             return Ok((message, usage));
         }
         let (message, usage) = read_stream(std::io::BufReader::new(response), cancel, on_piece)?;
-        self.charge(usage);
         Ok((message, usage))
     }
 }
 
 impl OpenAiClient {
-    /// Bills the meter for the tokens a successful call reported. A call that reported none is
-    /// counted as unbilled instead of silently escaping a cost bound.
-    fn charge(&self, usage: Option<Usage>) {
-        let Some(meter) = &self.meter else { return };
-        match usage {
-            Some(usage) => meter.charge(&self.model, usage.counts()),
-            None if meter.wants_usage() => meter.note_unbilled(),
-            None => {}
-        }
-    }
-
     /// One request, read as a stream so the interrupt flag is read between lines. A provider that
     /// ignored `stream` answers whole instead.
     fn exchange(
@@ -358,7 +399,6 @@ impl OpenAiClient {
             .is_some_and(|value| value.contains("text/event-stream"));
         if streamed {
             let (message, usage) = read_stream(std::io::BufReader::new(response), cancel, on_piece)?;
-            self.charge(usage);
             return Ok((message, usage));
         }
         let status = response.status();
@@ -368,7 +408,6 @@ impl OpenAiClient {
         }
         let (message, usage) = parse_response(&body)?;
         report(&message, on_piece);
-        self.charge(usage);
         Ok((message, usage))
     }
 
@@ -414,7 +453,7 @@ impl OpenAiClient {
 
     /// Whether this client asks its provider for token counts on streamed calls.
     fn wants_usage(&self) -> bool {
-        self.meter.as_ref().is_some_and(|meter| meter.wants_usage())
+        self.wants_usage
     }
 
     fn send(
@@ -982,10 +1021,11 @@ mod tests {
     #[test]
     fn a_request_carries_the_effort_only_when_one_is_set() {
         let http = reqwest::blocking::Client::new();
-        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, None);
+        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, true);
         let body = plain.payload(&[], &json!([]), None, false, false);
         assert!(body.get("reasoning_effort").is_none());
-        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None, None);
+        let effortful =
+            OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None, false);
         let body = effortful.payload(&[], &json!([]), None, false, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["model"], "m");
@@ -993,7 +1033,7 @@ mod tests {
 
     #[test]
     fn the_backend_reuses_one_client_per_pair() {
-        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None, None).unwrap();
+        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None, false).unwrap();
         let first = backend.get(None, None);
         assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
         assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
@@ -1030,37 +1070,46 @@ mod tests {
         let http = reqwest::blocking::Client::new();
         let bounded = crate::bounds::Bounds::new(None, Some(1.0), HashMap::new());
         let client =
-            OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, Some(Arc::new(bounded)));
+            OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, bounded.wants_usage());
         assert!(client.payload(&[], &json!([]), None, true, true).get("stream_options").is_some());
         assert!(
             client.payload(&[], &json!([]), None, false, true).get("stream_options").is_none(),
             "non-streaming asks for usage inline"
         );
-        let unbounded = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), None, None, None);
+        let unbounded = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), None, None, false);
         assert!(unbounded.payload(&[], &json!([]), None, true, false).get("stream_options").is_none());
     }
 
+    /// A client that answers with whatever token counts it was built with.
+    struct Counted(Option<Usage>);
+
+    impl Llm for Counted {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<(Message, Option<Usage>)> {
+            Ok((testing::text("hi"), self.0))
+        }
+    }
+
     #[test]
-    fn a_priced_model_is_billed_and_an_unpriced_one_is_not() {
+    fn a_priced_model_is_billed_to_its_agent_and_an_unpriced_one_is_not() {
         let pricing = HashMap::from([("m".into(), crate::bounds::Price { input: 3.0, output: 15.0 })]);
         let meter = Arc::new(crate::bounds::Bounds::new(None, Some(100.0), pricing));
-        let http = reqwest::blocking::Client::new();
-        let client = OpenAiClient::new(
-            http.clone(),
-            "http://x/v1",
-            "k".into(),
-            "m".into(),
-            None,
-            None,
-            Some(Arc::clone(&meter)),
-        );
-        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
+        let million = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 };
+        let metered = Metered::new(Arc::new(Counted(Some(million))), Arc::clone(&meter), 2, "m".into());
+        metered.chat(&[], &json!([]), None).unwrap();
         assert_eq!(meter.spent(), 18.0);
-        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 0 }));
-        assert_eq!(meter.spent(), 21.0);
-        let other =
-            OpenAiClient::new(http, "http://x/v1", "k".into(), "unpriced".into(), None, None, Some(Arc::clone(&meter)));
-        other.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
-        assert_eq!(meter.spent(), 21.0, "a model the table does not name counts $0");
+        assert_eq!(meter.agents(), [(2, crate::bounds::Spend { input: 1_000_000, output: 1_000_000, cost: 18.0 })]);
+        let unpriced = Metered::new(Arc::new(Counted(Some(million))), Arc::clone(&meter), 3, "unpriced".into());
+        unpriced.chat(&[], &json!([]), None).unwrap();
+        assert_eq!(meter.spent(), 18.0, "a model the table does not name counts $0");
+        assert_eq!(meter.tokens(), 4_000_000, "its tokens are counted all the same");
+    }
+
+    #[test]
+    fn a_call_that_reported_no_counts_is_counted_as_unbilled() {
+        let meter = Arc::new(crate::bounds::Bounds::new(None, Some(1.0), HashMap::new()));
+        let metered = Metered::new(Arc::new(Counted(None)), Arc::clone(&meter), 1, "m".into());
+        metered.chat(&[], &json!([]), None).unwrap();
+        assert_eq!(meter.unbilled(), 1);
+        assert_eq!(meter.spent(), 0.0);
     }
 }
