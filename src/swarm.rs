@@ -17,8 +17,6 @@ use crate::tools;
 use crate::url;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
@@ -838,7 +836,7 @@ impl Swarm {
             control.set_policy(supervisor.policy.clone());
             (
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 tree.models.get(supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
@@ -1009,7 +1007,7 @@ impl Swarm {
                 dir,
                 tree.config.home.clone(),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 llm,
                 tree.sender.clone(),
@@ -1109,7 +1107,7 @@ impl Swarm {
                 effective,
                 tree.config.max_depth.saturating_sub(depth),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 control,
                 tree.sender.clone(),
                 pipeline,
@@ -1423,7 +1421,7 @@ impl Swarm {
             let lines: Vec<String> = mine
                 .iter()
                 .map(|agent| {
-                    let path = self.log_dir.join(format!("agent-{}.log", agent.id));
+                    let path = self.log_dir.join(format!("agent-{}.jsonl", agent.id));
                     match std::fs::metadata(&path) {
                         Ok(meta) => format!("agent {} {} ({} bytes)", agent.label(), path.display(), meta.len()),
                         Err(_) => format!("agent {} {} (no log)", agent.label(), path.display()),
@@ -1437,7 +1435,7 @@ impl Swarm {
         if !self.visible(caller, id) {
             return Err(format!("agent {} is not under your command", agent.label()));
         }
-        let path = self.log_dir.join(format!("agent-{id}.log"));
+        let path = self.log_dir.join(format!("agent-{id}.jsonl"));
         let label = format!("history://{id}");
         match tools::read_limited_bounded(&path, &label, false) {
             Ok((Ok(text), cut)) => Ok(tools::with_note(records::render(&text), cut)),
