@@ -108,11 +108,16 @@ fn plain_event(agents: &mut Vec<AgentView>, event: UiEvent) {
             err(&format!("[{}] {}", label(agents, id), describe(&progress)));
         }
         // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
+        // An approval prompt never reaches this mode: the gate refuses gated calls when no terminal
+        // can answer, so these three are dropped rather than shown.
         UiEvent::AgentDelta { .. }
         | UiEvent::AgentThought { .. }
         | UiEvent::Boundary { .. }
         | UiEvent::Instruction { .. }
-        | UiEvent::Busy(_) => {}
+        | UiEvent::Busy(_)
+        | UiEvent::Approvals(_)
+        | UiEvent::ApprovalRequest { .. }
+        | UiEvent::ApprovalWithdrawn { .. } => {}
         UiEvent::Agents(roster) => *agents = roster,
         UiEvent::Answer(_) | UiEvent::Done => unreachable!("handled by run"),
     }
@@ -152,11 +157,15 @@ fn json_event(
             return None;
         }
         // Line mode writes whole lines: what streams, and where the screen breaks it, is the screen's.
+        // Approval prompts never reach this mode; see `plain_event`.
         UiEvent::AgentDelta { .. }
         | UiEvent::AgentThought { .. }
         | UiEvent::Boundary { .. }
         | UiEvent::Instruction { .. }
-        | UiEvent::Busy(_) => {
+        | UiEvent::Busy(_)
+        | UiEvent::Approvals(_)
+        | UiEvent::ApprovalRequest { .. }
+        | UiEvent::ApprovalWithdrawn { .. } => {
             return None;
         }
     })

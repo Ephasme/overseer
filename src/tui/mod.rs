@@ -135,6 +135,31 @@ fn event_loop(
 }
 
 fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key: KeyEvent) -> Result<()> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // Quitting owns these two keys whatever is open in front of them: a prompt an agent blocks
+    // on must never trap the user in the app.
+    match key.code {
+        KeyCode::Char('c') if ctrl => {
+            quit(app, input);
+            return Ok(());
+        }
+        KeyCode::Char('d') if ctrl => {
+            let _ = input.send(Event::Eof);
+            app.drain();
+            return Ok(());
+        }
+        _ => {}
+    }
+    // An approval prompt wins even over the rename prompt: the agent blocks on it, and the rename
+    // stays untouched, so answering the last prompt falls back into the rename next frame.
+    if app.approvals_open() {
+        if let Some(event) = app.approval_key(key) {
+            let _ = input.send(event);
+        }
+        return Ok(());
+    }
     // The rename prompt takes every key while it is open: no binding of the main screen applies.
     if app.renaming() {
         if let Some(event) = app.rename_key(key) {
@@ -142,17 +167,13 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         }
         return Ok(());
     }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Char('c') if ctrl => quit(app, input),
-        KeyCode::Char('d') if ctrl => {
-            let _ = input.send(Event::Eof);
-            app.drain();
-        }
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
         KeyCode::F(5) => mouse(app)?,
+        // The tier is session-wide, so F8 works from a worker's view too.
+        KeyCode::F(8) => {
+            let _ = input.send(Event::CycleTier);
+        }
         // The verbosity flag is global, like the mouse: both keys work from a worker's view too.
         KeyCode::Char('0' | 'o') if ctrl => app.toggle_tool_output(),
         // A menu in front of the caret takes esc first; a worker's view takes it next, stopping a
@@ -433,5 +454,110 @@ mod tests {
         assert!(!app.completing(), "esc closes the popup");
         assert!(!app.quit, "esc with the popup open never quits");
         assert_eq!(app.take_prompt(), "/s", "what was typed stays where it was");
+    }
+
+    /// An approval prompt takes y, a and n and nothing else: the answers it sends carry the
+    /// request and the choice, any other key is swallowed, and the prompt stays open for it.
+    #[test]
+    fn an_approval_prompt_takes_y_a_and_n_and_nothing_else() {
+        fn keyed(app: &mut App, code: KeyCode) -> Option<crate::swarm::Event> {
+            let (input, queue) = mpsc::channel();
+            let (pasted, _reads) = mpsc::channel();
+            let _ = handle_key(app, &input, &pasted, KeyEvent::new(code, KeyModifiers::NONE));
+            queue.try_recv().ok()
+        }
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 7, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(
+            keyed(&mut app, KeyCode::Char('y')),
+            Some(crate::swarm::Event::Resolve { request: 7, choice: crate::approvals::Choice::Once })
+        );
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 8, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(
+            keyed(&mut app, KeyCode::Char('a')),
+            Some(crate::swarm::Event::Resolve { request: 8, choice: crate::approvals::Choice::Always })
+        );
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 9, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(
+            keyed(&mut app, KeyCode::Char('n')),
+            Some(crate::swarm::Event::Resolve { request: 9, choice: crate::approvals::Choice::Deny })
+        );
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 10, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(keyed(&mut app, KeyCode::Char('x')), None, "an unrelated key sends nothing");
+        assert!(app.approvals_open(), "the prompt is still there for the next key");
+        assert_eq!(app.take_prompt(), "", "nothing was typed into the composer either");
+        assert_eq!(
+            keyed(&mut app, KeyCode::Char('y')),
+            Some(crate::swarm::Event::Resolve { request: 10, choice: crate::approvals::Choice::Once })
+        );
+        assert!(!app.approvals_open());
+    }
+
+    /// A control chord answers nothing: ctrl+a must not become a session-wide allow, and ctrl+n
+    /// stays the composer's recall-next. Shift still answers, since a terminal sends `Y` that way.
+    #[test]
+    fn an_approval_prompt_ignores_control_chords_and_accepts_shifted_letters() {
+        fn keyed_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
+            let (input, queue) = mpsc::channel();
+            let (pasted, _reads) = mpsc::channel();
+            let _ = handle_key(app, &input, &pasted, KeyEvent::new(code, modifiers));
+            queue.try_recv().ok()
+        }
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 4, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(keyed_with(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL), None);
+        assert_eq!(keyed_with(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL), None);
+        assert!(app.approvals_open(), "a control chord leaves the prompt alone");
+        assert_eq!(
+            keyed_with(&mut app, KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            Some(Event::Resolve { request: 4, choice: crate::approvals::Choice::Once })
+        );
+    }
+
+    /// A prompt is drawn in a worker view too: its keys are taken there, so the call it approves
+    /// must be on screen where the user is looking.
+    #[test]
+    fn an_approval_prompt_is_drawn_inside_a_worker_view() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![working(2)]));
+        press(&mut app, KeyCode::F(4));
+        assert!(app.in_worker_view(), "F4 opens the worker view");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 3, tool: "bash".into(), call: "rm -rf build".into() });
+        let shown = screen(&mut app, 100, 24);
+        assert!(shown.contains("approve") && shown.contains("rm -rf build"), "{shown}");
+    }
+
+    /// A prompt withdrawn by the core stops taking keys: the composer is usable again without
+    /// answering a call nobody waits on.
+    #[test]
+    fn a_withdrawn_prompt_returns_the_keys_to_the_composer() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 5, tool: "bash".into(), call: "ls".into() });
+        assert!(app.approvals_open());
+        app.apply(UiEvent::ApprovalWithdrawn { request: 5 });
+        assert!(!app.approvals_open());
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.take_prompt(), "x", "the composer takes keys again");
+    }
+
+    /// The quit keys still reach the app while an approval prompt is open: ctrl+c quits now,
+    /// ctrl+d starts the drain, and neither answers the prompt.
+    #[test]
+    fn ctrl_c_and_ctrl_d_still_work_through_an_open_prompt() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 1, tool: "bash".into(), call: "ls".into() });
+        let (input, queue) = mpsc::channel();
+        let (pasted, _reads) = mpsc::channel();
+        let _ = handle_key(&mut app, &input, &pasted, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit, "ctrl+c quits whatever is open");
+        assert_eq!(queue.try_recv().ok(), Some(Event::Exit));
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 2, tool: "bash".into(), call: "ls".into() });
+        let (input, queue) = mpsc::channel();
+        let (pasted, _reads) = mpsc::channel();
+        let _ = handle_key(&mut app, &input, &pasted, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!app.quit, "ctrl+d drains, it does not quit");
+        assert_eq!(queue.try_recv().ok(), Some(Event::Eof));
+        assert!(app.approvals_open(), "neither quit key answered the prompt");
     }
 }

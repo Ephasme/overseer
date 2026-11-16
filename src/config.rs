@@ -1,3 +1,4 @@
+use crate::approvals;
 use crate::bounds;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -8,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +21,8 @@ struct RawConfig {
     theme: Option<String>,
     max_depth: Option<usize>,
     dir: Option<String>,
+    /// Omitted means `ask`.
+    approvals: Option<String>,
     /// Omitted means `ask`: whether a project `.mcp.json` may start servers.
     mcp_project: Option<String>,
     /// Whole seconds of wall clock for the session.
@@ -54,6 +57,8 @@ pub(crate) struct Config {
     pub(crate) rule_dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+    /// The tool-call approval tier, from `approvals`.
+    pub(crate) approvals: approvals::Tier,
     /// Whether a project `.mcp.json` may start servers: `off`, `ask` (default) or `on`.
     pub(crate) mcp_project: McpProject,
     /// Whole seconds of wall clock for the session; `None` runs unbounded.
@@ -141,6 +146,7 @@ pub(crate) const SETTINGS: &[&str] = &[
     "base_url",
     "model",
     "theme",
+    "approvals",
     "max_depth",
     "max_time",
     "max_cost",
@@ -157,6 +163,7 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "base_url" => redact(&cfg.base_url),
         "model" => cfg.model.clone(),
         "theme" => cfg.theme.name().to_string(),
+        "approvals" => cfg.approvals.name().to_string(),
         "mcp_project" => cfg.mcp_project.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
         "max_time" => cfg.max_time.map_or_else(|| "unset".to_string(), |time| time.as_secs().to_string()),
@@ -271,6 +278,10 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots.push(canonical);
     }
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
+    let approvals = raw
+        .approvals
+        .as_deref()
+        .map_or(Ok(approvals::Tier::Ask), |text| approvals::Tier::parse(text).map_err(anyhow::Error::msg))?;
     // The root works in the user's home, not in the world-writable directory a child falls back to.
     let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
     // `ask` is the gate: a cloned repository must not start commands without the user's say.
@@ -293,6 +304,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots,
         base_url: raw.base_url,
         model: raw.model,
+        approvals,
         theme,
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,

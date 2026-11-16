@@ -1,4 +1,5 @@
 mod agent;
+mod approvals;
 mod artifacts;
 mod bounds;
 mod clipboard;
@@ -164,6 +165,8 @@ fn main() -> Result<()> {
     let stop = input_tx.clone();
     let quit = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::clone(&quit);
+    let interactive = tui_available(&args);
+    let gate = Arc::new(approvals::Gate::new(cfg.approvals, interactive));
     let model = profiles
         .get(profiles::SUPERVISOR)
         .and_then(|profile| profile.model.clone())
@@ -181,17 +184,15 @@ fn main() -> Result<()> {
             input_rx,
             ui_tx,
             mcp,
+            gate,
             shutdown,
             bounds,
             resume,
         )
     });
 
-    let frontend = if tui_available(&args) {
-        tui::run(ui_rx, input_tx, &model, theme)
-    } else {
-        plain::run(ui_rx, input_tx, &args)
-    };
+    let frontend =
+        if interactive { tui::run(ui_rx, input_tx, &model, theme) } else { plain::run(ui_rx, input_tx, &args) };
     // A frontend that returned early leaves the core waiting for an event nobody will send.
     quit.store(true, Ordering::Relaxed);
     let _ = stop.send(swarm::Event::Exit);
