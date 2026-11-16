@@ -64,6 +64,8 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 
 With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/agent-<id>.log`; `tail -f` one to watch it.
 
+Headless: `overseer -p "prompt"` runs one turn — the answer to stdout, everything else on stderr, exit 1 when the root never answered — and `overseer --mode json` writes every event as one compact JSON line on stdout instead, so a consumer filters by `type` (`jq -r 'select(.type=="answer") | .text'`). The two combine; `--mode text` changes nothing. JSON event types: `answer` (the root's final answer), `notice`, `error`, `debug` (each with `text`), `agent` (`id`, `name`, `kind` = says/finished/failed/interrupted, `text`), `out` (`id`, `name`, `text`), and `tool` (`id`, `call`, `phase` = start/done; on `done` also `name`, `secs`, `status`, `head`, `more`, `failed`). Usage errors exit 2.
+
 ## Release
 
 1. Bump `version` in `Cargo.toml` and merge it.
