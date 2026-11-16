@@ -24,7 +24,7 @@ theme = "auto"                        # auto | dark | light | mono; omitted mean
 approvals = "ask"                     # ask | cached-ask | write | yolo; omitted means ask
 ```
 
-The first three keys are required; `theme` and `approvals` are optional. `approvals` gates `bash`, `write_file` and `edit` in the TUI: `ask` prompts on every gated call, `cached-ask` prompts the first time each distinct call appears and replays the answer for the rest of the session, `write` lets the two file tools through and applies cached-ask to bash, and `yolo` never prompts. Line mode has no terminal to answer in, so there a gated call is refused unless the tier is `yolo`. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
+The first three keys are required; `theme` and `approvals` are optional. `approvals` gates `bash`, `write_file` and `edit` in the TUI: `ask` prompts on every gated call, `cached-ask` prompts the first time each distinct call appears and replays the answer for the rest of the session, `write` lets the two file tools through and applies cached-ask to bash, and `yolo` never prompts. At a prompt, `y` allows that call once, `n` refuses it and `esc` refuses too; `a` allows the call for the rest of the session whatever the tier, so a repeated call stops asking. Line mode has no terminal to answer in, so there a gated call is refused unless the tier is `yolo`. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
 
 ```sh
 OVERSEER_API_KEY=...
@@ -53,7 +53,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+o / ctrl+0|expand every tool card, or collapse it back: a shell command always shows whole, and every other card starts as one row and expands to the whole body plus what the call returned|
 |F4|open the picked agent's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
-|F8|cycle the approval tier (ask → cached-ask → write → yolo); the tier shows in the status line, and a pending prompt answers with `y` allow once, `a` always allow, `n` deny|
+|F8|cycle the approval tier (ask → cached-ask → write → yolo); the tier shows in the status line, and a pending prompt answers with `y` allow once, `a` always allow, `n` deny, `esc` deny|
 |click an agent row|open that agent's view; click its `esc back to fleet` line to come back|
 |drag the rule left of the panel|resize the agent panel: the transcript keeps at least 40 columns, the panel never drops below 20, and the width it is left at opens the next run|
 |↑ / ↓|inside an agent view: the previous or next agent|

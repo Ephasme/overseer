@@ -532,15 +532,7 @@ impl SwarmHost {
 
     /// The approval gate for this host's gated calls, keyed like an agent's.
     fn gate(&self, tool: &str, arguments: &str) -> Result<(), String> {
-        let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-        let display = swarm::describe(tool, arguments);
-        let key = if tool == tools::BASH {
-            let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or_default();
-            command.trim().to_string()
-        } else {
-            let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
-            path.to_string()
-        };
+        let (key, display) = swarm::gate_key(tool, arguments);
         self.approvals.admit(self.id, tool, &key, &display, Some(self.run_flag.as_ref()), &self.sender)
     }
 

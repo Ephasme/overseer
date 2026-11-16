@@ -83,7 +83,10 @@ const WORKER_HINTS: [&str; 4] = ["F4 toggle", "ctrl+o expand", "F5 mouse", "ctrl
 const RENAME_HINTS: [&str; 2] = ["enter accept", "esc cancel"];
 
 /// The same line while an approval prompt is open: it takes every key but the quit ones.
-const APPROVAL_HINTS: [&str; 3] = ["y allow once", "a always allow", "n deny"];
+const APPROVAL_HINTS: [&str; 4] = ["y allow once", "a always allow", "n deny", "esc deny"];
+
+/// The rows an approval prompt takes over the composer slot, in a worker view as well as the fleet.
+const PROMPT_ROWS: u16 = 3;
 
 /// The composer's frame: one bar down the left, closed by a half block.
 const PROMPT_FRAME: border::Set = border::Set {
@@ -1399,6 +1402,7 @@ impl App {
                 self.approvals.push(ApprovalPrompt { agent, request, tool, call });
             }
             UiEvent::Approvals(tier) => self.tier = tier,
+            UiEvent::ApprovalWithdrawn { request } => self.approvals.retain(|prompt| prompt.request != request),
         }
     }
 
@@ -1574,9 +1578,12 @@ impl App {
         Paragraph::new(line).block(block)
     }
 
-    /// The approval prompt, drawn where the composer sits with the rename's frame.
-    fn approval_widget(&self, prompt: &ApprovalPrompt) -> Paragraph<'static> {
-        let width = usize::from(self.body_area.width.max(20)).saturating_sub(8).max(10);
+    /// The approval prompt, drawn with the rename's frame wherever the user is looking.
+    ///
+    /// The whole call is shown, newlines flattened: approving a multi-line command from its first
+    /// line alone would be approving something the user never read.
+    fn approval_widget(&self, prompt: &ApprovalPrompt, width: u16) -> Paragraph<'static> {
+        let width = usize::from(width.max(24)).saturating_sub(8);
         let block = Block::new()
             .borders(Borders::LEFT | Borders::BOTTOM)
             .border_set(PROMPT_FRAME)
@@ -1585,14 +1592,11 @@ impl App {
             .style(Style::new().bg(theme::you_fill()));
         let line = Line::from(vec![
             Span::styled(
-                format!("approve agent {} · {} › ", prompt.agent, prompt.tool),
+                format!("approve {} · {} › ", self.label(prompt.agent), prompt.tool),
                 Style::new().fg(theme::warning()),
             ),
-            Span::styled(
-                truncate(prompt.call.lines().next().unwrap_or_default(), width),
-                Style::new().fg(theme::warning()),
-            ),
-            Span::styled("  (y/a/n)", Style::new().fg(theme::warning())),
+            Span::styled(truncate(&prompt.call.replace('\n', " ↵ "), width), Style::new().fg(theme::warning())),
+            Span::styled("  (y/a/n, esc deny)", Style::new().fg(theme::warning())),
         ]);
         Paragraph::new(line).block(block)
     }
@@ -1603,13 +1607,18 @@ impl App {
     }
 
     /// One key while an approval prompt is open. The event it returns is the one the frontend sends.
+    ///
+    /// A control or alt chord answers nothing: `ctrl+n` is the composer's recall-next, and `ctrl+a`
+    /// must not become a session-wide allow by accident.
     pub(super) fn approval_key(&mut self, key: KeyEvent) -> Option<Event> {
         self.dirty = true;
         let request = self.approvals.first()?.request;
+        let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let choice = match key.code {
-            KeyCode::Char('y') => Some(approvals::Choice::Once),
-            KeyCode::Char('a') => Some(approvals::Choice::Always),
-            KeyCode::Char('n') | KeyCode::Esc => Some(approvals::Choice::Deny),
+            KeyCode::Char('y' | 'Y') if plain => Some(approvals::Choice::Once),
+            KeyCode::Char('a' | 'A') if plain => Some(approvals::Choice::Always),
+            KeyCode::Char('n' | 'N') if plain => Some(approvals::Choice::Deny),
+            KeyCode::Esc => Some(approvals::Choice::Deny),
             _ => None,
         };
         choice.map(|choice| {
@@ -1786,7 +1795,9 @@ impl App {
         let view = self.in_worker_view();
         let attached = u16::from(self.attachment.is_some() && !view);
         let rows = if view {
-            0
+            // An approval prompt is drawn over the composer slot in a worker view too: its keys
+            // are taken there, so it must be visible there.
+            if self.approvals.is_empty() { 0 } else { PROMPT_ROWS }
         } else {
             let rows = self.composer.measure(area.width).preferred_rows;
             rows.clamp(3, area.height.saturating_sub(4 + attached).max(3))
@@ -1800,6 +1811,10 @@ impl App {
         .areas(area);
         if view {
             self.render_worker_view(frame, body);
+            if let Some(first) = self.approvals.first() {
+                let prompt = self.approval_widget(first, input.width);
+                frame.render_widget(prompt, input);
+            }
         } else {
             self.body_area = body;
             let transcript = if let Some(width) = self.panel_width(body.width) {
@@ -1816,7 +1831,7 @@ impl App {
             self.render_transcript(frame, transcript);
             self.render_attachment(frame, chip);
             if let Some(first) = self.approvals.first() {
-                let prompt = self.approval_widget(first);
+                let prompt = self.approval_widget(first, input.width);
                 frame.render_widget(prompt, input);
             } else if self.rename.is_some() {
                 let prompt = self.rename_widget();

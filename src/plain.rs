@@ -42,7 +42,8 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
             | UiEvent::Instruction { .. }
             | UiEvent::Busy(_)
             | UiEvent::Approvals(_)
-            | UiEvent::ApprovalRequest { .. } => {}
+            | UiEvent::ApprovalRequest { .. }
+            | UiEvent::ApprovalWithdrawn { .. } => {}
             UiEvent::Agents(roster) => agents = roster,
             UiEvent::Done => break,
         }

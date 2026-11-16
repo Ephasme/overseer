@@ -83,7 +83,8 @@ pub(crate) fn describe(cfg: &Config) -> String {
 }
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
-pub(crate) const SETTINGS: &[&str] = &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir"];
+pub(crate) const SETTINGS: &[&str] =
+    &["roots", "base_url", "model", "theme", "approvals", "max_depth", "dir", "home", "state_dir"];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -92,6 +93,7 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "base_url" => redact(&cfg.base_url),
         "model" => cfg.model.clone(),
         "theme" => cfg.theme.name().to_string(),
+        "approvals" => cfg.approvals.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
         "dir" => cfg.dir.display().to_string(),
         "home" => cfg.home.display().to_string(),

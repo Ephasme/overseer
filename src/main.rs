@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     let quit = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::clone(&quit);
     let interactive = tui_available();
-    let approvals = Arc::new(approvals::Gate::new(cfg.approvals, interactive));
+    let gate = Arc::new(approvals::Gate::new(cfg.approvals, interactive));
     let model = profiles
         .get(profiles::SUPERVISOR)
         .and_then(|profile| profile.model.clone())
@@ -77,19 +77,7 @@ fn main() -> Result<()> {
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
     let core = thread::spawn(move || {
-        session::run(
-            models,
-            profiles,
-            pipelines,
-            &cfg,
-            log_dir,
-            session_input,
-            input_rx,
-            ui_tx,
-            mcp,
-            approvals,
-            shutdown,
-        )
+        session::run(models, profiles, pipelines, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, gate, shutdown)
     });
 
     let frontend = if interactive {

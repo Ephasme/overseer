@@ -169,6 +169,10 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
     match key.code {
         // The mouse belongs to the terminal, not to a view: F5 works from a worker's view too.
         KeyCode::F(5) => mouse(app)?,
+        // The tier is session-wide, so F8 works from a worker's view too.
+        KeyCode::F(8) => {
+            let _ = input.send(Event::CycleTier);
+        }
         // The verbosity flag is global, like the mouse: both keys work from a worker's view too.
         KeyCode::Char('0' | 'o') if ctrl => app.toggle_tool_output(),
         // A menu in front of the caret takes esc first; a worker's view takes it next, stopping a
@@ -212,9 +216,6 @@ fn handle_key(app: &mut App, input: &Sender<Event>, pasted: &Sender<Copied>, key
         KeyCode::End => app.scroll_bottom(),
         KeyCode::F(2) => app.toggle_workers(),
         KeyCode::F(4) => app.toggle_worker_view(),
-        KeyCode::F(8) => {
-            let _ = input.send(Event::CycleTier);
-        }
         _ => app.input(key),
     }
     Ok(())
@@ -489,6 +490,53 @@ mod tests {
             Some(crate::swarm::Event::Approve { request: 10, choice: crate::approvals::Choice::Once })
         );
         assert!(!app.approvals_open());
+    }
+
+    /// A control chord answers nothing: ctrl+a must not become a session-wide allow, and ctrl+n
+    /// stays the composer's recall-next. Shift still answers, since a terminal sends `Y` that way.
+    #[test]
+    fn an_approval_prompt_ignores_control_chords_and_accepts_shifted_letters() {
+        fn keyed_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
+            let (input, queue) = mpsc::channel();
+            let (pasted, _reads) = mpsc::channel();
+            let _ = handle_key(app, &input, &pasted, KeyEvent::new(code, modifiers));
+            queue.try_recv().ok()
+        }
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 4, tool: "bash".into(), call: "ls".into() });
+        assert_eq!(keyed_with(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL), None);
+        assert_eq!(keyed_with(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL), None);
+        assert!(app.approvals_open(), "a control chord leaves the prompt alone");
+        assert_eq!(
+            keyed_with(&mut app, KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            Some(Event::Approve { request: 4, choice: crate::approvals::Choice::Once })
+        );
+    }
+
+    /// A prompt is drawn in a worker view too: its keys are taken there, so the call it approves
+    /// must be on screen where the user is looking.
+    #[test]
+    fn an_approval_prompt_is_drawn_inside_a_worker_view() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::Agents(vec![working(2)]));
+        press(&mut app, KeyCode::F(4));
+        assert!(app.in_worker_view(), "F4 opens the worker view");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 3, tool: "bash".into(), call: "rm -rf build".into() });
+        let shown = screen(&mut app, 100, 24);
+        assert!(shown.contains("approve") && shown.contains("rm -rf build"), "{shown}");
+    }
+
+    /// A prompt withdrawn by the core stops taking keys: the composer is usable again without
+    /// answering a call nobody waits on.
+    #[test]
+    fn a_withdrawn_prompt_returns_the_keys_to_the_composer() {
+        let mut app = App::new("m");
+        app.apply(UiEvent::ApprovalRequest { agent: 2, request: 5, tool: "bash".into(), call: "ls".into() });
+        assert!(app.approvals_open());
+        app.apply(UiEvent::ApprovalWithdrawn { request: 5 });
+        assert!(!app.approvals_open());
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.take_prompt(), "x", "the composer takes keys again");
     }
 
     /// The quit keys still reach the app while an approval prompt is open: ctrl+c quits now,

@@ -29,6 +29,8 @@ pub(crate) enum UiEvent {
     ApprovalRequest { agent: usize, request: u64, tool: String, call: String },
     /// The current approval tier, sent at startup and after each cycle.
     Approvals(crate::approvals::Tier),
+    /// A prompt that ended unanswered, so it must leave the screen.
+    ApprovalWithdrawn { request: u64 },
     /// The tree after a change.
     Agents(Vec<AgentView>),
     /// An agent turn started or finished.

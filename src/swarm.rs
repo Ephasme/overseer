@@ -356,6 +356,11 @@ pub(crate) enum Event {
         request: u64,
         choice: approvals::Choice,
     },
+    /// The prompt is gone: nobody waits on that request any more, so the frontend must stop
+    /// showing it.
+    ApprovalWithdrawn {
+        request: u64,
+    },
     /// The user cycled the approval tier.
     CycleTier,
 }
@@ -512,6 +517,18 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         return line;
     }
     tools::shorten(&line, PROGRESS_WIDTH)
+}
+
+/// The cache key and the transcript line for a gated call, one place for both gate paths.
+///
+/// The key is the raw argument, never `describe`'s output: `describe` shortens a path to the
+/// progress width, so two distinct long paths would otherwise share one cached answer.
+pub(crate) fn gate_key(name: &str, arguments: &str) -> (String, String) {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let field = if name == tools::BASH { "command" } else { "path" };
+    let raw = args.get(field).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let key = if name == tools::BASH { raw.trim().to_string() } else { raw.to_string() };
+    (key, describe(name, arguments))
 }
 
 /// One agent in the tree. Ids are never reused, so a stale order can never reach a new agent.
@@ -1840,28 +1857,18 @@ impl AgentRun<'_> {
             let gated = matches!(call.function.name.as_str(), tools::BASH | tools::WRITE_FILE | tools::EDIT);
             let mut denied: Option<String> = None;
             if gated && policy.refuse(&call.function.name, &call.function.arguments).is_none() {
-                let gate = match self.gate() {
-                    Ok(gate) => gate,
-                    // No session means no turn left to report to: nothing will read the output.
-                    Err(reason) => return format!("error: {reason}"),
-                };
-                let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
-                let (key, display) = if call.function.name == tools::BASH {
-                    let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or_default();
-                    // The key is the raw command, newlines kept: two commands that differ only
-                    // after the first line are two approvals.
-                    (command.trim().to_string(), describe(&call.function.name, &call.function.arguments))
-                } else {
-                    // The key is the raw path, never `describe`'s shortened form: two distinct
-                    // long paths must not share one cached answer.
-                    let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
-                    (path.to_string(), describe(&call.function.name, &call.function.arguments))
-                };
-                // A denial is the call's output: the card still closes, as failed.
-                denied = gate
-                    .admit(self.id, &call.function.name, &key, &display, Some(control.flag()), self.sender)
-                    .err()
-                    .map(|reason| format!("error: {reason}"));
+                // A dead session has no gate to ask: the call fails, and still closes its card.
+                match self.gate() {
+                    Ok(gate) => {
+                        let (key, display) = gate_key(&call.function.name, &call.function.arguments);
+                        // A denial is the call's output: the card still closes, as failed.
+                        denied = gate
+                            .admit(self.id, &call.function.name, &key, &display, Some(control.flag()), self.sender)
+                            .err()
+                            .map(|reason| format!("error: {reason}"));
+                    }
+                    Err(reason) => denied = Some(format!("error: {reason}")),
+                }
             }
             match denied {
                 Some(output) => output,
@@ -3283,6 +3290,8 @@ mod tests {
         assert_eq!(gate_call, "sleep 30", "the worker, not the root, asked");
         let stopped = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"}));
         assert!(stopped.contains("stopped"), "{stopped}");
+        // The prompt leaves the screen first: nobody waits on that request any more.
+        assert_eq!(next_event(&h.queue), Event::ApprovalWithdrawn { request });
         assert_eq!(
             next_agent_event(&h.queue),
             Event::Agent { id: 2, kind: AgentEvent::Interrupted, text: "your owner cut this turn short".into() }

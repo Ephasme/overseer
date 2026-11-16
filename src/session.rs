@@ -181,6 +181,9 @@ pub(crate) fn run(
             Event::Approve { request, choice } => {
                 approvals.answer(request, choice);
             }
+            Event::ApprovalWithdrawn { request } => {
+                let _ = ui.send(UiEvent::ApprovalWithdrawn { request });
+            }
             Event::CycleTier => {
                 let tier = approvals.cycle();
                 let _ = ui.send(UiEvent::Approvals(tier));
