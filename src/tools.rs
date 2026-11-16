@@ -1327,6 +1327,7 @@ mod tests {
             max_depth: 3,
             dir: dir.to_path_buf(),
             home: dir.to_path_buf(),
+            mcp_project: config::McpProject::On,
         }
     }
 
