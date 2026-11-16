@@ -588,7 +588,6 @@ mod tests {
         assert!(calls[0].1.contains("\"path\":\"a.txt\"") || calls[0].1.contains("\"path\": \"a.txt\""), "{calls:?}");
     }
 
-
     #[test]
     fn an_oversized_result_is_truncated_with_a_note() {
         let working = dir();
