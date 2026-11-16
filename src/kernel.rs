@@ -652,8 +652,17 @@ mod tests {
         assert_eq!(out, "2");
     }
 
+    /// The Bun tests need the runtime; CI runners and some machines lack it, and the missing
+    /// runtime path is covered separately by `a_runtime_the_machine_lacks_is_refused_before_any_pipe`.
+    fn bun_available() -> bool {
+        Command::new("bun").arg("--version").output().is_ok()
+    }
+
     #[test]
     fn bun_state_survives_between_calls() {
+        if !bun_available() {
+            return;
+        }
         let working = dir();
         call(&working, Runtime::Bun, "state.y = 41", BASH_TIMEOUT, None, no_tool!()).unwrap();
         let out = call(&working, Runtime::Bun, "console.log(state.y + 1)", BASH_TIMEOUT, None, no_tool!()).unwrap();
@@ -696,6 +705,9 @@ mod tests {
 
     #[test]
     fn a_bun_tool_call_is_awaited_and_answered() {
+        if !bun_available() {
+            return;
+        }
         let working = dir();
         let seen = &mut |_: &str, _: &str| -> Result<String, String> { Ok("file body".to_string()) };
         let out =
