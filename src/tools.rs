@@ -132,6 +132,7 @@ const WRAPPERS: &[&str] = &["env", "command", "exec", "nohup", "nice", "time", "
 /// A guard, not a sandbox: a `bash` command is matched word by word, so the lists are only as good
 /// as they are tight. Workers already run unsandboxed, with the user's own rights.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct Policy {
     /// Tools this agent may call. An exact tool name, or `mcp__<server>` for that server's tools.
     /// Empty grants nothing. A profile that declares no list at all is refused at spawn.

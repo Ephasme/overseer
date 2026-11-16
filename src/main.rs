@@ -47,6 +47,15 @@ enum Mode {
     Resume(Option<String>),
 }
 
+/// What the run starts from. Cancelled is a clean exit, not a failure: a picker the user backed out
+/// of must not look like an error in a `&&` chain or a launcher.
+#[derive(Debug)]
+enum Start {
+    Fresh,
+    Resume(ResumeSource),
+    Cancelled,
+}
+
 fn parse(argv: &[String]) -> Result<Mode> {
     let mut mode = Mode::Fresh;
     let mut rest = argv.iter().peekable();
@@ -54,7 +63,9 @@ fn parse(argv: &[String]) -> Result<Mode> {
         match arg.as_str() {
             "-c" | "--continue" => mode = Mode::Continue,
             "-r" | "--resume" => {
-                let id = rest.next().cloned();
+                // Only a token that is not a flag can be an id: `-r -c` asks for the picker, then
+                // reads `-c` as its own flag.
+                let id = rest.next_if(|next| !next.starts_with('-')).cloned();
                 mode = Mode::Resume(id);
             }
             other => anyhow::bail!("unknown argument: {other}\nusage: overseer [-c | -r [session-id]]"),
@@ -63,36 +74,36 @@ fn parse(argv: &[String]) -> Result<Mode> {
     Ok(mode)
 }
 
-/// Resolves the session a `-c` / `-r` asks for, before anything new is created.
-fn resume_source(home: &std::path::Path, mode: &Mode) -> Result<Option<ResumeSource>> {
-    let state = config::state_dir(home);
+/// A session id is one directory name under `state/sessions`: no separators, no relative component.
+fn session_dir(state: &std::path::Path, id: &str) -> Result<std::path::PathBuf, anyhow::Error> {
+    let invalid = id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\');
+    if invalid {
+        anyhow::bail!("not a session id: {id:?}");
+    }
+    let dir = state.join("sessions").join(id);
+    if !session_store::resumable(&dir) {
+        anyhow::bail!("no such session: {id}");
+    }
+    Ok(dir)
+}
+
+/// Resolves the session a `-c` / `-r` asks for, before anything new is created. `state` is already
+/// resolved so a test can point it at a temp dir.
+fn resume_source(state: &std::path::Path, mode: &Mode) -> Result<Start> {
     match mode {
-        Mode::Fresh => Ok(None),
-        Mode::Continue => {
-            let newest = session_store::sessions(&state).into_iter().next();
-            match newest {
-                Some(info) => Ok(Some(ResumeSource { id: info.id, dir: info.dir })),
-                None => anyhow::bail!("no previous session"),
-            }
-        }
-        Mode::Resume(Some(id)) => {
-            let dir = state.join("sessions").join(id);
-            if !dir.join("session.jsonl").is_file() {
-                anyhow::bail!("no such session: {id}");
-            }
-            Ok(Some(ResumeSource { id: id.clone(), dir }))
-        }
+        Mode::Fresh => Ok(Start::Fresh),
+        Mode::Continue => match session_store::newest(state) {
+            Some(info) => Ok(Start::Resume(ResumeSource { id: info.id, dir: info.dir })),
+            None => anyhow::bail!("no previous session"),
+        },
+        Mode::Resume(Some(id)) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, id)? })),
         Mode::Resume(None) => {
             if !tui_available() {
                 anyhow::bail!("-r needs a terminal; pass the session id instead");
             }
-            let picked = tui::picker::run(home)?;
-            match picked {
-                Some(id) => {
-                    let dir = state.join("sessions").join(&id);
-                    Ok(Some(ResumeSource { id, dir }))
-                }
-                None => Err(anyhow::Error::msg("__cancelled__")),
+            match tui::picker::run(state)? {
+                Some(id) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, &id)? })),
+                None => Ok(Start::Cancelled),
             }
         }
     }
@@ -102,17 +113,18 @@ fn main() -> Result<()> {
     let mode = parse(&env::args().skip(1).collect::<Vec<_>>())?;
     let home = config::home()?;
     let cfg = config::load(&home)?;
+    let state = config::state_dir(&cfg.home);
     // Resolved before the new log dir exists, so the picker never sees the session it is about to
     // start. A cancelled picker exits cleanly, before any MCP server or thread came up.
-    let resume = match resume_source(&cfg.home, &mode) {
-        Ok(resume) => resume,
-        Err(e) if e.to_string() == "__cancelled__" => return Ok(()),
-        Err(e) => return Err(e),
+    let resume = match resume_source(&state, &mode)? {
+        Start::Cancelled => return Ok(()),
+        Start::Fresh => None,
+        Start::Resume(source) => Some(source),
     };
     let api_key = secrets::api_key(&home)?;
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     // Two runs started in the same second must not share, and truncate, each other's worker logs.
-    let log_dir = config::state_dir(&cfg.home).join("sessions").join(format!("{started}-{}", std::process::id()));
+    let log_dir = state.join("sessions").join(format!("{started}-{}", std::process::id()));
     fs::create_dir_all(&log_dir).with_context(|| format!("cannot create {}", log_dir.display()))?;
     let (input_tx, input_rx) = mpsc::channel();
     let (ui_tx, ui_rx) = mpsc::channel();
@@ -203,16 +215,65 @@ mod tests {
     }
 
     #[test]
+    fn resume_does_not_swallow_the_next_flag() {
+        // `-r -c` asks for the picker and then continues: an id never starts with a dash.
+        assert_eq!(parse(&args(&["-r", "-c"])).unwrap(), Mode::Continue);
+        assert_eq!(parse(&args(&["-r", "--continue"])).unwrap(), Mode::Continue);
+    }
+
+    #[test]
     fn a_missing_session_is_named() {
-        let home = tempfile::tempdir().unwrap();
-        let err = resume_source(home.path(), &Mode::Resume(Some("nope".into()))).unwrap_err().to_string();
+        let state = tempfile::tempdir().unwrap();
+        let err = resume_source(state.path(), &Mode::Resume(Some("nope".into()))).unwrap_err().to_string();
         assert_eq!(err, "no such session: nope");
     }
 
     #[test]
+    fn an_id_cannot_leave_the_state_dir() {
+        let state = tempfile::tempdir().unwrap();
+        for id in ["../..", "/etc", ".", "..", "", "a/b"] {
+            let err = resume_source(state.path(), &Mode::Resume(Some(id.into()))).unwrap_err().to_string();
+            assert!(err.starts_with("not a session id:"), "{id:?} gave {err}");
+        }
+    }
+
+    #[test]
+    fn a_session_without_agents_is_not_resumable() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("sessions").join("1700000000-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session.jsonl"), "{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}\n").unwrap();
+        let err = resume_source(state.path(), &Mode::Resume(Some("1700000000-1".into()))).unwrap_err().to_string();
+        assert_eq!(err, "no such session: 1700000000-1");
+    }
+
+    #[test]
     fn continue_without_any_session_says_so() {
-        let home = tempfile::tempdir().unwrap();
-        let err = resume_source(home.path(), &Mode::Continue).unwrap_err().to_string();
+        let state = tempfile::tempdir().unwrap();
+        let err = resume_source(state.path(), &Mode::Continue).unwrap_err().to_string();
         assert_eq!(err, "no previous session");
+    }
+
+    #[test]
+    fn continue_takes_the_newest_resumable_session() {
+        let state = tempfile::tempdir().unwrap();
+        let sessions = state.path().join("sessions");
+        for id in ["1700000000-1", "1700000001-2"] {
+            let dir = sessions.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let policy = r#"{"allow_tools":["bash"],"read_only":true,"allow_commands":[],"deny_commands":[],"deny_all_commands":false}"#;
+            fs::write(
+                dir.join("session.jsonl"),
+                format!(
+                    "{{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}}\n{{\"kind\":\"agent\",\"id\":1,\"depth\":0,\"dir\":\"/tmp\",\"task\":\"\",\"profile\":\"supervisor\",\"role\":\"supervisor\",\"policy\":{policy},\"stopped\":false,\"archived\":false,\"pipeline\":false}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        match resume_source(state.path(), &Mode::Continue).unwrap() {
+            Start::Resume(source) => assert_eq!(source.id, "1700000001-2"),
+            other => panic!("continue resolved to {other:?}"),
+        }
+        assert!(matches!(resume_source(state.path(), &Mode::Fresh).unwrap(), Start::Fresh));
     }
 }

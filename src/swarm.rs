@@ -535,7 +535,7 @@ struct Agent {
 
 impl Agent {
     fn finished(&self) -> bool {
-        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     fn label(&self) -> String {
@@ -597,7 +597,7 @@ pub(crate) struct Swarm {
     /// The sequence the next `out://` write gets; never reused, so a stale id fails loudly.
     out_seq: usize,
     /// The append-only session log, when this session is persistent: tree records land here.
-    session_log: Option<Mutex<SessionLog>>,
+    session_log: Option<SessionLog>,
 }
 
 impl Swarm {
@@ -627,15 +627,21 @@ impl Swarm {
             local: HashMap::new(),
             outs: VecDeque::new(),
             out_seq: 0,
-            session_log: session_log.map(Mutex::new),
+            session_log,
         }
     }
 
     /// Records one tree record, best-effort: persistence never takes the session down.
     fn record_tree_record(&mut self, record: &TreeRecord) {
         if let Some(log) = self.session_log.as_mut() {
-            let Ok(file) = log.get_mut() else { return };
-            file.write(record);
+            log.write(record);
+        }
+    }
+
+    /// Records several tree records in one write: `stop` writes one per descendant.
+    fn record_tree_records(&mut self, records: &[TreeRecord]) {
+        if let Some(log) = self.session_log.as_mut() {
+            log.write_many(records);
         }
     }
 
@@ -1282,126 +1288,110 @@ impl Swarm {
     /// been validated by the caller; the new session's header is already in the log.
     pub(crate) fn resume_tree(swarm: &Arc<Mutex<Swarm>>, source: &ResumeSource) -> Result<String, String> {
         let _reserved = spawning();
-        let records = session_store::read_tree(&source.dir)?;
-        let agents: Vec<TreeRecord> =
-            records.into_iter().filter(|record| matches!(record, TreeRecord::Agent { .. })).collect();
-        if agents.is_empty() {
+        let rows = session_store::rows(&source.dir)?;
+        if rows.is_empty() {
             return Err(format!("session {} has no agents to resume", source.id));
         }
-        // Ids index the tree (`id - 1`), so a log whose ids skip one would scramble every lookup.
-        for (index, record) in agents.iter().enumerate() {
-            let TreeRecord::Agent { id, .. } = record else { continue };
-            if *id != index + 1 {
-                return Err(format!("cannot resume session {}: agent {id} is out of order", source.id));
-            }
-        }
+        // Session-invariant, so read once instead of per row: every one of these takes the tree
+        // lock, which every other agent thread waits on.
+        let (home, models, profiles, sender, log_dir) = {
+            let tree = lock(swarm);
+            (
+                tree.config.home.clone(),
+                Arc::clone(&tree.models),
+                Arc::clone(&tree.profiles),
+                tree.sender.clone(),
+                tree.log_dir.clone(),
+            )
+        };
         let mut pipelines = 0;
-        for record in &agents {
-            let TreeRecord::Agent {
-                id,
-                name,
-                parent,
-                depth,
-                dir,
-                task,
-                profile,
-                role,
-                policy,
-                stopped: was_stopped,
-                archived,
-                pipeline,
-            } = record
-            else {
-                continue;
-            };
-            let home = lock(swarm).config.home.clone();
-            let working_dir =
-                config::resolve_dir(dir, &home).map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
-            let history = session_store::load_history(&source.dir.join(format!("agent-{id}.history.json")))
-                .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
-            let control = Arc::new(Control::default());
-            // The policy was fixed at spawn: set it directly, no parent merge.
-            control.set_policy(policy.clone());
-            // The profile decides the model and effort, as at spawn; a profile deleted since then
-            // falls back to the configured default and the agent still runs.
-            let (llm, sender, log_dir) = {
-                let tree = lock(swarm);
-                let found = tree.profiles.get(profile.as_str());
-                let model = found.and_then(|found| found.model.clone());
-                let effort = found.and_then(|found| found.effort().ok()).flatten();
-                (tree.models.get(model.as_deref(), effort), tree.sender.clone(), tree.log_dir.clone())
-            };
+        for row in &rows {
             // A dead row has no thread and no inbox: `stop` dropped both in the original session,
-            // and a pipeline re-running its script would duplicate its side effects.
-            let dead = *was_stopped || *archived || *pipeline;
-            if *pipeline && !*was_stopped && !*archived {
+            // and a pipeline re-running its script would duplicate its side effects. Neither its
+            // working dir nor its history is read, so a deleted checkout cannot block the resume.
+            let dead = row.stopped || row.archived || row.pipeline;
+            if row.pipeline && !row.stopped && !row.archived {
                 pipelines += 1;
             }
-            let log_path = log_dir.join(format!("agent-{id}.log"));
+            let log_path = log_dir.join(format!("agent-{}.log", row.id));
             let history_path = spawn_history_path(&log_path);
-            let (inbox, handle) = if dead {
-                (None, None)
+            let control = Arc::new(Control::default());
+            // The policy was fixed at spawn: set it directly, no parent merge.
+            control.set_policy(row.policy.clone());
+            let (working_dir, inbox, handle) = if dead {
+                (PathBuf::from(&row.dir), None, None)
             } else {
+                let working_dir = config::resolve_dir(&row.dir, &home)
+                    .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+                let history = session_store::load_history(&source.dir.join(format!("agent-{}.history.json", row.id)))
+                    .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+                // The profile decides the model and effort, as at spawn; a profile deleted since
+                // then falls back to the configured default and the agent still runs.
+                let found = profiles.get(row.profile.as_str());
+                let model = found.and_then(|found| found.model.clone());
+                let effort = found.and_then(|found| found.effort().ok()).flatten();
+                let llm = models.get(model.as_deref(), effort);
+                // The new session dir gets the replayed history now, so quitting before the next
+                // turn still leaves a session that resumes with its conversation.
+                let _ = session_store::save_history(&history_path, &history);
                 let (inbox, handle) = spawn_thread(
                     llm,
-                    sender,
-                    *id,
-                    *depth,
-                    *parent,
+                    sender.clone(),
+                    row.id,
+                    row.depth,
+                    row.parent,
                     &working_dir,
                     Arc::clone(&control),
                     None,
-                    profile.clone(),
-                    *role,
+                    row.profile.clone(),
+                    row.role,
                     &log_path,
                     history_path,
                     history,
                     swarm,
                 )
                 .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
-                (Some(inbox), Some(handle))
+                (working_dir, Some(inbox), Some(handle))
             };
             let mut tree = lock(swarm);
             tree.agents.push(Agent {
-                id: *id,
-                name: name.clone(),
-                parent: *parent,
-                depth: *depth,
-                working_dir: working_dir.clone(),
-                initial_task: task.clone(),
-                profile: profile.clone(),
-                role: *role,
-                archived: *archived,
+                id: row.id,
+                name: row.name.clone(),
+                parent: row.parent,
+                depth: row.depth,
+                working_dir,
+                initial_task: row.task.clone(),
+                profile: row.profile.clone(),
+                role: row.role,
+                archived: row.archived,
                 pending: 0,
                 failed: false,
-                stopped: *was_stopped || *pipeline,
+                stopped: row.stopped || row.pipeline,
                 control,
                 inbox,
                 busy_since: None,
                 last_output: String::new(),
                 handle,
             });
-            // Every record goes into the NEW session's log, so a second resume works too.
+            // Every record goes into the NEW session's log, folded state included, so a second
+            // resume works too.
             tree.record_tree_record(&TreeRecord::Agent {
-                id: *id,
-                name: name.clone(),
-                parent: *parent,
-                depth: *depth,
-                dir: dir.clone(),
-                task: task.clone(),
-                profile: profile.clone(),
-                role: *role,
-                policy: policy.clone(),
-                stopped: *was_stopped || *pipeline,
-                archived: *archived,
-                pipeline: *pipeline,
+                id: row.id,
+                name: row.name.clone(),
+                parent: row.parent,
+                depth: row.depth,
+                dir: row.dir.clone(),
+                task: row.task.clone(),
+                profile: row.profile.clone(),
+                role: row.role,
+                policy: row.policy.clone(),
+                stopped: row.stopped || row.pipeline,
+                archived: row.archived,
+                pipeline: row.pipeline,
             });
-            if *was_stopped || *archived {
-                tree.record_tree_record(&TreeRecord::State { id: *id, stopped: *was_stopped, archived: *archived });
-            }
         }
-        let total = agents.len();
-        let id = lock(swarm).log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let total = rows.len();
+        let id = log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
         Ok(if pipelines == 0 {
             format!("resumed {} as {id}; {total} agent(s) back", source.id)
         } else {
@@ -1486,6 +1476,7 @@ impl Swarm {
         let label = self.label(id);
         let mut stopped = self.descendants(id);
         stopped.push(id);
+        let mut records = Vec::with_capacity(stopped.len());
         for target in &stopped {
             if let Some(agent) = self.agent_mut(*target) {
                 agent.control.stop();
@@ -1495,9 +1486,11 @@ impl Swarm {
                 // them: the counter and the busy mark would stay set for good.
                 agent.pending = 0;
                 agent.busy_since = None;
-                self.record_tree_record(&TreeRecord::State { id: *target, stopped: true, archived: false });
+                records.push(TreeRecord::State { id: *target, stopped: true, archived: false });
             }
         }
+        // One write and one sync for the whole subtree: every record write blocks the tree lock.
+        self.record_tree_records(&records);
         let below = stopped.len().saturating_sub(1);
         Ok(if below == 0 {
             format!("{label} stopped")
@@ -3436,12 +3429,14 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let mut log = session_store::SessionLog::open(source.path()).unwrap();
         log.write(&TreeRecord::Session { at: 1, dir: h.root.path().display().to_string(), resumed_from: None });
+        // Production always writes `stopped: false` at spawn and a separate `State` on the way to
+        // dead, so the fixture does too: the fold, not the fixture, has to bring the stop back.
         for id in [1usize, 2] {
             let tree = h.swarm.lock().unwrap();
             let agent = tree.agent(id).unwrap();
             log.write(&TreeRecord::Agent {
                 id,
-                name: agent.name.clone(),
+                name: None,
                 parent: agent.parent,
                 depth: agent.depth,
                 dir: agent.working_dir.display().to_string(),
@@ -3449,14 +3444,14 @@ mod tests {
                 profile: agent.profile.clone(),
                 role: agent.role,
                 policy: agent.control.policy(),
-                stopped: agent.stopped,
-                archived: agent.archived,
+                stopped: false,
+                archived: false,
                 pipeline: false,
             });
-            if agent.stopped {
-                log.write(&TreeRecord::State { id, stopped: true, archived: false });
-            }
+            assert!(agent.stopped || id == 1, "the fixture stops agent 2 first");
         }
+        log.write(&TreeRecord::Rename { id: 2, name: "kept name".into() });
+        log.write(&TreeRecord::State { id: 2, stopped: true, archived: false });
         // The committed histories, as the AgentRun would have saved them: system messages out.
         let replay = vec![llm::Message::user("second question")];
         session_store::save_history(&source.path().join("agent-1.history.json"), &replay).unwrap();
@@ -3497,7 +3492,12 @@ mod tests {
         assert_eq!(tree.agent(2).unwrap().state(), State::Stopped);
         // No re-merge: the child's policy is the stored one, byte for byte.
         assert_eq!(tree.agent(2).unwrap().control.policy(), h.swarm.lock().unwrap().agent(2).unwrap().control.policy());
+        assert_eq!(tree.agent(2).unwrap().name.as_deref(), Some("kept name"), "a rename survives the resume");
         drop(tree);
+        // The replayed history lands in the NEW session dir, so quitting before the next turn
+        // still leaves a session that resumes with its conversation.
+        let seeded = session_store::load_history(&logs.path().join("agent-1.history.json")).unwrap();
+        assert_eq!(seeded, replay, "the resumed session seeds its own history file");
 
         // The resumed root's next model call carries the replayed history: system slot first, then
         // the committed user turn.
