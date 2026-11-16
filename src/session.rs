@@ -7,6 +7,7 @@ use crate::mcp;
 use crate::names;
 use crate::pipelines;
 use crate::profiles;
+use crate::session_store::{ResumeSource, SessionLog, TreeRecord};
 use crate::swarm::{AgentEvent, CompactionNotice, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
@@ -16,8 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// How often the loop looks at the shutdown flag, so a frontend that returned cannot be waited on.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
@@ -38,26 +38,55 @@ pub(crate) fn run(
     approvals: Arc<Gate>,
     shutdown: Arc<AtomicBool>,
     bounds: Arc<bounds::Bounds>,
+    resume: Option<ResumeSource>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
     let _ = ui.send(UiEvent::Approvals(approvals.tier()));
+    // One session dir = one durable state: the tree records and each agent's committed history.
+    let session_log = match SessionLog::open(&log_dir) {
+        Ok(log) => log,
+        Err(e) => {
+            let _ = ui.send(UiEvent::Error(e.clone()));
+            tools::kill_running();
+            mcp.kill_all();
+            let _ = ui.send(UiEvent::Done);
+            return Err(anyhow::Error::msg(e));
+        }
+    };
+    let resumed_from = resume.as_ref().map(|source| source.id.clone());
+    let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut log = session_log;
+    log.write(&TreeRecord::Session { at, dir: cfg.dir.display().to_string(), resumed_from: resumed_from.clone() });
     let swarm = Arc::new(Mutex::new(Swarm::new(
         models,
         profiles,
         pipelines,
         Arc::new(cfg.clone()),
-        log_dir,
+        log_dir.clone(),
         input,
         Arc::clone(&mcp),
         Arc::clone(&approvals),
         Arc::clone(&bounds),
+        Some(log),
     )));
-    if let Err(e) = Swarm::start_root(&swarm, cfg.dir.clone()) {
-        let _ = ui.send(UiEvent::Error(e.clone()));
-        tools::kill_running();
-        mcp.kill_all();
-        let _ = ui.send(UiEvent::Done);
-        return Err(anyhow::Error::msg(e));
+    let started = match &resume {
+        Some(source) => Swarm::resume_tree(&swarm, source).map(Some),
+        None => Swarm::start_root(&swarm, &cfg.dir).map(|_| None),
+    };
+    match started {
+        Ok(Some(line)) => {
+            let _ = ui.send(UiEvent::Notice(line));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = ui.send(UiEvent::Error(e.clone()));
+            tools::kill_running();
+            mcp.kill_all();
+            let _ = ui.send(UiEvent::Done);
+            // The picker never lists a session that holds nothing.
+            let _ = std::fs::remove_dir_all(&log_dir);
+            return Err(anyhow::Error::msg(e));
+        }
     }
     let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
     // Set when stdin closes: the run ends at the first moment no agent is busy.
@@ -380,6 +409,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
             )
         });
         frontend
@@ -442,6 +472,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
             )
         });
         frontend.send(Event::User("hello".into())).unwrap();
@@ -500,6 +531,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
             )
         });
         let mut seen: Vec<String> = Vec::new();
@@ -574,6 +606,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
             )
         });
         frontend.send(Event::from_line("/pipeline list").unwrap()).unwrap();
@@ -585,6 +618,94 @@ mod tests {
         assert!(until(&ui_rx, "stopped").iter().any(|line| line.contains("stopped")));
         frontend.send(Event::User("hello".into())).unwrap();
         assert!(until(&ui_rx, "hello back").iter().any(|line| line.contains("hello back")));
+        frontend.send(Event::Eof).unwrap();
+        assert!(until(&ui_rx, "Done").iter().any(|line| line.contains("Done")));
+        handle.join().unwrap().unwrap();
+    }
+
+    /// One session answers a line and exits; a second one resumes it: the roster comes back and the
+    /// root answers a new line with the replayed history behind it.
+    #[test]
+    fn a_session_resumes_the_tree_of_the_one_before() {
+        let root = tempfile::tempdir().unwrap();
+        let first_logs = tempfile::tempdir().unwrap();
+        let second_logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
+            dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            mcp_project: config::McpProject::On,
+            approvals: crate::approvals::Tier::Ask,
+            compaction: crate::config::CompactionSettings::default(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let frontend = input.clone();
+        let first_dir = first_logs.path().to_path_buf();
+        let cfg_first = cfg.clone();
+        let home = root.path().to_path_buf();
+        let home_first = home.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("first answer")])))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg_first,
+                first_dir,
+                input,
+                input_rx,
+                ui,
+                Arc::new(mcp::Registry::load(&home_first)),
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
+            )
+        });
+        frontend.send(Event::User("remember this".into())).unwrap();
+        assert_eq!(next_answer(&ui_rx), "first answer");
+        frontend.send(Event::Eof).unwrap();
+        assert!(until(&ui_rx, "Done").iter().any(|line| line.contains("Done")));
+        handle.join().unwrap().unwrap();
+
+        // The first session left a tree record and the root's committed history behind.
+        let source = crate::session_store::ResumeSource { id: "first".into(), dir: first_logs.path().to_path_buf() };
+        assert!(first_logs.path().join("session.jsonl").is_file());
+        assert!(first_logs.path().join("agent-1.history.json").is_file());
+
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let frontend = input.clone();
+        let second_dir = second_logs.path().to_path_buf();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(vec![text("second answer")])))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                second_dir,
+                input,
+                input_rx,
+                ui,
+                Arc::new(mcp::Registry::load(&home)),
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                Some(source),
+            )
+        });
+        // The resume notice names the agents that came back.
+        assert!(until(&ui_rx, "resumed").iter().any(|line| line.contains("1 agent(s) back")));
+        frontend.send(Event::User("what did I say?".into())).unwrap();
+        assert_eq!(next_answer(&ui_rx), "second answer");
         frontend.send(Event::Eof).unwrap();
         assert!(until(&ui_rx, "Done").iter().any(|line| line.contains("Done")));
         handle.join().unwrap().unwrap();
@@ -658,6 +779,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, std::collections::HashMap::new())),
+                None,
             )
         });
         frontend.send(Event::User("run".into())).unwrap();
