@@ -83,9 +83,9 @@ pub(crate) enum Piece<'a> {
 /// `prompt_tokens`/`completion_tokens`, so each field takes both spellings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub(crate) struct Usage {
-    #[serde(alias = "prompt_tokens")]
+    #[serde(default, alias = "prompt_tokens")]
     input_tokens: u64,
-    #[serde(alias = "completion_tokens")]
+    #[serde(default, alias = "completion_tokens")]
     output_tokens: u64,
 }
 
@@ -255,10 +255,14 @@ impl Llm for OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// Bills the meter for the tokens a successful call reported.
+    /// Bills the meter for the tokens a successful call reported. A call that reported none is
+    /// counted as unbilled instead of silently escaping a cost bound.
     fn charge(&self, usage: Option<Usage>) {
-        if let (Some(meter), Some(usage)) = (&self.meter, usage) {
-            meter.charge(&self.model, usage.counts());
+        let Some(meter) = &self.meter else { return };
+        match usage {
+            Some(usage) => meter.charge(&self.model, usage.counts()),
+            None if meter.wants_usage() => meter.note_unbilled(),
+            None => {}
         }
     }
 
@@ -272,12 +276,12 @@ impl OpenAiClient {
         Ok(body)
     }
 
-    fn payload(&self, messages: &[Message], tools: &Value, stream: bool) -> Value {
+    fn payload(&self, messages: &[Message], tools: &Value, stream: bool, usage: bool) -> Value {
         let mut payload =
             json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
         // Gated: some servers reject the field, and with no cost bound the tokens are not needed.
         if stream
-            && self.meter.as_ref().is_some_and(|meter| meter.wants_usage())
+            && usage
             && let Some(object) = payload.as_object_mut()
         {
             object.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -290,18 +294,31 @@ impl OpenAiClient {
         payload
     }
 
+    /// Whether this client asks its provider for token counts on streamed calls.
+    fn wants_usage(&self) -> bool {
+        self.meter.as_ref().is_some_and(|meter| meter.wants_usage())
+    }
+
     fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = self.payload(messages, tools, stream);
-        if let Some(sink) = &self.debug {
-            sink(&payload.to_string());
+        let mut payload = self.payload(messages, tools, stream, self.wants_usage());
+        let sent = |payload: &Value| {
+            if let Some(sink) = &self.debug {
+                sink(&payload.to_string());
+            }
+            self.http
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(payload)
+                .send()
+                .context("request to model failed")
+        };
+        let mut response = sent(&payload)?;
+        // A server that rejects `stream_options` with a 400 gets one retry without it: the answer
+        // is worth streaming even if its tokens cannot be billed.
+        if stream && self.wants_usage() && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            payload = self.payload(messages, tools, stream, false);
+            response = sent(&payload)?;
         }
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .context("request to model failed")?;
         let status = response.status();
         if stream && !status.is_success() {
             let body = response.text().context("reading model response failed")?;
@@ -603,7 +620,12 @@ pub(crate) mod testing {
     }
 
     impl Llm for Recording {
-        fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+        fn chat(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<(Message, Option<Usage>)> {
             self.requests.lock().unwrap().push(messages.to_vec());
             self.inner.chat(messages, tools, cancel)
         }
@@ -614,7 +636,7 @@ pub(crate) mod testing {
             tools: &Value,
             cancel: Option<&AtomicBool>,
             on_piece: &mut dyn FnMut(Piece<'_>),
-        ) -> Result<Message> {
+        ) -> Result<(Message, Option<Usage>)> {
             self.requests.lock().unwrap().push(messages.to_vec());
             self.inner.chat_stream(messages, tools, cancel, on_piece)
         }
@@ -821,10 +843,10 @@ mod tests {
     fn a_request_carries_the_effort_only_when_one_is_set() {
         let http = reqwest::blocking::Client::new();
         let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, None);
-        let body = plain.payload(&[], &json!([]), false);
+        let body = plain.payload(&[], &json!([]), false, false);
         assert!(body.get("reasoning_effort").is_none());
         let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None, None);
-        let body = effortful.payload(&[], &json!([]), false);
+        let body = effortful.payload(&[], &json!([]), false, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["model"], "m");
     }
@@ -869,13 +891,13 @@ mod tests {
         let bounded = crate::bounds::Bounds::new(None, Some(1.0), HashMap::new());
         let client =
             OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, Some(Arc::new(bounded)));
-        assert!(client.payload(&[], &json!([]), true).get("stream_options").is_some());
+        assert!(client.payload(&[], &json!([]), true, true).get("stream_options").is_some());
         assert!(
-            client.payload(&[], &json!([]), false).get("stream_options").is_none(),
+            client.payload(&[], &json!([]), false, true).get("stream_options").is_none(),
             "non-streaming asks for usage inline"
         );
         let unbounded = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), None, None, None);
-        assert!(unbounded.payload(&[], &json!([]), true).get("stream_options").is_none());
+        assert!(unbounded.payload(&[], &json!([]), true, false).get("stream_options").is_none());
     }
 
     #[test]

@@ -76,6 +76,17 @@ pub(crate) fn run(
             let _ = ui.send(UiEvent::Error(format!("session budget exceeded: {reason}; every agent stopped")));
             let _ = ui.send(UiEvent::Agents(agents));
             let _ = ui.send(UiEvent::Busy(busy));
+            let unbilled = bounds.unbilled();
+            if unbilled > 0 {
+                let _ = ui.send(UiEvent::Notice(format!(
+                    "{unbilled} model call(s) reported no token counts and were not billed"
+                )));
+            }
+            // Same exit rule as every other busy-falsifying arm: with stdin closed the run ends
+            // here, not after a poll that will never fire.
+            if draining && !busy {
+                break;
+            }
         }
         let Some(event) = event else {
             continue;
@@ -140,21 +151,29 @@ pub(crate) fn run(
                             let _ = ui.send(UiEvent::Error(format!("not an agent id: {id}")));
                         }
                     },
-                    [name] => match Swarm::start_pipeline(&swarm, Swarm::ROOT, name) {
-                        Ok(id) => {
-                            draining = false;
-                            let (label, agents, busy) = {
-                                let tree = lock(&swarm);
-                                (tree.label(id), tree.snapshot(), tree.busy())
-                            };
-                            let _ = ui.send(UiEvent::Notice(format!("pipeline {name} started as {label}")));
-                            let _ = ui.send(UiEvent::Agents(agents));
-                            let _ = ui.send(UiEvent::Busy(busy));
+                    [name] => {
+                        // A pipeline agent never passes through `Turn`, so the bound cannot stop
+                        // it: once the session is blown, starting one would run unbounded.
+                        if tripped {
+                            let _ = ui.send(UiEvent::Error("session budget exceeded: pipelines are refused".into()));
+                        } else {
+                            match Swarm::start_pipeline(&swarm, Swarm::ROOT, name) {
+                                Ok(id) => {
+                                    draining = false;
+                                    let (label, agents, busy) = {
+                                        let tree = lock(&swarm);
+                                        (tree.label(id), tree.snapshot(), tree.busy())
+                                    };
+                                    let _ = ui.send(UiEvent::Notice(format!("pipeline {name} started as {label}")));
+                                    let _ = ui.send(UiEvent::Agents(agents));
+                                    let _ = ui.send(UiEvent::Busy(busy));
+                                }
+                                Err(line) => {
+                                    let _ = ui.send(UiEvent::Error(line));
+                                }
+                            }
                         }
-                        Err(line) => {
-                            let _ = ui.send(UiEvent::Error(line));
-                        }
-                    },
+                    }
                     _ => {
                         let _ = ui.send(UiEvent::Notice(USAGE.into()));
                     }

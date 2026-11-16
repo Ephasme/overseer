@@ -108,7 +108,7 @@ impl Turn<'_> {
 impl Turn<'_> {
     /// Why the session bound refuses to continue, or `None` while it fits.
     fn over_budget(&self) -> Option<String> {
-        self.bounds.and_then(bounds::Bounds::exceeded).map(|reason| format!("session budget exceeded: {reason}"))
+        self.bounds.and_then(bounds::Bounds::refusal)
     }
 }
 
@@ -234,6 +234,7 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
             bounds: Some(&budget),
         };
         let err = turn.run(&mut history, "go").unwrap_err();

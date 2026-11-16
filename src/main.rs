@@ -32,7 +32,7 @@ mod url;
 mod vault;
 mod version;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use bounds::Bounds;
 use event::UiEvent;
 use std::io::IsTerminal;
@@ -219,10 +219,7 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
 }
 
 /// The value of a flag given as its own argument; the next item, which may start with `-`.
-fn next_value(
-    items: &mut impl Iterator<Item = std::ffi::OsString>,
-    name: &str,
-) -> Result<String> {
+fn next_value(items: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> Result<String> {
     items
         .next()
         .ok_or_else(|| anyhow::anyhow!("{name} needs a value"))?
@@ -304,10 +301,22 @@ mod tests {
 
     #[test]
     fn mode_json_and_mode_text() {
-        assert_eq!(parse(&["--mode", "json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() });
-        assert_eq!(parse(&["--mode=json"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() });
-        assert_eq!(parse(&["--mode", "text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() });
-        assert_eq!(parse(&["--mode=text"]).unwrap(), Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() });
+        assert_eq!(
+            parse(&["--mode", "json"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode=json"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Json), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode", "text"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() }
+        );
+        assert_eq!(
+            parse(&["--mode=text"]).unwrap(),
+            Args { print: None, mode: Some(plain::Mode::Text), ..Args::default() }
+        );
     }
 
     #[test]

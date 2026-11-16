@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# Where the root agent starts.\ndir = \"~/code\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,20 +136,19 @@ pub(crate) fn describe(cfg: &Config) -> String {
 }
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
-pub(crate) const SETTINGS: &[&str] =
-    &[
-        "roots",
-        "base_url",
-        "model",
-        "theme",
-        "max_depth",
-        "max_time",
-        "max_cost",
-        "dir",
-        "home",
-        "state_dir",
-        "mcp_project",
-    ];
+pub(crate) const SETTINGS: &[&str] = &[
+    "roots",
+    "base_url",
+    "model",
+    "theme",
+    "max_depth",
+    "max_time",
+    "max_cost",
+    "dir",
+    "home",
+    "state_dir",
+    "mcp_project",
+];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -256,6 +255,11 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     }
     if raw.base_url.trim().is_empty() || raw.model.trim().is_empty() {
         bail!("base_url and model must not be empty");
+    }
+    if let Some(max_cost) = raw.max_cost
+        && (!max_cost.is_finite() || max_cost <= 0.0)
+    {
+        bail!("max_cost must be a positive number of dollars, got {max_cost:?}");
     }
     let mut roots = Vec::new();
     for root in &raw.roots {

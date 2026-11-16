@@ -569,6 +569,16 @@ impl Agent {
         names::label(self.id, self.name.as_deref())
     }
 
+    /// One place the stop flags become a state: the thread takes no more work, the queued
+    /// instructions are dropped, and the counter and busy mark would otherwise stay set for good.
+    fn retire(&mut self) {
+        self.control.stop();
+        self.inbox = None;
+        self.stopped = true;
+        self.pending = 0;
+        self.busy_since = None;
+    }
+
     /// The one place the flags become a state. Precedence is the order of `State`'s variants.
     fn state(&self) -> State {
         if self.archived {
@@ -866,8 +876,6 @@ impl Swarm {
             )
         };
         let recorded = profile.clone();
-        // Read before the call: a `lock(swarm)` temporary there would hold the tree across the spawn.
-        let bounds = Arc::clone(&lock(swarm).bounds);
         let (inbox, handle) = spawn_thread(
             llm,
             sender,
@@ -881,7 +889,6 @@ impl Swarm {
             profiles::Role::Supervisor,
             &log_path,
             swarm,
-            bounds,
         )?;
         lock(swarm).agents.push(Agent {
             id,
@@ -1042,8 +1049,6 @@ impl Swarm {
         };
         let working_dir = config::resolve_dir(&dir, &home)?;
         let recorded = profile.clone();
-        // Read before the call: a `lock(swarm)` temporary there would hold the tree across the spawn.
-        let bounds = Arc::clone(&lock(swarm).bounds);
         let (inbox, handle) = spawn_thread(
             llm,
             sender,
@@ -1057,7 +1062,6 @@ impl Swarm {
             role,
             &log_path,
             swarm,
-            bounds,
         )?;
         lock(swarm).agents.push(Agent {
             id,
@@ -1295,13 +1299,7 @@ impl Swarm {
         stopped.push(id);
         for target in &stopped {
             if let Some(agent) = self.agent_mut(*target) {
-                agent.control.stop();
-                agent.inbox = None;
-                agent.stopped = true;
-                // Nothing will run the instructions still queued, so nothing will ever finish
-                // them: the counter and the busy mark would stay set for good.
-                agent.pending = 0;
-                agent.busy_since = None;
+                agent.retire();
             }
         }
         let below = stopped.len().saturating_sub(1);
@@ -1319,11 +1317,7 @@ impl Swarm {
             if agent.id == Swarm::ROOT {
                 agent.control.cut();
             } else {
-                agent.control.stop();
-                agent.inbox = None;
-                agent.stopped = true;
-                agent.pending = 0;
-                agent.busy_since = None;
+                agent.retire();
             }
         }
     }
@@ -1593,7 +1587,6 @@ fn spawn_thread(
     role: profiles::Role,
     records_path: &Path,
     me: &Arc<Mutex<Swarm>>,
-    bounds: Arc<bounds::Bounds>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
     let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
@@ -1630,7 +1623,6 @@ fn spawn_thread(
             control: &control,
             conflicts: conflict::Registry::default(),
             seen: edit::Store::default(),
-            bounds,
         };
         run.run(streamed.as_ref(), &instructions);
     });
@@ -1683,17 +1675,16 @@ struct AgentRun<'a> {
     seen: edit::Store,
     /// Tool calls made so far, so each start pairs with its own result whatever interleaves.
     calls: usize,
-    bounds: Arc<bounds::Bounds>,
 }
 
 impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let (config, mcp, catalogue) = {
+        let (config, mcp, catalogue, bounds) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
             let tree = lock(&swarm);
-            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles))
+            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles), Arc::clone(&tree.bounds))
         };
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
@@ -1758,7 +1749,6 @@ impl AgentRun<'_> {
                 // `Writer::write` takes `&self`, so both closures below share one copied
                 // reference: the execute closure keeps `&mut self` capture without a conflict.
                 let records = self.records;
-                let bounds = Arc::clone(&self.bounds);
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
@@ -2527,6 +2517,7 @@ mod tests {
             root.path().join("logs"),
             sender,
             Arc::new(mcp::Registry::load(root.path())),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         assert_eq!(swarm.lock().unwrap().tell_root("go").unwrap(), format!("sent to {}", codename(1)));
