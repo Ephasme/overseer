@@ -76,6 +76,10 @@ pub(crate) fn run(
             Event::Mcp => {
                 let _ = ui.send(UiEvent::Notice(mcp.summary()));
             }
+            Event::Approve(arg) => {
+                let line = if arg.is_empty() { "usage: /approve <server>".to_string() } else { mcp.approve(&arg) };
+                let _ = ui.send(UiEvent::Notice(line));
+            }
             Event::Login(arg) => {
                 let line = if arg.is_empty() {
                     "usage: /login <server>".to_string()

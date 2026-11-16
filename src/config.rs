@@ -17,6 +17,8 @@ struct RawConfig {
     theme: Option<String>,
     max_depth: Option<usize>,
     dir: Option<String>,
+    /// Omitted means `ask`: whether a project `.mcp.json` may start servers.
+    mcp_project: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,36 @@ pub(crate) struct Config {
     pub(crate) dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+    /// Whether a project `.mcp.json` may start servers: `off`, `ask` (default) or `on`.
+    pub(crate) mcp_project: McpProject,
+}
+
+/// The gate on a project's `.mcp.json`: cloning into an untrusted repository must not start
+/// arbitrary commands. `ask` lists project servers unapproved and one `/approve` starts it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum McpProject {
+    Off,
+    Ask,
+    On,
+}
+
+impl McpProject {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "ask" => Ok(Self::Ask),
+            "on" => Ok(Self::On),
+            other => bail!("mcp_project {other:?} is not off, ask or on"),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ask => "ask",
+            Self::On => "on",
+        }
+    }
 }
 
 /// Delegations allowed below the root when `config.toml` names no `max_depth`.
@@ -78,7 +110,8 @@ pub(crate) fn describe(cfg: &Config) -> String {
 }
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
-pub(crate) const SETTINGS: &[&str] = &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir"];
+pub(crate) const SETTINGS: &[&str] =
+    &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir", "mcp_project"];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -87,6 +120,7 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "base_url" => redact(&cfg.base_url),
         "model" => cfg.model.clone(),
         "theme" => cfg.theme.name().to_string(),
+        "mcp_project" => cfg.mcp_project.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
         "dir" => cfg.dir.display().to_string(),
         "home" => cfg.home.display().to_string(),
@@ -195,6 +229,8 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
     // The root works in the user's home, not in the world-writable directory a child falls back to.
     let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
+    // `ask` is the gate: a cloned repository must not start commands without the user's say.
+    let mcp_project = raw.mcp_project.as_deref().map_or(Ok(McpProject::Ask), McpProject::parse)?;
     Ok(Config {
         roots,
         base_url: raw.base_url,
@@ -203,6 +239,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,
         home: home.to_path_buf(),
+        mcp_project,
     })
 }
 

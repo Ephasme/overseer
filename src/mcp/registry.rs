@@ -12,7 +12,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -21,11 +20,12 @@ use std::time::Duration;
 /// Longest runtime tool name a model sees, before it is truncated and hashed.
 const MAX_NAME: usize = 64;
 
-/// What one server is doing, as `/mcp` shows it.
+#[derive(PartialEq)]
 enum Status {
     Connecting,
     Connected,
     OauthRequired { challenge: Option<String> },
+    Unapproved,
     Failed(String),
 }
 
@@ -33,6 +33,8 @@ struct Server {
     name: String,
     /// `None` when the file itself could not be read, or the declaration is unusable.
     config: Option<ServerConfig>,
+    /// Which file the entry came from, kept even when `config` is `None`.
+    source: config::Source,
     status: Status,
     /// The live connection, in its own lock so a slow call does not hold the server list.
     client: Arc<Mutex<Option<Client>>>,
@@ -77,21 +79,28 @@ impl Registry {
     /// connecting anything; `start` builds on it.
     fn load_with(home: &Path, project: Option<&Path>) -> Self {
         let path = config::path(home);
-        let project_file = project.map(|project| project.join(".mcp.json"));
+        // The project file is named only when it exists: the empty summary must not claim servers
+        // are absent from a file that was never there.
+        let project_file = project.map(|project| project.join(".mcp.json")).filter(|file| file.exists());
         let servers: Vec<Server> = config::discover(home, project)
             .into_iter()
             .map(|entry| match entry {
-                Ok(config) => Server {
-                    name: config.name.clone(),
-                    config: Some(config),
-                    status: Status::Connecting,
-                    client: Arc::new(Mutex::new(None)),
-                    tools: Vec::new(),
-                    notes: None,
-                },
-                Err((name, why)) => Server {
+                Ok(config) => {
+                    let source = config.source;
+                    Server {
+                        name: config.name.clone(),
+                        config: Some(config),
+                        source,
+                        status: Status::Connecting,
+                        client: Arc::new(Mutex::new(None)),
+                        tools: Vec::new(),
+                        notes: None,
+                    }
+                }
+                Err((name, why, source)) => Server {
                     name,
                     config: None,
+                    source,
                     status: Status::Failed(why),
                     client: Arc::new(Mutex::new(None)),
                     tools: Vec::new(),
@@ -115,32 +124,39 @@ impl Registry {
     }
 
     /// Reads the server list and connects each server on its own thread: startup never waits.
-    pub(crate) fn start(home: &Path, ui: &Sender<UiEvent>) -> Arc<Self> {
+    ///
+    /// `gate` decides what a project `.mcp.json` may do: `on` connects its servers like home
+    /// ones, `ask` lists them unapproved until `/approve`, `off` leaves them out entirely.
+    pub(crate) fn start(home: &Path, gate: crate::config::McpProject, ui: &Sender<UiEvent>) -> Arc<Self> {
         // The project is the working directory at launch, walked up to its nearest `.git`.
         let project = std::env::current_dir().ok().map(|dir| config::project_root(&dir));
+        let project = match gate {
+            crate::config::McpProject::Off => None,
+            _ => project,
+        };
         let registry = Arc::new(Self::load_with(home, project.as_deref()));
         let total = registry.servers().len();
         if total == 0 {
             let _ = ui.send(UiEvent::Notice(registry.notice()));
             return registry;
         }
-        let remaining = Arc::new(AtomicUsize::new(total));
+        let mut unapproved = Vec::new();
         for index in 0..total {
-            let weak = Arc::downgrade(&registry);
-            let ui = ui.clone();
-            let remaining = Arc::clone(&remaining);
-            // A `Weak` on purpose: a server still connecting while overseer quits must not keep it alive.
-            thread::spawn(move || {
-                if let Some(registry) = weak.upgrade() {
-                    registry.connect(index);
-                }
-                if remaining.fetch_sub(1, Ordering::SeqCst) == 1
-                    && let Some(registry) = weak.upgrade()
-                {
-                    let _ = ui.send(UiEvent::Notice(registry.notice()));
-                }
-            });
+            if hold && registry.is_unapproved(index) {
+                unapproved.push(index);
+            } else {
+                let weak = Arc::downgrade(&registry);
+                // A `Weak` on purpose: a server still connecting while overseer quits must not keep it alive.
+                thread::spawn(move || {
+                    if let Some(registry) = weak.upgrade() {
+                        registry.connect(index);
+                    }
+                });
+            }
         }
+        registry.mark_unapproved(&unapproved);
+        // The notice counts every server, connected or not, so it fires immediately.
+        let _ = ui.send(UiEvent::Notice(registry.notice()));
         registry
     }
 
@@ -163,6 +179,52 @@ impl Registry {
             }
             Err(ConnectError::Failed(why)) => self.set_status(index, Status::Failed(why)),
         }
+    }
+
+    /// Whether `index` is a project server the `ask` gate has not approved yet.
+    fn is_unapproved(&self, index: usize) -> bool {
+        self.guard()
+            .servers
+            .get(index)
+            .is_some_and(|server| server.source == config::Source::Project && server.config.is_some())
+    }
+
+    /// Marks the project servers the `ask` gate holds back: shown in `/mcp`, never connected.
+    fn mark_unapproved(&self, indexes: &[usize]) {
+        let mut guard = self.guard();
+        for index in indexes {
+            if let Some(server) = guard.servers.get_mut(*index)
+                && server.source == config::Source::Project
+            {
+                server.status = Status::Unapproved;
+            }
+        }
+    }
+
+    /// `/approve <server>`: starts a project server the `ask` gate held back, for this session
+    /// only; the next launch asks again. A home server is already running and needs no approval.
+    pub(crate) fn approve(self: &Arc<Self>, name: &str) -> String {
+        let found = self.guard().servers.iter().enumerate().find_map(|(index, server)| {
+            (server.name == name && server.source == config::Source::Project).then_some(index)
+        });
+        let Some(index) = found else { return format!("no unapproved project server {name}") };
+        let started = {
+            let mut guard = self.guard();
+            let Some(server) = guard.servers.get_mut(index) else {
+                return format!("no unapproved project server {name}");
+            };
+            if server.status != Status::Unapproved {
+                return format!("{name} is not waiting for approval");
+            }
+            server.status = Status::Connecting;
+            server.config.clone()
+        };
+        if started.is_none() {
+            return format!("error: mcp server {name} has no usable configuration");
+        }
+        let registry = Arc::clone(self);
+        thread::spawn(move || registry.connect(index));
+        format!("approved {name}: connecting")
     }
 
     /// The stored access token for a server URL, refreshed first when it has expired.
@@ -461,12 +523,7 @@ impl Registry {
                 Status::OauthRequired { .. } => format!("oauth required (/login {})", server.name),
                 Status::Failed(why) => why.lines().next().unwrap_or_default().to_string(),
             };
-            let from_project = if server.config.as_ref().is_some_and(|config| config.source == config::Source::Project)
-            {
-                " (project)"
-            } else {
-                ""
-            };
+            let from_project = if server.source == config::Source::Project { " (project)" } else { "" };
             lines.push(format!("- {} {kind} {status}{from_project}", server.name));
         }
         drop(state);
@@ -554,7 +611,7 @@ fn count(state: &State) -> (usize, usize, usize) {
     let unavailable = state
         .servers
         .iter()
-        .filter(|server| matches!(server.status, Status::Failed(_) | Status::OauthRequired { .. }))
+        .filter(|server| matches!(server.status, Status::Failed(_) | Status::OauthRequired { .. } | Status::Unapproved))
         .count();
     (state.servers.len(), tools, unavailable)
 }
@@ -625,7 +682,7 @@ fn sanitise(part: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use std::fs;
     #[test]
     fn a_registry_without_servers_offers_no_resource_and_names_the_uri_it_could_not_read() {
         let home = tempfile::tempdir().unwrap();
@@ -656,5 +713,55 @@ mod tests {
         assert!(name.len() <= MAX_NAME, "{name}");
         assert!(!taken.contains_key(&name), "{name}");
         assert_eq!(name, free_runtime_name("mcp__fs_read", "fs", "fs_read", &taken), "the hash is stable");
+    }
+    #[test]
+    fn the_ask_gate_holds_project_servers_until_an_approve_starts_one() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".overseer/agent")).unwrap();
+        fs::write(
+            config::path(home.path()),
+            r#"{"mcpServers":{"home-false":{"command":"/bin/false"},"home-true":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        fs::write(project.path().join(".mcp.json"), r#"{"mcpServers":{"boom":{"command":"/bin/false"}}}"#).unwrap();
+        let registry = Arc::new(Registry::load_with(home.path(), Some(project.path())));
+        let total = registry.servers().len();
+        assert_eq!(total, 3);
+        let unapproved: Vec<usize> = (0..total).filter(|index| registry.is_unapproved(*index)).collect();
+        assert_eq!(unapproved, [2], "only the project server waits for approval");
+        registry.mark_unapproved(&unapproved);
+        // A project server that failed to build is never unapproved: its `why` is what /mcp shows.
+        let line = registry.approve("home-true");
+        assert_eq!(line, "no unapproved project server home-true");
+        let refused = registry.approve("no-such");
+        assert_eq!(refused, "no unapproved project server no-such");
+    }
+
+    #[test]
+    fn the_empty_summary_names_only_a_project_file_that_exists() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let without = Registry::load_with(home.path(), Some(project.path()));
+        assert_eq!(
+            without.summary(),
+            format!("no MCP servers in {}", config::path(home.path()).display()),
+            "no project file was read, so the summary names none"
+        );
+        fs::write(project.path().join(".mcp.json"), "{}").unwrap();
+        let with = Registry::load_with(home.path(), Some(project.path()));
+        let line = with.summary();
+        assert!(line.contains("or") && line.contains(".mcp.json"), "{line}");
+    }
+
+    #[test]
+    fn a_failed_project_declaration_keeps_its_source_in_the_summary() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".overseer/agent")).unwrap();
+        fs::write(project.path().join(".mcp.json"), r#"{"mcpServers":{"broken":{"type":"stdio"}}}"#).unwrap();
+        let registry = Registry::load_with(home.path(), Some(project.path()));
+        let summary = registry.summary();
+        assert!(summary.contains("(project)"), "{summary}");
     }
 }

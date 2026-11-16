@@ -216,7 +216,7 @@ struct RawAuth {
     resource: Option<String>,
 }
 /// Every server the file declares: `Ok` for one to connect, `Err` for a name and why it cannot be.
-pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String)>>;
+pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String, Source)>>;
 
 /// Reads the server list; a missing file is an empty list, an unreadable one is one failure.
 ///
@@ -229,11 +229,11 @@ pub(crate) fn discover(home: &Path, project: Option<&Path>) -> Discovery {
         for entry in project_servers {
             let name = match &entry {
                 Ok(config) => config.name.clone(),
-                Err((name, _)) => name.clone(),
+                Err((name, _, _)) => name.clone(),
             };
             let existing = found.iter_mut().find(|entry| match entry.as_ref() {
                 Ok(config) => config.name == name,
-                Err((existing, _)) => *existing == name,
+                Err((existing, _, _)) => *existing == name,
             });
             match existing {
                 Some(existing) => *existing = entry,
@@ -249,11 +249,11 @@ fn read_file(file: &Path, label: &str, source: Source) -> Discovery {
     let text = match fs::read_to_string(file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display()), source))],
     };
     let raw: RawFile = match serde_json::from_str(&text) {
         Ok(raw) => raw,
-        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display()), source))],
     };
     raw.servers
         .into_iter()
@@ -277,8 +277,8 @@ fn build(
     disabled: &[String],
     forced: &[String],
     source: Source,
-) -> Result<ServerConfig, (String, String)> {
-    let fail = |why: String| Err((name.clone(), why));
+) -> Result<ServerConfig, (String, String, Source)> {
+    let fail = |why: String| Err((name.clone(), why, source));
     if disabled.contains(&name) {
         return fail("listed in disabledServers".into());
     }
@@ -569,7 +569,7 @@ mod tests {
         live.sort_unstable();
         assert_eq!(live, ["forced", "live"]);
         let mut skipped: Vec<&str> =
-            found.iter().filter_map(|entry| entry.as_ref().err()).map(|(name, _)| name.as_str()).collect();
+            found.iter().filter_map(|entry| entry.as_ref().err()).map(|(name, _, _)| name.as_str()).collect();
         skipped.sort_unstable();
         assert_eq!(skipped, ["banned", "off"]);
     }
@@ -593,7 +593,7 @@ mod tests {
         let neither = server(r#"{"mcpServers":{"s":{"type":"stdio"}}}"#);
         assert!(neither.first().is_some_and(Result::is_err), "a stdio server needs a command");
         let unknown = server(r#"{"mcpServers":{"s":{"type":"carrier-pigeon","url":"x"}}}"#);
-        let (_, why) = unknown.first().and_then(|entry| entry.as_ref().err()).expect("an error");
+        let (_, why, _) = unknown.first().and_then(|entry| entry.as_ref().err()).expect("an error");
         assert!(why.contains("unknown type"), "{why}");
         let empty = server(r#"{"mcpServers":{"s":{}}}"#);
         assert!(empty.first().is_some_and(Result::is_err), "a server with neither field is not silently dropped");
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn an_unparsable_file_is_one_failure_not_a_crash() {
         let found = server("{not json");
-        let (name, why) = found.first().and_then(|entry| entry.as_ref().err()).expect("an error");
+        let (name, why, _) = found.first().and_then(|entry| entry.as_ref().err()).expect("an error");
         assert_eq!(name, "mcp.json");
         assert!(why.contains("mcp.json"), "{why}");
         let missing = tempfile::tempdir().unwrap();
@@ -666,7 +666,7 @@ mod tests {
         assert!(discover(home.path(), Some(project.path())).is_empty(), "neither file present is no server");
         fs::write(project.path().join(".mcp.json"), "{not json").unwrap();
         let found = discover(home.path(), Some(project.path()));
-        let (name, why) = found.first().and_then(|entry| entry.as_ref().err()).expect("one failure");
+        let (name, why, _) = found.first().and_then(|entry| entry.as_ref().err()).expect("one failure");
         assert_eq!(name, ".mcp.json");
         assert!(why.contains(".mcp.json"), "{why}");
     }
@@ -680,5 +680,52 @@ mod tests {
         assert_eq!(project_root(&deep), outer.path().join("repo"), "the first .git ancestor wins");
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(project_root(plain.path()), plain.path(), "no .git means the directory itself");
+    }
+    #[test]
+    fn a_project_entry_replaces_a_home_entry_by_name_whatever_its_usability() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".overseer/agent")).unwrap();
+        // The home file declares `beta` unusable and the project file revives it; a name match on
+        // usable entries only would leave two `beta` entries, and /login would pick the broken one.
+        fs::write(
+            path(home.path()),
+            r#"{"mcpServers":{"alpha":{"command":"true"},"beta":{"command":"true"}},"disabledServers":["beta"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"beta":{"command":"true"},"delta":{"command":"true","enabled":false}}}"#,
+        )
+        .unwrap();
+        let found = discover(home.path(), Some(project.path()));
+        let names: Vec<&str> = found
+            .iter()
+            .map(|entry| match entry {
+                Ok(config) => config.name.as_str(),
+                Err((name, _, _)) => name.as_str(),
+            })
+            .collect();
+        assert_eq!(names, ["alpha", "beta", "delta"], "one entry per name, no duplicates");
+        let beta = found.iter().find_map(|entry| entry.as_ref().ok().filter(|c| c.name == "beta")).unwrap();
+        assert_eq!(beta.source, Source::Project, "the project declaration revived the disabled home one");
+    }
+
+    #[test]
+    fn a_failed_project_declaration_is_an_err_just_like_a_home_one() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"broken":{"type":"stdio"},"also-broken":{"command":"true"}},"disabledServers":["also-broken"]}"#,
+        )
+        .unwrap();
+        let found = discover(home.path(), Some(project.path()));
+        let broken =
+            found.iter().find_map(|entry| entry.as_ref().err().filter(|(name, _, _)| name == "broken")).unwrap();
+        assert!(broken.1.contains("no command"), "{broken:?}");
+        let disabled =
+            found.iter().find_map(|entry| entry.as_ref().err().filter(|(name, _, _)| name == "also-broken")).unwrap();
+        assert_eq!(disabled.1, "listed in disabledServers");
     }
 }

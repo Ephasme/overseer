@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let pipelines = Arc::new(pipelines::Catalogue::load(&cfg.home));
 
     // Started before the core loop: a server that is slow to connect must not delay startup.
-    let mcp = mcp::Registry::start(&cfg.home, &ui_tx);
+    let mcp = mcp::Registry::start(&cfg.home, cfg.mcp_project, &ui_tx);
     let session_input = input_tx.clone();
     let stop = input_tx.clone();
     let quit = Arc::new(AtomicBool::new(false));

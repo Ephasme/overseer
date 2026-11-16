@@ -305,6 +305,8 @@ pub(crate) enum Event {
     Schemes,
     /// User typed `/mcp`: the server list, handled without a model call.
     Mcp,
+    /// User typed `/approve <server>`: the argument, handled without a model call.
+    Approve(String),
     /// User typed `/login <server>`: the argument, handled without a model call.
     Login(String),
     /// User typed `/pipeline <name|list|stop <id>>`: the argument, handled without a model call.
@@ -371,6 +373,11 @@ impl Event {
         }
         if let Some(arg) = line.strip_prefix("/pipeline ") {
             return Some(Event::Pipeline(arg.trim().to_string()));
+        }
+        if let Some(arg) = line.strip_prefix("/login") {
+            return Some(Event::Login(arg.trim().to_string()));
+        if let Some(arg) = line.strip_prefix("/approve") {
+            return Some(Event::Approve(arg.trim().to_string()));
         }
         if let Some(arg) = line.strip_prefix("/login") {
             return Some(Event::Login(arg.trim().to_string()));
@@ -1979,6 +1986,7 @@ mod tests {
             max_depth,
             dir: root.to_path_buf(),
             home: root.to_path_buf(),
+            mcp_project: config::McpProject::On,
         }
     }
 
