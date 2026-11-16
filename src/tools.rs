@@ -1123,6 +1123,7 @@ mod tests {
             theme: config::Theme::Auto,
             max_depth: 3,
             dir: dir.to_path_buf(),
+            rule_dir: dir.to_path_buf(),
             home: dir.to_path_buf(),
             mcp_project: config::McpProject::On,
         }

@@ -6,18 +6,26 @@ use std::path::{Path, PathBuf};
 /// The file names an agent reads as rules, relative to a directory.
 const NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", "RULES.md", ".cursorrules", ".github/copilot-instructions.md"];
 
-/// Every rule file that governs `dir`: from it up to the repository root, then the configuration's.
+/// Every rule file that governs `dir`: from the repository root (where the walk from `dir` meets a
+/// `.git`) down to `dir`, then the configuration's. Without a repository root only `dir` itself
+/// counts: rule files from arbitrary ancestors must not feed the prompt automatically.
 fn found(config_dir: &Path, dir: &Path) -> Vec<PathBuf> {
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut walk: Vec<PathBuf> = Vec::new();
+    let mut rooted = false;
     for ancestor in dir.ancestors() {
         walk.push(ancestor.to_path_buf());
         if ancestor.join(".git").exists() {
+            rooted = true;
             break;
         }
     }
-    walk.push(config_dir.to_path_buf());
-    for base in walk {
+    let bases = if rooted {
+        walk.iter().rev().map(PathBuf::as_path).chain(std::iter::once(config_dir)).collect::<Vec<_>>()
+    } else {
+        vec![dir, config_dir]
+    };
+    for base in bases {
         for name in NAMES {
             let path = base.join(name);
             let Ok(resolved) = path.canonicalize() else { continue };
@@ -26,7 +34,6 @@ fn found(config_dir: &Path, dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    seen.sort();
     seen
 }
 
@@ -92,5 +99,45 @@ mod tests {
         );
         let refused = read(&config_dir, &deep, &deep.join("notes.txt").display().to_string()).unwrap_err();
         assert!(refused.ends_with("is not a rule file"), "{refused}");
+    }
+
+    #[test]
+    fn rules_load_in_discovery_order_and_skip_unreadable_files() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let deep = repo.join("src/nested");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("AGENTS.md"), "repo root").unwrap();
+        fs::write(deep.join("AGENTS.md"), "deep dir").unwrap();
+        let config_dir = root.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("RULES.md"), "config rules").unwrap();
+
+        let rules = Rules::load(&config_dir, &deep);
+        let order: Vec<String> =
+            rules.iter().map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(order, ["AGENTS.md", "AGENTS.md", "RULES.md"], "repository root first, then deeper, then config");
+        assert!(!rules.is_empty());
+        let contents: Vec<&str> = rules.iter().filter_map(|(_, l)| l.as_ref().map(|(t, _)| t.as_str())).collect();
+        assert_eq!(contents, ["repo root", "deep dir", "config rules"]);
+
+        // A rule file the loader cannot read is skipped, not fatal. Non-UTF-8 bytes are one such
+        // refusal that holds for any user, root included.
+        let broken = repo.join("CLAUDE.md");
+        fs::write(&broken, [0xff, 0xfe]).unwrap();
+        let rules = Rules::load(&config_dir, &deep);
+        let skipped: Vec<PathBuf> = rules.iter().filter(|(_, l)| l.is_none()).map(|(p, _)| p.clone()).collect();
+        assert_eq!(skipped, [broken.canonicalize().unwrap()], "only the unreadable file is skipped");
+    }
+
+    #[test]
+    fn no_rule_files_means_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let rules = Rules::load(&config_dir, root.path());
+        assert!(rules.is_empty());
+        assert_eq!(rules.iter().count(), 0);
     }
 }

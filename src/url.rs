@@ -569,9 +569,9 @@ fn rule_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
         return Err("`rule://` needs an agent session: this caller has none".to_string());
     };
     if rest.is_empty() {
-        return Ok(rules::list(&config_dir(scope), scope.working_dir));
+        return Ok(rules::list(&scope.config.rule_dir, scope.working_dir));
     }
-    let (text, cut) = rules::read(&config_dir(scope), scope.working_dir, rest)?;
+    let (text, cut) = rules::read(&scope.config.rule_dir, scope.working_dir, rest)?;
     Ok(tools::with_note(text, cut))
 }
 

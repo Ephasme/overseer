@@ -32,6 +32,9 @@ pub(crate) struct Config {
     pub(crate) max_depth: usize,
     /// The directory the root agent starts in; children get the path `spawn_agent` names.
     pub(crate) dir: PathBuf,
+    /// The directory the configuration lives in, which `rule://` searches after the repository's own.
+    /// Resolved once at load, like `home`, so no later call re-reads the environment.
+    pub(crate) rule_dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
     /// Whether a project `.mcp.json` may start servers: `off`, `ask` (default) or `on`.
@@ -238,6 +241,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         theme,
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,
+        rule_dir: path(home).parent().map_or_else(|| home.to_path_buf(), Path::to_path_buf),
         home: home.to_path_buf(),
         mcp_project,
     })
