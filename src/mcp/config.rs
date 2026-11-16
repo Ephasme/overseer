@@ -75,7 +75,12 @@ impl fmt::Debug for AuthConfig {
             .finish()
     }
 }
-
+/// Which config file a server was read from: the home one or the project's `.mcp.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    Home,
+    Project,
+}
 #[derive(Clone)]
 pub(crate) enum Transport {
     Stdio {
@@ -123,6 +128,8 @@ pub(crate) struct ServerConfig {
     pub(crate) instructions: bool,
     pub(crate) oauth: Option<OAuthConfig>,
     pub(crate) auth: Option<AuthConfig>,
+    /// Which file the declaration came from.
+    pub(crate) source: Source,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -134,6 +141,7 @@ impl fmt::Debug for ServerConfig {
             .field("instructions", &self.instructions)
             .field("oauth", &self.oauth)
             .field("auth", &self.auth)
+            .field("source", &self.source)
             .finish()
     }
 }
@@ -207,23 +215,59 @@ struct RawAuth {
     client_secret: Option<String>,
     resource: Option<String>,
 }
-
 /// Every server the file declares: `Ok` for one to connect, `Err` for a name and why it cannot be.
 pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String)>>;
 
+
 /// Reads the server list; a missing file is an empty list, an unreadable one is one failure.
-pub(crate) fn discover(home: &Path) -> Discovery {
-    let file = path(home);
-    let text = match fs::read_to_string(&file) {
+///
+/// `project` is a directory that may hold a `.mcp.json`; its servers are merged after the home
+/// ones, and one whose name the home file already declared replaces that declaration in place.
+pub(crate) fn discover(home: &Path, project: Option<&Path>) -> Discovery {
+    let mut found = read_file(&path(home), "mcp.json");
+    if let Some(project) = project {
+        let project_servers = read_file(&project.join(".mcp.json"), ".mcp.json");
+        for entry in project_servers {
+            let name = match &entry {
+                Ok(config) => config.name.clone(),
+                Err((name, _)) => name.clone(),
+            };
+            let existing = found.iter_mut().find(|entry| entry.as_ref().is_ok_and(|c| c.name == name));
+            match existing {
+                Some(existing) => *existing = entry,
+                None => found.push(entry),
+            }
+        }
+    }
+    found
+}
+
+/// One file's server list, with the name its errors carry and the source they record.
+fn read_file(file: &Path, name: &str) -> Discovery {
+    let text = match fs::read_to_string(file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => return vec![Err(("mcp.json".to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((name.to_string(), format!("{}: {e}", file.display())))],
     };
     let raw: RawFile = match serde_json::from_str(&text) {
         Ok(raw) => raw,
-        Err(e) => return vec![Err(("mcp.json".to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((name.to_string(), format!("{}: {e}", file.display())))],
     };
-    raw.servers.into_iter().map(|(name, server)| build(name, server, &raw.disabled, &raw.force_enabled)).collect()
+    let source = if name == ".mcp.json" { Source::Project } else { Source::Home };
+    raw.servers
+        .into_iter()
+        .map(|(name, server)| build(name, server, &raw.disabled, &raw.force_enabled, source))
+        .collect()
+}
+
+/// The nearest `.git` ancestor of `dir`, or `dir` itself when there is none.
+pub(crate) fn project_root(dir: &Path) -> PathBuf {
+    for ancestor in dir.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    dir.to_path_buf()
 }
 
 fn build(
@@ -231,6 +275,7 @@ fn build(
     raw: RawServer,
     disabled: &[String],
     forced: &[String],
+    source: Source,
 ) -> Result<ServerConfig, (String, String)> {
     let fail = |why: String| Err((name.clone(), why));
     if disabled.contains(&name) {
@@ -269,6 +314,7 @@ fn build(
             client_secret: auth.client_secret.as_deref().map(expand),
             resource: auth.resource.as_deref().map(expand),
         }),
+        source,
     })
 }
 
@@ -489,7 +535,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".overseer/agent")).unwrap();
         fs::write(path(dir.path()), json).unwrap();
-        discover(dir.path())
+        discover(dir.path(), None)
     }
 
     fn only(json: &str) -> ServerConfig {
@@ -559,7 +605,7 @@ mod tests {
         assert_eq!(name, "mcp.json");
         assert!(why.contains("mcp.json"), "{why}");
         let missing = tempfile::tempdir().unwrap();
-        assert!(discover(missing.path()).is_empty(), "a missing file is no server at all");
+        assert!(discover(missing.path(), None).is_empty(), "a missing file is no server at all");
     }
 
     #[test]
@@ -589,5 +635,49 @@ mod tests {
         let launched = launch_env(&env);
         assert_eq!(launched.get("GOOD").map(String::as_str), Some("ok"));
         assert!(!launched.contains_key("BAD"), "an entry with no value is omitted, never sent empty");
+    }
+    #[test]
+    fn a_project_server_appears_and_one_with_a_home_name_replaces_the_home_one() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".overseer/agent")).unwrap();
+        fs::write(path(home.path()), r#"{"mcpServers":{"alpha":{"command":"true"},"beta":{"command":"echo home"}}}"#)
+            .unwrap();
+        fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"beta":{"url":"https://x/mcp"},"gamma":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let found = discover(home.path(), Some(project.path()));
+        let names: Vec<&str> = found.iter().filter_map(|entry| entry.as_ref().ok().map(|c| c.name.as_str())).collect();
+        assert_eq!(names, ["alpha", "beta", "gamma"], "project entries come last, a shared name replaces in place");
+        let beta = found.iter().find_map(|entry| entry.as_ref().ok().filter(|c| c.name == "beta")).unwrap();
+        assert!(matches!(beta.transport, Transport::Http { .. }), "the project declaration won");
+        assert_eq!(beta.source, Source::Project);
+        let alpha = found.iter().find_map(|entry| entry.as_ref().ok().filter(|c| c.name == "alpha")).unwrap();
+        assert_eq!(alpha.source, Source::Home);
+    }
+
+    #[test]
+    fn an_unparsable_project_file_is_one_failure_named_after_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        assert!(discover(home.path(), Some(project.path())).is_empty(), "neither file present is no server");
+        fs::write(project.path().join(".mcp.json"), "{not json").unwrap();
+        let found = discover(home.path(), Some(project.path()));
+        let (name, why) = found.first().and_then(|entry| entry.as_ref().err()).expect("one failure");
+        assert_eq!(name, ".mcp.json");
+        assert!(why.contains(".mcp.json"), "{why}");
+    }
+
+    #[test]
+    fn the_project_root_is_the_nearest_git_ancestor_or_the_directory_itself() {
+        let outer = tempfile::tempdir().unwrap();
+        let deep = outer.path().join("repo/sub");
+        fs::create_dir_all(outer.path().join("repo/.git")).unwrap();
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(project_root(&deep), outer.path().join("repo"), "the first .git ancestor wins");
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(project_root(plain.path()), plain.path(), "no .git means the directory itself");
     }
 }

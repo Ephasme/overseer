@@ -52,6 +52,8 @@ pub(crate) struct Registry {
     state: Mutex<State>,
     store: Store,
     path: PathBuf,
+    /// The project `.mcp.json` that was read, when one was; the empty summary names it.
+    project: Option<PathBuf>,
     /// One process group per server, replaced when that server reconnects, so a group whose client
     /// is gone is never signalled and a recycled pgid is never hit.
     groups: Mutex<HashMap<usize, i32>>,
@@ -64,11 +66,18 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    /// The registry a home directory describes, without connecting anything; tests use it as the
-    /// empty case, and `start` builds on it.
+    /// adds the project file, and no test should pin that merge on this path.
+    #[allow(dead_code)]
     pub(crate) fn load(home: &Path) -> Self {
+        Self::load_with(home, None)
+    }
+
+    /// The registry a home directory and, optionally, a project's `.mcp.json` describe, without
+    /// connecting anything; `start` builds on it.
+    fn load_with(home: &Path, project: Option<&Path>) -> Self {
         let path = config::path(home);
-        let servers: Vec<Server> = config::discover(home)
+        let project_file = project.map(|project| project.join(".mcp.json"));
+        let servers: Vec<Server> = config::discover(home, project)
             .into_iter()
             .map(|entry| match entry {
                 Ok(config) => Server {
@@ -97,6 +106,7 @@ impl Registry {
             state: Mutex::new(State { servers, index: HashMap::new() }),
             store: Store::load(home),
             path,
+            project: project_file,
             groups: Mutex::new(HashMap::new()),
             warnings: Mutex::new(Vec::new()),
             http,
@@ -105,7 +115,9 @@ impl Registry {
 
     /// Reads the server list and connects each server on its own thread: startup never waits.
     pub(crate) fn start(home: &Path, ui: &Sender<UiEvent>) -> Arc<Self> {
-        let registry = Arc::new(Self::load(home));
+        // The project is the working directory at launch, walked up to its nearest `.git`.
+        let project = std::env::current_dir().ok().map(|dir| config::project_root(&dir));
+        let registry = Arc::new(Self::load_with(home, project.as_deref()));
         let total = registry.servers().len();
         if total == 0 {
             let _ = ui.send(UiEvent::Notice(registry.notice()));
@@ -432,7 +444,11 @@ impl Registry {
     pub(crate) fn summary(&self) -> String {
         let state = self.guard();
         if state.servers.is_empty() {
-            return format!("no MCP servers in {}", self.path.display());
+            let named = match &self.project {
+                Some(project) => format!(" or {}", project.display()),
+                None => String::new(),
+            };
+            return format!("no MCP servers in {}{}", self.path.display(), named);
         }
         let (servers, tools, unavailable) = count(&state);
         let mut lines = vec![format!("mcp: {servers} servers, {tools} tools, {unavailable} unavailable")];
@@ -444,7 +460,13 @@ impl Registry {
                 Status::OauthRequired { .. } => format!("oauth required (/login {})", server.name),
                 Status::Failed(why) => why.lines().next().unwrap_or_default().to_string(),
             };
-            lines.push(format!("- {} {kind} {status}", server.name));
+            let from_project = if server.config.as_ref().is_some_and(|config| config.source == config::Source::Project)
+            {
+                " (project)"
+            } else {
+                ""
+            };
+            lines.push(format!("- {} {kind} {status}{from_project}", server.name));
         }
         drop(state);
         for warning in self.warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
