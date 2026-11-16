@@ -519,6 +519,36 @@ pub(crate) mod testing {
             Arc::clone(&self.0)
         }
     }
+
+    /// Records every request it sees, then delegates: a test reads back what reached the model.
+    pub(crate) struct Recording {
+        inner: Arc<dyn Llm>,
+        pub(crate) requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Recording {
+        pub(crate) fn new(inner: Arc<dyn Llm>) -> Self {
+            Self { inner, requests: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Llm for Recording {
+        fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat(messages, tools, cancel)
+        }
+
+        fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+            on_piece: &mut dyn FnMut(Piece<'_>),
+        ) -> Result<Message> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat_stream(messages, tools, cancel, on_piece)
+        }
+    }
 }
 
 #[cfg(test)]

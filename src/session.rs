@@ -266,6 +266,7 @@ mod tests {
             theme: Theme::Auto,
             max_depth: 3,
             dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
             mcp_project: config::McpProject::On,
         };
@@ -315,6 +316,7 @@ mod tests {
             theme: Theme::Auto,
             max_depth: 3,
             dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
             mcp_project: config::McpProject::On,
         };
@@ -381,6 +383,7 @@ mod tests {
             theme: Theme::Auto,
             max_depth: 3,
             dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
             mcp_project: config::McpProject::On,
         };

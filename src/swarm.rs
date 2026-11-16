@@ -10,6 +10,7 @@ use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
 use crate::repos;
+use crate::rules;
 use crate::skills;
 use crate::tools;
 use crate::url;
@@ -1656,6 +1657,9 @@ impl AgentRun<'_> {
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&config.home, self.working_dir);
+        // Discovered once per agent, like the skills: a rule file changed mid-session reaches the
+        // agent through `rule://`.
+        let rules = rules::Rules::load(&config.rule_dir, self.working_dir);
         let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the agent.
         while let Some(input) = control.next(instructions) {
@@ -1674,6 +1678,7 @@ impl AgentRun<'_> {
                     policy: &policy,
                     children: tree.children(self.id),
                     skills: &skills,
+                    rules: &rules,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
                     profile,
@@ -1989,6 +1994,7 @@ mod tests {
             theme: config::Theme::Auto,
             max_depth,
             dir: root.to_path_buf(),
+            rule_dir: root.join("overseer").clone(),
             home: root.to_path_buf(),
             mcp_project: config::McpProject::On,
         }
@@ -2379,7 +2385,7 @@ mod tests {
             parent: Some(1),
             depth: 1,
             max_depth: 3,
-            dir: Path::new("/tmp"),
+            dir: home.path(),
             policy: &policy,
             profile: None,
             role: profiles::Role::Worker,
@@ -2387,6 +2393,7 @@ mod tests {
             children: vec![3],
             skills: &skills,
             mcp: &mcp,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             root: false,
         };
         let rendered = prompt::agent_prompt(&facts);
@@ -2439,6 +2446,37 @@ mod tests {
         let deepest = advertised(&narrow, 0);
         assert!(!deepest.contains(&prompt::SPAWN_AGENT.to_string()), "spawn_agent offered with no depth left");
         assert!(deepest.contains(&prompt::MESSAGE_AGENT.to_string()));
+    }
+
+    /// The rule files of the directory an agent starts in reach its system prompt without anyone
+    /// reading them: the first recorded request's system message carries the file's text and path.
+    #[test]
+    fn the_rules_of_the_root_directory_reach_the_first_request() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("AGENTS.md"), "be brief").unwrap();
+        fs::create_dir(root.path().join("logs")).unwrap();
+        let (sender, queue) = mpsc::channel();
+        let recording = Arc::new(llm::testing::Recording::new(Arc::new(Scripted::new(vec![text("hi")]))));
+        let llm: Arc<dyn llm::Llm> = recording.clone();
+        let models = Arc::new(llm::testing::Fixed(llm));
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            models,
+            Arc::new(profiles::Catalogue::default()),
+            Arc::new(pipelines::Catalogue::default()),
+            Arc::new(test_config(root.path(), 3)),
+            root.path().join("logs"),
+            sender,
+            Arc::new(mcp::Registry::load(root.path())),
+        )));
+        Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
+        assert_eq!(swarm.lock().unwrap().tell_root("go").unwrap(), format!("sent to {}", codename(1)));
+        let _ = next_event(&queue);
+        let requests = recording.requests.lock().unwrap().clone();
+        let system = requests[0].iter().find(|m| m.role == "system").unwrap();
+        let content = system.content.as_deref().unwrap();
+        let path = fs::canonicalize(root.path()).unwrap().join("AGENTS.md").display().to_string();
+        assert!(content.contains("be brief"), "{content}");
+        assert!(content.contains(&path), "{content}");
     }
 
     #[test]
