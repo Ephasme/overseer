@@ -21,6 +21,7 @@ roots = ["~/code"]                    # repositories under these are listed for 
 base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions endpoint
 model = "gpt-4.1"
 theme = "auto"                        # auto | dark | light | mono; omitted means auto
+compaction = { context_window = 200000 } # optional: see below
 ```
 
 The first three keys are required; `theme` is optional. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
@@ -28,6 +29,8 @@ The first three keys are required; `theme` is optional. `auto` follows a non-emp
 ```sh
 OVERSEER_API_KEY=...
 ```
+
+`compaction` decides when a conversation's oldest messages are summarized so the model keeps working past its context window. It is on by default and compacts nothing until you name `context_window` or `threshold_tokens`: the trigger is the window minus the larger of 15% of it and `reserve_tokens` (16384), or `threshold_tokens` alone when you set it. `keep_recent_tokens` (20000) is how much of the newest conversation is never summarized, and `enabled = false` turns the whole thing off. `/compact [id]` forces one at the agent's next safe point. A summary call that fails is logged and the turn carries on un-compacted.
 
 ## Run
 

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +17,80 @@ struct RawConfig {
     theme: Option<String>,
     max_depth: Option<usize>,
     dir: Option<String>,
+    compaction: Option<RawCompaction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompaction {
+    enabled: Option<bool>,
+    /// The model's context window in tokens; 0 means unknown.
+    context_window: Option<u64>,
+    /// A fixed trigger threshold; negative means derive it from the window.
+    threshold_tokens: Option<i64>,
+    keep_recent_tokens: Option<u64>,
+    reserve_tokens: Option<u64>,
+}
+
+/// How and when conversation history is compacted into a summary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionSettings {
+    pub(crate) enabled: bool,
+    pub(crate) context_window: u64,
+    pub(crate) threshold_tokens: i64,
+    pub(crate) keep_recent_tokens: u64,
+    pub(crate) reserve_tokens: u64,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            context_window: 0,
+            threshold_tokens: -1,
+            keep_recent_tokens: 20_000,
+            reserve_tokens: 16_384,
+        }
+    }
+}
+
+impl CompactionSettings {
+    /// The token count above which history is compacted, or `None` when compaction is off.
+    ///
+    /// A fixed `threshold_tokens` overrides the window math; otherwise the threshold is the
+    /// window minus the larger of 15% of the window and `reserve_tokens`.
+    pub(crate) fn threshold(&self) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        if self.threshold_tokens > 0 {
+            let fixed = u64::try_from(self.threshold_tokens).unwrap_or(u64::MAX);
+            return Some(if self.context_window > 0 {
+                fixed.min(self.context_window.saturating_sub(1))
+            } else {
+                fixed
+            });
+        }
+        if self.context_window > 0 {
+            let reserve = self.context_window * 15 / 100;
+            let reserve = reserve.max(self.reserve_tokens);
+            return Some(self.context_window.saturating_sub(reserve));
+        }
+        None
+    }
+}
+
+impl From<RawCompaction> for CompactionSettings {
+    fn from(raw: RawCompaction) -> Self {
+        let default = CompactionSettings::default();
+        Self {
+            enabled: raw.enabled.unwrap_or(default.enabled),
+            context_window: raw.context_window.unwrap_or(default.context_window),
+            threshold_tokens: raw.threshold_tokens.unwrap_or(default.threshold_tokens),
+            keep_recent_tokens: raw.keep_recent_tokens.unwrap_or(default.keep_recent_tokens),
+            reserve_tokens: raw.reserve_tokens.unwrap_or(default.reserve_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +106,7 @@ pub(crate) struct Config {
     pub(crate) dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+    pub(crate) compaction: CompactionSettings,
 }
 
 /// Delegations allowed below the root when `config.toml` names no `max_depth`.
@@ -78,7 +153,8 @@ pub(crate) fn describe(cfg: &Config) -> String {
 }
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
-pub(crate) const SETTINGS: &[&str] = &["roots", "base_url", "model", "theme", "max_depth", "dir", "home", "state_dir"];
+pub(crate) const SETTINGS: &[&str] =
+    &["roots", "base_url", "model", "theme", "max_depth", "dir", "compaction", "home", "state_dir"];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -89,6 +165,14 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "theme" => cfg.theme.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
         "dir" => cfg.dir.display().to_string(),
+        "compaction" => format!(
+            "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={}",
+            cfg.compaction.enabled,
+            cfg.compaction.context_window,
+            cfg.compaction.threshold_tokens,
+            cfg.compaction.keep_recent_tokens,
+            cfg.compaction.reserve_tokens
+        ),
         "home" => cfg.home.display().to_string(),
         "state_dir" => state_dir(&cfg.home).display().to_string(),
         other => return Err(format!("unknown setting {other}; settings are {}", SETTINGS.join(", "))),
@@ -203,6 +287,7 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,
         home: home.to_path_buf(),
+        compaction: raw.compaction.map_or_else(CompactionSettings::default, CompactionSettings::from),
     })
 }
 

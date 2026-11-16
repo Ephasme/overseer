@@ -146,6 +146,18 @@ pub(crate) fn run(
                 let _ = ui.send(UiEvent::Agents(agents));
                 let _ = ui.send(UiEvent::Busy(busy));
             }
+            Event::Compact(arg) => {
+                let (result, agents) = {
+                    let mut tree = lock(&swarm);
+                    let result = tree.compact(&arg);
+                    (result, tree.snapshot())
+                };
+                let _ = ui.send(match result {
+                    Ok(line) => UiEvent::Notice(line),
+                    Err(line) => UiEvent::Error(line),
+                });
+                let _ = ui.send(UiEvent::Agents(agents));
+            }
             Event::Stop { id } => {
                 let (result, agents, busy) = {
                     let mut tree = lock(&swarm);
@@ -216,6 +228,13 @@ pub(crate) fn run(
                     break;
                 }
             }
+            Event::Compacted { id, before, after, over_band } => {
+                let mut line = format!("compacted agent-{id}: {before} → {after} tokens");
+                if over_band {
+                    line.push_str("; still above the recovery band");
+                }
+                let _ = ui.send(UiEvent::Notice(line));
+            }
             Event::User(text) => {
                 draining = false;
                 // The guard must not outlive `tell_root`: a `match` scrutinee's temporary lives for
@@ -250,6 +269,47 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// A compaction reaches the user as a notice, with the recovery band named when it applies.
+    #[test]
+    fn a_compaction_reaches_the_user_as_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            compaction: crate::config::CompactionSettings::default(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let frontend = input.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(Arc::new(Scripted::new(Vec::new())))),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        frontend.send(Event::Compacted { id: 1, before: 900, after: 100, over_band: false }).unwrap();
+        assert_eq!(next_notice(&ui_rx), "compacted agent-1: 900 → 100 tokens");
+        frontend.send(Event::Compacted { id: 2, before: 900, after: 800, over_band: true }).unwrap();
+        assert_eq!(next_notice(&ui_rx), "compacted agent-2: 900 → 800 tokens; still above the recovery band");
+        frontend.send(Event::Eof).unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
     /// The whole wire: a user line reaches the root, its answer comes back, and the frontend quits.
     #[test]
     fn a_users_line_reaches_the_root_and_its_answer_comes_back() {
@@ -263,6 +323,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -311,6 +372,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -376,6 +438,7 @@ mod tests {
             max_depth: 3,
             dir: root.path().to_path_buf(),
             home: root.path().to_path_buf(),
+            compaction: crate::config::CompactionSettings::default(),
         };
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -411,6 +474,18 @@ mod tests {
     }
 
     /// The first answer the frontend prints; on a timeout it names everything else that arrived.
+    /// The first notice about a compaction: startup notices come before it.
+    fn next_notice(ui: &Receiver<UiEvent>) -> String {
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match ui.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiEvent::Notice(text)) if text.starts_with("compacted ") => return text,
+                Ok(event) => seen.push(format!("{event:?}")),
+                Err(e) => panic!("no notice reached the frontend ({e}); it saw {seen:?}"),
+            }
+        }
+    }
+
     fn next_answer(ui: &Receiver<UiEvent>) -> String {
         let mut seen: Vec<String> = Vec::new();
         loop {

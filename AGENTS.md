@@ -57,6 +57,7 @@
 | `src/forge.rs` | `gh` and `glab` invocations, behind `issue://`, `pr://` and `mr://` |
 | `src/url.rs` | internal URIs: the scheme table, `/schemes`, and what a `scheme://…` path resolves to |
 | `src/llm.rs` | chat-completions wire types, SSE streaming, `StreamLlm`, `testing::Scripted` |
+| `src/compaction.rs` | summarizing the oldest messages: the cut point, the serialized request, the injected `<summary>` message |
 | `src/config.rs` | `config.toml`, roots, `max_depth`, the root's `dir`, `home`, `resolve_dir`, state directory, `io_error` |
 | `.github/workflows/ci.yml` | checks; on a `v*` tag: build, release, Homebrew formula update |
 | `.github/scripts/update-formula.sh` | rewrites the tap's formula from a release |
@@ -80,6 +81,8 @@
 - `close` sends an agent's final report and closes it; the owner re-opens it with an instruction, and only the owner archives it. An archived agent leaves the user's default view; its entry, id and log stay.
 - A conflict id belongs to one agent's `conflict::Registry`, not the process: ids never collide across agents, and a resolved id stays dead so a stale write fails loudly. A resolution splices out the marker lines only, keeping the code around them.
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
+- Compaction's trigger lives in `config::CompactionSettings::threshold` alone; `compaction::should_compact` delegates to it. The cut never passes the current turn's user message, so `Turn::run`'s `history.truncate(base)` rollback stays exact: a turn larger than the window is not compacted, and the next turn reclaims it. A summary message is `Message::summary`, tested by `summary.is_some()`; both `usage` and `summary` are `#[serde(skip)]`, so neither reaches the wire.
+- A compaction failure never fails a turn: `Compaction::run` answers `CompactionOutcome::Failed`, `AgentRun` logs `= Compaction failed: …` and the turn runs on un-compacted.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
 - Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build`, a background `bash` job or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.

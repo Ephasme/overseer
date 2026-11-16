@@ -1,6 +1,7 @@
 mod agent;
 mod artifacts;
 mod clipboard;
+mod compaction;
 mod config;
 mod conflict;
 mod diff;

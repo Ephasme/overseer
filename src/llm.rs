@@ -21,6 +21,16 @@ fn excerpt(body: &str) -> String {
     format!("{}…", body.get(..end).unwrap_or_default())
 }
 
+/// What the provider reported for one model call, when it reports usage at all. Field names are
+/// the wire's own, so the response deserializes without a rename table.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Usage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+}
+
 /// One chat message in the chat-completions wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Message {
@@ -31,11 +41,26 @@ pub(crate) struct Message {
     pub(crate) tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
+    /// The usage the provider reported for this assistant message. Never serialized: it is
+    /// bookkeeping, not wire format.
+    #[serde(skip)]
+    pub(crate) usage: Option<Usage>,
+    /// The raw summary body when this message is an injected compaction summary; `content` then
+    /// holds the rendered wrapper. `summary.is_some()` is the test that a message is a summary.
+    #[serde(skip)]
+    pub(crate) summary: Option<String>,
 }
 
 impl Message {
     fn new(role: &str, content: String) -> Self {
-        Self { role: role.into(), content: Some(content), tool_calls: None, tool_call_id: None }
+        Self {
+            role: role.into(),
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+            usage: None,
+            summary: None,
+        }
     }
     pub(crate) fn system(content: String) -> Self {
         Self::new("system", content)
@@ -45,6 +70,18 @@ impl Message {
     }
     pub(crate) fn tool(tool_call_id: &str, content: String) -> Self {
         Self { tool_call_id: Some(tool_call_id.into()), ..Self::new("tool", content) }
+    }
+    /// An injected compaction summary: `body` is the raw text the summarizer produced, `rendered`
+    /// the wrapper sent to the model.
+    pub(crate) fn summary(body: String, rendered: String) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(rendered),
+            tool_calls: None,
+            tool_call_id: None,
+            usage: None,
+            summary: Some(body),
+        }
     }
 }
 
@@ -81,8 +118,20 @@ pub(crate) enum Piece<'a> {
 
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
-    /// `cancel` is the owner's interrupt flag, read between streamed lines.
     fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message>;
+
+    /// The same call with a token cap on the reply, used for the compaction summary. A backend
+    /// without a cap ignores it.
+    fn chat_capped(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        max_tokens: u64,
+    ) -> Result<Message> {
+        let _ = max_tokens;
+        self.chat(messages, tools, cancel)
+    }
 
     /// The same call, reporting pieces as they arrive. A backend without streaming reports them once.
     fn chat_stream(
@@ -189,7 +238,18 @@ impl OpenAiClient {
 
 impl Llm for OpenAiClient {
     fn chat(&self, messages: &[Message], tools: &Value, _cancel: Option<&AtomicBool>) -> Result<Message> {
-        let body = self.post(messages, tools, false)?;
+        let body = self.post(messages, tools, None, false)?;
+        parse_response(&body)
+    }
+
+    fn chat_capped(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        _cancel: Option<&AtomicBool>,
+        max_tokens: u64,
+    ) -> Result<Message> {
+        let body = self.post(messages, tools, Some(max_tokens), false)?;
         parse_response(&body)
     }
 
@@ -200,7 +260,7 @@ impl Llm for OpenAiClient {
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
     ) -> Result<Message> {
-        let response = self.send(messages, tools, true)?;
+        let response = self.send(messages, tools, None, true)?;
         let streamed = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -218,8 +278,8 @@ impl Llm for OpenAiClient {
 }
 
 impl OpenAiClient {
-    fn post(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<String> {
-        let response = self.send(messages, tools, stream)?;
+    fn post(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Result<String> {
+        let response = self.send(messages, tools, max_tokens, stream)?;
         let status = response.status();
         let body = response.text().context("reading model response failed")?;
         if !status.is_success() {
@@ -228,7 +288,7 @@ impl OpenAiClient {
         Ok(body)
     }
 
-    fn payload(&self, messages: &[Message], tools: &Value, stream: bool) -> Value {
+    fn payload(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Value {
         let mut payload =
             json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
         if let Some(effort) = &self.effort
@@ -236,11 +296,27 @@ impl OpenAiClient {
         {
             object.insert("reasoning_effort".into(), Value::String(effort.clone()));
         }
+        if let Some(max_tokens) = max_tokens
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("max_tokens".into(), Value::from(max_tokens));
+        }
+        // OpenAI reports no usage on a stream without this; a provider that ignores the option
+        // simply yields no usage, and the token estimate covers that.
+        if stream && let Some(object) = payload.as_object_mut() {
+            object.insert("stream_options".into(), json!({ "include_usage": true }));
+        }
         payload
     }
 
-    fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = self.payload(messages, tools, stream);
+    fn send(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        max_tokens: Option<u64>,
+        stream: bool,
+    ) -> Result<reqwest::blocking::Response> {
+        let payload = self.payload(messages, tools, max_tokens, stream);
         if let Some(sink) = &self.debug {
             sink(&payload.to_string());
         }
@@ -263,6 +339,7 @@ impl OpenAiClient {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -273,18 +350,21 @@ struct Choice {
 fn parse_response(body: &str) -> Result<Message> {
     let response: ChatResponse =
         serde_json::from_str(body).with_context(|| format!("unexpected model response: {}", excerpt(body)))?;
-    response.choices.into_iter().next().map(|c| c.message).context("model response has no choices")
+    let mut message =
+        response.choices.into_iter().next().map(|c| c.message).context("model response has no choices")?;
+    message.usage = response.usage;
+    Ok(message)
 }
 
-/// One `data:` line of a chat-completions stream.
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
     /// A provider reports a mid-stream failure here, with no choices.
     error: Option<serde_json::Value>,
+    usage: Option<Usage>,
 }
-
+/// One `data:` line of a chat-completions stream.
 #[derive(Deserialize)]
 struct StreamChoice {
     /// Which of the request's `n` answers this chunk belongs to; only the first is kept.
@@ -329,6 +409,7 @@ fn read_stream(
 ) -> Result<Message> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
+    let mut usage: Option<Usage> = None;
     let mut complete = false;
     for line in reader.lines() {
         if cancelled(cancel) {
@@ -372,6 +453,9 @@ fn read_stream(
                 merge_fragment(&mut calls, fragment)?;
             }
         }
+        if chunk.usage.is_some() {
+            usage = chunk.usage;
+        }
     }
     if !complete {
         bail!("model stream ended before it finished");
@@ -389,7 +473,7 @@ fn read_stream(
     }
     let tool_calls = (!calls.is_empty()).then_some(calls);
     let content = (!content.is_empty()).then_some(content);
-    Ok(Message { role: "assistant".into(), content, tool_calls, tool_call_id: None })
+    Ok(Message { role: "assistant".into(), content, tool_calls, tool_call_id: None, usage, summary: None })
 }
 
 fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
@@ -447,6 +531,17 @@ impl Llm for StreamLlm {
         self.chat_stream(messages, tools, cancel, &mut |_| ())
     }
 
+    fn chat_capped(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        max_tokens: u64,
+    ) -> Result<Message> {
+        // A summary is not shown as it streams; the cap is forwarded to the inner client.
+        self.inner.chat_capped(messages, tools, cancel, max_tokens)
+    }
+
     fn chat_stream(
         &self,
         messages: &[Message],
@@ -485,11 +580,20 @@ pub(crate) mod testing {
             content: None,
             tool_calls: Some(vec![tool_call(id, name, args)]),
             tool_call_id: None,
+            usage: None,
+            summary: None,
         }
     }
 
     pub(crate) fn text(content: &str) -> Message {
-        Message { role: "assistant".into(), content: Some(content.into()), tool_calls: None, tool_call_id: None }
+        Message {
+            role: "assistant".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            usage: None,
+            summary: None,
+        }
     }
 
     /// Returns scripted replies in order; errors once exhausted.
@@ -720,10 +824,10 @@ mod tests {
     fn a_request_carries_the_effort_only_when_one_is_set() {
         let http = reqwest::blocking::Client::new();
         let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None);
-        let body = plain.payload(&[], &json!([]), false);
+        let body = plain.payload(&[], &json!([]), None, false);
         assert!(body.get("reasoning_effort").is_none());
         let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None);
-        let body = effortful.payload(&[], &json!([]), false);
+        let body = effortful.payload(&[], &json!([]), None, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["model"], "m");
     }
@@ -735,5 +839,53 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
         assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
         assert!(!Arc::ptr_eq(&first, &backend.get(None, Some("high"))));
+    }
+
+    #[test]
+    fn a_whole_response_reports_its_usage() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],
+            "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
+        let message = parse_response(body).unwrap();
+        assert_eq!(message.usage, Some(Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }));
+    }
+
+    #[test]
+    fn a_stream_reports_the_usage_of_its_last_chunk() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,",
+            "\"total_tokens\":6}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
+        assert_eq!(message.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }));
+    }
+
+    #[test]
+    fn a_response_without_usage_carries_none() {
+        let message = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#).unwrap();
+        assert_eq!(message.usage, None);
+        let sse =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap().usage, None);
+    }
+
+    #[test]
+    fn usage_is_asked_for_on_a_stream_and_only_there() {
+        let client =
+            OpenAiClient::new(reqwest::blocking::Client::new(), "http://x/v1", "k".into(), "m".into(), None, None);
+        assert!(client.payload(&[], &json!([]), None, false).get("stream_options").is_none());
+        assert_eq!(client.payload(&[], &json!([]), None, true)["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn a_capped_call_carries_its_cap_and_the_default_ignores_it() {
+        let client =
+            OpenAiClient::new(reqwest::blocking::Client::new(), "http://x/v1", "k".into(), "m".into(), None, None);
+        assert_eq!(client.payload(&[], &json!([]), Some(64), false)["max_tokens"], 64);
+        assert!(client.payload(&[], &json!([]), None, false).get("max_tokens").is_none());
+        let scripted = testing::Scripted::new(vec![testing::text("hi")]);
+        let reply = scripted.chat_capped(&[], &json!([]), None, 5).unwrap();
+        assert_eq!(reply.content.as_deref(), Some("hi"), "a backend with no cap answers anyway");
     }
 }
