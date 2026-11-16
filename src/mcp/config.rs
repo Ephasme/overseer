@@ -224,15 +224,18 @@ pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String)>>;
 /// `project` is a directory that may hold a `.mcp.json`; its servers are merged after the home
 /// ones, and one whose name the home file already declared replaces that declaration in place.
 pub(crate) fn discover(home: &Path, project: Option<&Path>) -> Discovery {
-    let mut found = read_file(&path(home), "mcp.json");
+    let mut found = read_file(&path(home), "mcp.json", Source::Home);
     if let Some(project) = project {
-        let project_servers = read_file(&project.join(".mcp.json"), ".mcp.json");
+        let project_servers = read_file(&project.join(".mcp.json"), ".mcp.json", Source::Project);
         for entry in project_servers {
             let name = match &entry {
                 Ok(config) => config.name.clone(),
                 Err((name, _)) => name.clone(),
             };
-            let existing = found.iter_mut().find(|entry| entry.as_ref().is_ok_and(|c| c.name == name));
+            let existing = found.iter_mut().find(|entry| match entry.as_ref() {
+                Ok(config) => config.name == name,
+                Err((existing, _)) => *existing == name,
+            });
             match existing {
                 Some(existing) => *existing = entry,
                 None => found.push(entry),
@@ -243,17 +246,16 @@ pub(crate) fn discover(home: &Path, project: Option<&Path>) -> Discovery {
 }
 
 /// One file's server list, with the name its errors carry and the source they record.
-fn read_file(file: &Path, name: &str) -> Discovery {
+fn read_file(file: &Path, label: &str, source: Source) -> Discovery {
     let text = match fs::read_to_string(file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => return vec![Err((name.to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display())))],
     };
     let raw: RawFile = match serde_json::from_str(&text) {
         Ok(raw) => raw,
-        Err(e) => return vec![Err((name.to_string(), format!("{}: {e}", file.display())))],
+        Err(e) => return vec![Err((label.to_string(), format!("{}: {e}", file.display())))],
     };
-    let source = if name == ".mcp.json" { Source::Project } else { Source::Home };
     raw.servers
         .into_iter()
         .map(|(name, server)| build(name, server, &raw.disabled, &raw.force_enabled, source))

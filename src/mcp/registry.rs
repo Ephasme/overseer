@@ -66,7 +66,8 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    /// adds the project file, and no test should pin that merge on this path.
+    /// The home-only registry, which the tests build on: it never reads a project file, so no
+    /// test pins the project merge on this path.
     #[allow(dead_code)]
     pub(crate) fn load(home: &Path) -> Self {
         Self::load_with(home, None)
