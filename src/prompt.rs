@@ -28,6 +28,10 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     tools::READ_FILE,
     tools::WRITE_FILE,
     tools::EDIT,
+    tools::GLOB,
+    tools::GREP,
+    tools::PYTHON,
+    tools::BUN,
     SPAWN_AGENT,
     MESSAGE_AGENT,
     CONTROL_AGENT,
@@ -291,7 +295,7 @@ Depth: you are at depth {} and agents may be nested to depth {} (config `max_dep
         "Ownership is one way: you may message, pause, resume or stop any agent below you, and nobody below you may do any of that to you. You cannot command your parent, your siblings, or any agent outside your own subtree.\n\
 Your rights are fixed: nothing can widen or narrow them while you run, and the same holds for the agents you own.\n\
 Messages that start with [agent N · <name> ...] come from an agent you own, and a renamed agent shows its new name there: \"says\" is a progress note or a question, \"finished\" carries its final report, \"failed\" an error, \"interrupted\" a turn you cut short. Answer a question yourself when you can.\n\
-Searching: `rg` (or `git grep`) scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
+Searching: the `glob` and `grep` tools first; `rg` (or `git grep`) through `bash` only for a flag the tools lack, scoped to the project, never a bare recursive grep over a code root — vendored trees (`.venv`, `node_modules`, `target`) make that take minutes.\n\
 If you need a decision to continue, end your turn with the question as your final answer.\n",
     );
     let defs = agent_tool_definitions(facts.mcp, &policy, remaining);
