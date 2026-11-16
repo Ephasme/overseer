@@ -1,11 +1,15 @@
+use crate::approvals;
+use crate::bounds;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Wall clock for the whole session, in seconds.\n# max_time = 3600\n# Spend ceiling in USD.\n# max_cost = 5.0\n# USD per 1M tokens, keyed by the exact model string.\n# [pricing.\"gpt-4.1\"]\n# in = 2.0\n# out = 8.0\n# Where the root agent starts.\ndir = \"~/code\"\n# compaction = { enabled = true, context_window = 200000, keep_recent_tokens = 20000, reserve_tokens = 16384 }\n# ask | cached-ask | write | yolo: gate bash, write_file and edit.\n# approvals = \"ask\"";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +21,25 @@ struct RawConfig {
     theme: Option<String>,
     max_depth: Option<usize>,
     dir: Option<String>,
+    /// Omitted means `ask`.
+    approvals: Option<String>,
+    /// Omitted means `ask`: whether a project `.mcp.json` may start servers.
+    mcp_project: Option<String>,
+    /// Whole seconds of wall clock for the session.
+    max_time: Option<u64>,
+    /// Spend ceiling in USD.
+    max_cost: Option<f64>,
+    pricing: Option<HashMap<String, RawPrice>>,
     compaction: Option<RawCompaction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPrice {
+    #[serde(rename = "in")]
+    input: f64,
+    #[serde(rename = "out")]
+    output: f64,
 }
 
 #[derive(Deserialize)]
@@ -104,9 +126,51 @@ pub(crate) struct Config {
     pub(crate) max_depth: usize,
     /// The directory the root agent starts in; children get the path `spawn_agent` names.
     pub(crate) dir: PathBuf,
+    /// The directory the configuration lives in, which `rule://` searches after the repository's own.
+    /// Resolved once at load, like `home`, so no later call re-reads the environment.
+    pub(crate) rule_dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+    /// The tool-call approval tier, from `approvals`.
+    pub(crate) approvals: approvals::Tier,
+    /// Whether a project `.mcp.json` may start servers: `off`, `ask` (default) or `on`.
+    pub(crate) mcp_project: McpProject,
+    /// Whole seconds of wall clock for the session; `None` runs unbounded.
+    pub(crate) max_time: Option<Duration>,
+    /// Spend ceiling in USD; `None` runs unbounded.
+    pub(crate) max_cost: Option<f64>,
+    /// USD per 1M tokens, keyed by the exact model string.
+    pub(crate) pricing: HashMap<String, bounds::Price>,
+    /// How and when the oldest messages are summarized.
     pub(crate) compaction: CompactionSettings,
+}
+
+/// The gate on a project's `.mcp.json`: cloning into an untrusted repository must not start
+/// arbitrary commands. `ask` lists project servers unapproved and one `/approve` starts it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum McpProject {
+    Off,
+    Ask,
+    On,
+}
+
+impl McpProject {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "ask" => Ok(Self::Ask),
+            "on" => Ok(Self::On),
+            other => bail!("mcp_project {other:?} is not off, ask or on"),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ask => "ask",
+            Self::On => "on",
+        }
+    }
 }
 
 /// Delegations allowed below the root when `config.toml` names no `max_depth`.
@@ -153,8 +217,21 @@ pub(crate) fn describe(cfg: &Config) -> String {
 }
 
 /// The settings `cfg://<key>` reads, in the order [`describe`] prints them.
-pub(crate) const SETTINGS: &[&str] =
-    &["roots", "base_url", "model", "theme", "max_depth", "dir", "compaction", "home", "state_dir"];
+pub(crate) const SETTINGS: &[&str] = &[
+    "roots",
+    "base_url",
+    "model",
+    "theme",
+    "approvals",
+    "max_depth",
+    "max_time",
+    "max_cost",
+    "dir",
+    "compaction",
+    "home",
+    "state_dir",
+    "mcp_project",
+];
 
 /// One effective setting, or why the key names none.
 pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
@@ -163,7 +240,11 @@ pub(crate) fn value(cfg: &Config, key: &str) -> Result<String, String> {
         "base_url" => redact(&cfg.base_url),
         "model" => cfg.model.clone(),
         "theme" => cfg.theme.name().to_string(),
+        "approvals" => cfg.approvals.name().to_string(),
+        "mcp_project" => cfg.mcp_project.name().to_string(),
         "max_depth" => cfg.max_depth.to_string(),
+        "max_time" => cfg.max_time.map_or_else(|| "unset".to_string(), |time| time.as_secs().to_string()),
+        "max_cost" => cfg.max_cost.map_or_else(|| "unset".to_string(), |cost| format!("${cost}")),
         "dir" => cfg.dir.display().to_string(),
         "compaction" => format!(
             "enabled={} context_window={} threshold_tokens={} keep_recent_tokens={} reserve_tokens={} threshold={}",
@@ -269,6 +350,11 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
     if raw.base_url.trim().is_empty() || raw.model.trim().is_empty() {
         bail!("base_url and model must not be empty");
     }
+    if let Some(max_cost) = raw.max_cost
+        && (!max_cost.is_finite() || max_cost <= 0.0)
+    {
+        bail!("max_cost must be a positive number of dollars, got {max_cost:?}");
+    }
     let mut roots = Vec::new();
     for root in &raw.roots {
         let path = expand_home(root, home);
@@ -279,18 +365,57 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots.push(canonical);
     }
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
+    let approvals = raw
+        .approvals
+        .as_deref()
+        .map_or(Ok(approvals::Tier::Ask), |text| approvals::Tier::parse(text).map_err(anyhow::Error::msg))?;
     // The root works in the user's home, not in the world-writable directory a child falls back to.
     let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
+    // `ask` is the gate: a cloned repository must not start commands without the user's say.
+    let mcp_project = raw.mcp_project.as_deref().map_or(Ok(McpProject::Ask), McpProject::parse)?;
+    let pricing = match raw.pricing {
+        None => HashMap::new(),
+        Some(table) => table
+            .into_iter()
+            .map(|(model, price)| {
+                for (key, value) in [("in", price.input), ("out", price.output)] {
+                    if !value.is_finite() || value <= 0.0 {
+                        bail!("pricing {model:?} {key} must be a positive USD per 1M tokens, got {value:?}");
+                    }
+                }
+                Ok((model, bounds::Price { input: price.input, output: price.output }))
+            })
+            .collect::<Result<HashMap<String, bounds::Price>>>()?,
+    };
     Ok(Config {
         roots,
         base_url: raw.base_url,
         model: raw.model,
+        approvals,
         theme,
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,
+        rule_dir: path(home).parent().map_or_else(|| home.to_path_buf(), Path::to_path_buf),
         home: home.to_path_buf(),
+        mcp_project,
+        max_time: raw.max_time.map(Duration::from_secs),
+        max_cost: raw.max_cost,
+        pricing,
         compaction: raw.compaction.map_or_else(CompactionSettings::default, CompactionSettings::from),
     })
+}
+
+/// Models a `max_cost` session would bill but the pricing table does not name: `cfg.model` plus
+/// every profile's model, deduplicated and sorted. Empty when there is no cost bound at all.
+pub(crate) fn unpriced(cfg: &Config, models: &[String]) -> Vec<String> {
+    if cfg.max_cost.is_none() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = models.iter().chain(std::iter::once(&cfg.model)).cloned().collect();
+    names.sort();
+    names.dedup();
+    names.retain(|model| !cfg.pricing.contains_key(model));
+    names
 }
 
 fn expand_home(path: &str, home: &Path) -> PathBuf {
@@ -444,5 +569,67 @@ model = "m"
 dir = "/nonexistent/x""#;
         let error = parse(text, Path::new("/Users/nobody")).unwrap_err().to_string();
         assert!(error.contains("/nonexistent/x"), "{error}");
+    }
+
+    #[test]
+    fn max_time_max_cost_and_pricing_are_read_when_present() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+max_time = 60
+max_cost = 2.5
+[pricing."gpt-4.1"]
+in = 3.0
+out = 15.0"#;
+        let home = tempfile::tempdir().unwrap();
+        let resolved = parse(text, home.path()).unwrap();
+        assert_eq!(resolved.max_time, Some(Duration::from_secs(60)));
+        assert_eq!(resolved.max_cost, Some(2.5));
+        let price = resolved.pricing.get("gpt-4.1").unwrap();
+        assert_eq!(price.input, 3.0);
+        assert_eq!(price.output, 15.0);
+        assert!(!resolved.pricing.contains_key("missing"));
+    }
+
+    #[test]
+    fn bounds_and_pricing_default_when_absent() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m""#;
+        let home = tempfile::tempdir().unwrap();
+        let resolved = parse(text, home.path()).unwrap();
+        assert_eq!(resolved.max_time, None);
+        assert_eq!(resolved.max_cost, None);
+        assert!(resolved.pricing.is_empty());
+    }
+
+    #[test]
+    fn unpriced_lists_only_the_models_the_table_omits() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "gpt-4.1"
+max_cost = 2.5
+[pricing."gpt-4.1"]
+in = 3.0
+out = 15.0"#;
+        let home = tempfile::tempdir().unwrap();
+        let cfg = parse(text, home.path()).unwrap();
+        let models = vec!["gpt-4.1".to_string(), "main/coding".to_string(), "a-cheap".to_string()];
+        assert_eq!(unpriced(&cfg, &models), ["a-cheap", "main/coding"]);
+        // No cost bound, no notice, whatever the table holds.
+        let unbounded = Config { max_cost: None, ..cfg.clone() };
+        assert_eq!(unpriced(&unbounded, &models), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_pricing_table_refuses_unknown_keys() {
+        let text = r#"roots = ["/tmp"]
+base_url = "http://localhost:8080/v1"
+model = "m"
+[pricing."gpt-4.1"]
+input = 3.0
+output = 15.0"#;
+        let error = parse(text, tempfile::tempdir().unwrap().path()).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
     }
 }

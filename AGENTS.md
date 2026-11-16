@@ -30,16 +30,18 @@
 | `src/main.rs` | picks the frontend, creates both channels, connects the MCP servers, starts the session thread |
 | `src/session.rs` | the router: user input to the root, agent events to their owner and the frontends |
 | `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
-| `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
+| `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out, and `-p`/`--print` / `--mode json` |
 | `src/tui/mod.rs` | terminal lifecycle and its panic hook, the event loop, key bindings, the mouse capture F5 hands back |
 | `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
 | `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
+| `src/records.rs` | JSONL session records: one writer per agent, and the renderer `history://` reads back |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |
+| `src/approvals.rs` | the approval gate: tiers, the session cache, and the pending prompts |
 | `src/tools.rs` | the file tools `bash`, `read_file`, `write_file`, `edit`, and the `Policy` that guards them |
 | `src/diff.rs` | Myers over interned line ids, and the compact `-N|…` / `+N|…` rows both the model and the transcript read |
 | `src/edit.rs` | the line-anchored `edit` patch engine and the per-agent `Store` of files read |
@@ -72,7 +74,7 @@
 - Tool arguments are typed structs with `deny_unknown_fields`: a wrong key or a missing field comes back to the model as `error: invalid arguments: …`, naming the allowed fields.
 - An agent's `bash` runs in its own process group and is killed after 300 s (`tools::BASH_TIMEOUT`): without the group kill, a surviving grandchild holds the pipes and the tool call never returns.
 - An owner reaches an agent through `swarm::Control`: pause holds the inbox, stop drops it, urgent jumps the queue and sets the flag `agent::Turn` checks before every model call and every tool call. A paused agent is not busy, so ctrl+D stops waiting on it.
-- `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards.
+- `Control::set_policy` has two callers, `start_root` and `Swarm::spawn`, each running it before its thread exists. The policy is then fixed: it is still re-read on every tool call and rewritten into the prompt each turn, but nothing in the program changes it afterwards. The approval gate (`src/approvals.rs`) sits outside the Policy: the user's tier and cached answers decide at call time, and a denial is a tool error, not a policy change. Its cache is keyed by `<tool>\0<raw call>`, so a shell command and a file path that read alike never share one answer; `Always` outlives the tier, the other answers last only where the tier caches; and a prompt that ends unanswered is withdrawn from the frontend so it cannot keep taking keys.
 - The root always runs the built-in `supervisor` profile and `Role::Supervisor`; a `~/.overseer/agent/profiles/supervisor.md` replaces its text, model, effort and tool list, never its role or its read-only restriction.
 - A profile's `allow_tools` is the whole right: tools are granted one by one, `mcp__<server>` grants one server's tools, and an empty list leaves an agent able to think and answer only. No tool changes a policy after the agent starts.
 - A child gets the intersection of the two tool lists. `free_spawn` is a grant, not a callable tool: an owner that holds it may pass `spawn_agent(free: true)`, and the child then gets its profile's policy. The built-in supervisor grants `free_spawn`, so the read-only root can start full-rights children; a custom `supervisor.md` without it is strict.
@@ -83,7 +85,7 @@
 - A `scheme://…` path is resolved by `url::SCHEMES`, never by a tool: a scheme exists by having a row there, and its line then reaches the tool descriptions and `/schemes` on its own. Every row resolves, so an unknown name is refused with the full list of the ones that do.
 - Compaction's trigger lives in `config::CompactionSettings::threshold` alone; `compaction::should_compact` delegates to it. The reserve never takes more than half the window, and `compaction::keep_budget` caps `keep_recent_tokens` under the trigger: without that cap a cut keeps a span still over the threshold and the trigger re-fires on every round. A turn compacts at most once for the same reason.
 - The cut never passes the current turn's user message, so `Turn::run`'s `history.truncate(base)` rollback stays exact: a turn larger than the window is not compacted, and the next turn reclaims it. A summary message is `Message::summary`, tested by `summary.is_some()`; both `usage` and `summary` are `#[serde(skip)]`, so neither reaches the wire.
-- A compaction attempt always has an outcome the user can see: `Compaction::run` answers `CompactionOutcome::{Compacted,Skipped,Failed}`, `AgentRun` logs one `= Compaction …` line and sends one `Event::Compaction` per attempt, and a failure never fails the turn. `/compact` refuses up front — compaction off in config, or an agent that runs no further turn — rather than acking a request nothing will read.
+- A compaction attempt always has an outcome the user can see: `Compaction::run` answers `CompactionOutcome::{Compacted,Skipped,Failed}`, `AgentRun` sends one `Event::Compaction` per attempt, and a failure never fails the turn. `/compact` refuses up front — compaction off in config, or an agent that runs no further turn — rather than acking a request nothing will read.
 - `slash::COMMANDS` is the one list of slash commands, and `swarm::Event::from_line` is still the one parser: a test submits every row of the table through it, so a command added to one side without the other fails the build instead of reaching the model as a prompt.
 - Quitting calls `tools::kill_running` and `Registry::kill_all`: without them an agent's `cargo build`, a background `bash` job or an MCP server outlives the process.
 - An agent's liveness is its thread's `JoinHandle`, not a bookkeeping counter: a panicked agent cannot leave the swarm busy forever.

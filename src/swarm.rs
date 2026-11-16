@@ -1,4 +1,6 @@
 use crate::agent::{INTERRUPTED, Turn};
+use crate::approvals;
+use crate::bounds;
 use crate::compaction::{Compaction, CompactionOutcome};
 use crate::config;
 use crate::conflict;
@@ -10,14 +12,14 @@ use crate::names;
 use crate::pipelines;
 use crate::profiles;
 use crate::prompt;
+use crate::records;
 use crate::repos;
+use crate::rules;
 use crate::skills;
 use crate::tools;
 use crate::url;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
@@ -148,6 +150,12 @@ struct Gate {
 }
 
 impl Control {
+    /// Ends the running turn only, without changing lifecycle flags.
+    fn cut(&self) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
     fn lock(&self) -> MutexGuard<'_, Gate> {
         self.gate.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -296,6 +304,18 @@ impl AgentEvent {
     }
 }
 
+/// The record outcome a turn-ending event writes. `Reply` never ends a turn; it maps with
+/// `Finished` only because the match must be exhaustive.
+impl From<AgentEvent> for records::Outcome {
+    fn from(kind: AgentEvent) -> Self {
+        match kind {
+            AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
+            AgentEvent::Failed => records::Outcome::Failed,
+            AgentEvent::Interrupted => records::Outcome::Interrupted,
+        }
+    }
+}
+
 /// Everything that wakes the overseer.
 /// What one compaction attempt did, as the frontend shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -335,6 +355,8 @@ pub(crate) enum Event {
     Schemes,
     /// User typed `/mcp`: the server list, handled without a model call.
     Mcp,
+    /// User typed `/approve <server>`: the argument, handled without a model call.
+    Approve(String),
     /// User typed `/login <server>`: the argument, handled without a model call.
     Login(String),
     /// User typed `/pipeline <name|list|stop <id>>`: the argument, handled without a model call.
@@ -378,6 +400,25 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
+    /// A gated tool call waits for the user's approval.
+    ApprovalRequest {
+        id: usize,
+        request: u64,
+        tool: String,
+        call: String,
+    },
+    /// The user answered a pending approval prompt.
+    Resolve {
+        request: u64,
+        choice: approvals::Choice,
+    },
+    /// The prompt is gone: nobody waits on that request any more, so the frontend must stop
+    /// showing it.
+    ApprovalWithdrawn {
+        request: u64,
+    },
+    /// The user cycled the approval tier.
+    CycleTier,
 }
 
 impl Event {
@@ -413,6 +454,9 @@ impl Event {
         }
         if let Some(arg) = line.strip_prefix("/pipeline ") {
             return Some(Event::Pipeline(arg.trim().to_string()));
+        }
+        if let Some(arg) = line.strip_prefix("/approve") {
+            return Some(Event::Approve(arg.trim().to_string()));
         }
         if let Some(arg) = line.strip_prefix("/login") {
             return Some(Event::Login(arg.trim().to_string()));
@@ -493,6 +537,8 @@ struct Described {
     text: Option<String>,
     command: Option<String>,
     action: Option<String>,
+    pattern: Option<String>,
+    code: Option<String>,
     id: Option<u64>,
     #[serde(default)]
     urgent: bool,
@@ -533,12 +579,27 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => field(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE | tools::EDIT => field(args.path.as_ref()).to_string(),
+        tools::GLOB | tools::GREP | tools::PYTHON => {
+            first_line(args.pattern.as_ref().or(args.code.as_ref())).to_string()
+        }
         _ => String::new(),
     };
     if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT | tools::BASH) {
         return line;
     }
     tools::shorten(&line, PROGRESS_WIDTH)
+}
+
+/// The cache key and the transcript line for a gated call, one place for both gate paths.
+///
+/// The key is the raw argument, never `describe`'s output: `describe` shortens a path to the
+/// progress width, so two distinct long paths would otherwise share one cached answer.
+pub(crate) fn gate_key(name: &str, arguments: &str) -> (String, String) {
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let field = if name == tools::BASH { "command" } else { "path" };
+    let raw = args.get(field).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let key = if name == tools::BASH { raw.trim().to_string() } else { raw.to_string() };
+    (key, describe(name, arguments))
 }
 
 /// One agent in the tree. Ids are never reused, so a stale order can never reach a new agent.
@@ -582,6 +643,16 @@ impl Agent {
         names::label(self.id, self.name.as_deref())
     }
 
+    /// One place the stop flags become a state: the thread takes no more work, the queued
+    /// instructions are dropped, and the counter and busy mark would otherwise stay set for good.
+    fn retire(&mut self) {
+        self.control.stop();
+        self.inbox = None;
+        self.stopped = true;
+        self.pending = 0;
+        self.busy_since = None;
+    }
+
     /// The one place the flags become a state. Precedence is the order of `State`'s variants.
     fn state(&self) -> State {
         if self.archived {
@@ -619,6 +690,7 @@ impl Agent {
 /// so a strong handle back from the worker would keep the pair alive after the session left.
 pub(crate) struct Swarm {
     models: Arc<dyn llm::Models>,
+    pub(crate) bounds: Arc<bounds::Bounds>,
     profiles: Arc<profiles::Catalogue>,
     /// The pipelines loaded at startup; a start reads it, nothing writes it.
     pipelines: Arc<pipelines::Catalogue>,
@@ -630,6 +702,8 @@ pub(crate) struct Swarm {
     agents: Vec<Agent>,
     /// Every agent shares the servers the process connected; a late one reaches the next turn.
     mcp: Arc<mcp::Registry>,
+    /// The user's approval gate for gated tool calls, shared by every agent and the pipeline host.
+    approvals: Arc<approvals::Gate>,
     /// `local://` notes, by name: one store per session, shared by every agent.
     local: HashMap<String, String>,
     /// `out://` texts, by the 1-based sequence they were written in.
@@ -651,9 +725,12 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        approvals: Arc<approvals::Gate>,
+        bounds: Arc<bounds::Bounds>,
     ) -> Self {
         Self {
             models,
+            bounds,
             profiles,
             pipelines,
             config,
@@ -661,6 +738,7 @@ impl Swarm {
             sender,
             agents: Vec::new(),
             mcp,
+            approvals,
             local: HashMap::new(),
             outs: VecDeque::new(),
             out_seq: 0,
@@ -897,7 +975,7 @@ impl Swarm {
             control.set_policy(supervisor.policy.clone());
             (
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 tree.models.get(supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
@@ -1068,7 +1146,7 @@ impl Swarm {
                 dir,
                 tree.config.home.clone(),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 Arc::clone(&control),
                 llm,
                 tree.sender.clone(),
@@ -1123,7 +1201,21 @@ impl Swarm {
     pub(crate) fn start_pipeline(swarm: &Arc<Mutex<Swarm>>, caller: usize, name: &str) -> Result<usize, String> {
         // Two starts must not allocate the same id while the tree lock is released.
         let _reserved = spawning();
-        let (depth, working_dir, policy, remaining_depth, id, log_path, control, sender, pipeline, cfg, profiles, mcp) = {
+        let (
+            depth,
+            working_dir,
+            policy,
+            remaining_depth,
+            id,
+            log_path,
+            control,
+            sender,
+            pipeline,
+            cfg,
+            profiles,
+            mcp,
+            approvals,
+        ) = {
             let tree = lock(swarm);
             let caller_agent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let label = caller_agent.label();
@@ -1168,20 +1260,18 @@ impl Swarm {
                 effective,
                 tree.config.max_depth.saturating_sub(depth),
                 id,
-                tree.log_dir.join(format!("agent-{id}.log")),
+                tree.log_dir.join(format!("agent-{id}.jsonl")),
                 control,
                 tree.sender.clone(),
                 pipeline,
                 Arc::clone(&tree.config),
                 Arc::clone(&tree.profiles),
                 Arc::clone(&tree.mcp),
+                Arc::clone(&tree.approvals),
             )
         };
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|error| config::io_error(log_path.display(), &error))?;
+        let records =
+            records::Writer::create(&log_path).map_err(|error| config::io_error(log_path.display(), &error))?;
         let skills = Arc::new(skills::Catalogue::in_dir(&cfg.home, &working_dir));
         let task = format!("pipeline {name}");
         // The thread waits for its `Agent` entry: a fast pipeline must not report `Finished` before
@@ -1194,11 +1284,12 @@ impl Swarm {
             let instruction = task.clone();
             let working_dir = working_dir.clone();
             thread::spawn(move || {
-                let mut log = log;
+                let records = &records;
                 if start_rx.recv().is_err() {
                     return;
                 }
-                let _ = sender.send(Event::Instruction { id, text: instruction });
+                let _ = sender.send(Event::Instruction { id, text: instruction.clone() });
+                records.write(&records::Record::Instruction { text: instruction });
                 let run_flag = Arc::new(AtomicBool::new(false));
                 let host = pipelines::SwarmHost {
                     swarm: tree,
@@ -1208,6 +1299,7 @@ impl Swarm {
                     skills,
                     profiles,
                     mcp,
+                    approvals,
                     config: cfg,
                     remaining_depth,
                     sender: sender.clone(),
@@ -1224,7 +1316,8 @@ impl Swarm {
                     }
                     Err(text) => (AgentEvent::Failed, text),
                 };
-                let _ = writeln!(log, "= {}: {text}", kind.verb());
+                let outcome = records::Outcome::from(kind);
+                records.write(&records::Record::Outcome { outcome, text: text.clone() });
                 let _ = sender.send(Event::Agent { id, kind, text });
             })
         };
@@ -1329,13 +1422,7 @@ impl Swarm {
         stopped.push(id);
         for target in &stopped {
             if let Some(agent) = self.agent_mut(*target) {
-                agent.control.stop();
-                agent.inbox = None;
-                agent.stopped = true;
-                // Nothing will run the instructions still queued, so nothing will ever finish
-                // them: the counter and the busy mark would stay set for good.
-                agent.pending = 0;
-                agent.busy_since = None;
+                agent.retire();
             }
         }
         let below = stopped.len().saturating_sub(1);
@@ -1344,6 +1431,18 @@ impl Swarm {
         } else {
             format!("{label} stopped, with {below} agent(s) below it")
         })
+    }
+
+    /// Cuts the root's turn and stops every worker. The root thread must survive so the user can
+    /// still type, and each later instruction's turn reports the bound rather than reaching a model.
+    pub(crate) fn stop_all(&mut self) {
+        for agent in &mut self.agents {
+            if agent.id == Swarm::ROOT {
+                agent.control.cut();
+            } else {
+                agent.retire();
+            }
+        }
     }
 
     /// Queues `text` for one agent, counting it as pending work.
@@ -1480,7 +1579,7 @@ impl Swarm {
             let lines: Vec<String> = mine
                 .iter()
                 .map(|agent| {
-                    let path = self.log_dir.join(format!("agent-{}.log", agent.id));
+                    let path = self.log_dir.join(format!("agent-{}.jsonl", agent.id));
                     match std::fs::metadata(&path) {
                         Ok(meta) => format!("agent {} {} ({} bytes)", agent.label(), path.display(), meta.len()),
                         Err(_) => format!("agent {} {} (no log)", agent.label(), path.display()),
@@ -1494,10 +1593,11 @@ impl Swarm {
         if !self.visible(caller, id) {
             return Err(format!("agent {} is not under your command", agent.label()));
         }
-        let path = self.log_dir.join(format!("agent-{id}.log"));
+        let path = self.log_dir.join(format!("agent-{id}.jsonl"));
         let label = format!("history://{id}");
-        match tools::read_limited(&path, &label) {
-            Ok((text, cut)) => Ok(tools::with_note(text, cut)),
+        match tools::read_limited_bounded(&path, &label, false) {
+            Ok((Ok(text), cut)) => Ok(tools::with_note(records::render(&text), cut)),
+            Ok((Err(e), _)) => Err(e),
             Err(_) => Err(format!("agent {} has no log yet", agent.label())),
         }
     }
@@ -1608,14 +1708,10 @@ fn spawn_thread(
     task: Option<String>,
     profile: String,
     role: profiles::Role,
-    log_path: &Path,
+    records_path: &Path,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_err(|e| config::io_error(log_path.display(), &e))?;
+    let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
     let tree = Arc::downgrade(me);
     let stream_sender = sender.clone();
@@ -1635,7 +1731,7 @@ fn spawn_thread(
     ));
     let agent_dir = working_dir.to_path_buf();
     let handle = thread::spawn(move || {
-        let mut log = log;
+        let records = &records;
         let mut run = AgentRun {
             swarm: &tree,
             id,
@@ -1645,7 +1741,7 @@ fn spawn_thread(
             role,
             working_dir: &agent_dir,
             sender: &sender,
-            log: &mut log,
+            records,
             calls: 0,
             control: &control,
             conflicts: conflict::Registry::default(),
@@ -1694,7 +1790,7 @@ struct AgentRun<'a> {
     role: profiles::Role,
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
-    log: &'a mut File,
+    records: &'a records::Writer,
     control: &'a Control,
     /// Conflict blocks this agent has read, by id: resolving one writes only its marker lines.
     conflicts: conflict::Registry,
@@ -1708,14 +1804,17 @@ impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
     fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
         let control = self.control;
-        let (config, mcp, catalogue) = {
+        let (config, mcp, catalogue, bounds) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
             let tree = lock(&swarm);
-            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles))
+            (Arc::clone(&tree.config), Arc::clone(&tree.mcp), Arc::clone(&tree.profiles), Arc::clone(&tree.bounds))
         };
         let profile = catalogue.get(&self.profile);
         // Discovered once per agent: a skill installed mid-session needs a new agent.
         let skills = skills::Catalogue::in_dir(&config.home, self.working_dir);
+        // Discovered once per agent, like the skills: a rule file changed mid-session reaches the
+        // agent through `rule://`.
+        let rules = rules::Rules::load(&config.rule_dir, self.working_dir);
         let settings = config.compaction;
         let mut history: Vec<Message> = Vec::new();
         // Log writes are best effort: a full disk must not kill the agent.
@@ -1735,6 +1834,7 @@ impl AgentRun<'_> {
                     policy: &policy,
                     children: tree.children(self.id),
                     skills: &skills,
+                    rules: &rules,
                     mcp: mcp.as_ref(),
                     root: self.parent.is_none(),
                     profile,
@@ -1762,7 +1862,7 @@ impl AgentRun<'_> {
             let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
             // Sent before the turn's first delta, so a frontend always reads the instruction first.
             let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
-            let _ = writeln!(self.log, "> {input}");
+            self.records.write(&records::Record::Instruction { text: input.clone() });
             let result = {
                 let context = tools::Context {
                     skills: &skills,
@@ -1770,12 +1870,19 @@ impl AgentRun<'_> {
                     mcp: mcp.as_ref(),
                     scope: Some(&scope),
                 };
+                // `Writer::write` takes `&self`, so both closures below share one copied
+                // reference: the execute closure keeps `&mut self` capture without a conflict.
+                let records = self.records;
                 let mut compactions: Vec<CompactionOutcome> = Vec::new();
                 let mut turn = Turn {
                     llm,
                     tool_defs: &tool_defs,
                     execute: &mut |call: &ToolCall| self.execute(call, control, &context),
                     cancel: Some(control.flag()),
+                    on_commit: Some(&mut |message: &Message| {
+                        records.write(&records::Record::Assistant { message: message.clone() });
+                    }),
+                    bounds: Some(&bounds),
                     compaction: settings.enabled.then_some(Compaction { settings: &settings }),
                     force_compact: Some(control.force_compact_flag()),
                     on_compact: Some(&mut |outcome| compactions.push(outcome)),
@@ -1783,22 +1890,13 @@ impl AgentRun<'_> {
                 let outcome = turn.run(&mut history, &input);
                 for attempt in compactions {
                     let notice = match attempt {
-                        CompactionOutcome::Compacted(report) => {
-                            let _ = writeln!(self.log, "= Compacted {} → {} tokens", report.before, report.after);
-                            CompactionNotice::Compacted {
-                                before: report.before,
-                                after: report.after,
-                                over_band: report.over_band,
-                            }
-                        }
-                        CompactionOutcome::Skipped => {
-                            let _ = writeln!(self.log, "= Compaction skipped: nothing older to summarize");
-                            CompactionNotice::Skipped
-                        }
-                        CompactionOutcome::Failed(error) => {
-                            let _ = writeln!(self.log, "= Compaction failed: {error}");
-                            CompactionNotice::Failed(error)
-                        }
+                        CompactionOutcome::Compacted(report) => CompactionNotice::Compacted {
+                            before: report.before,
+                            after: report.after,
+                            over_band: report.over_band,
+                        },
+                        CompactionOutcome::Skipped => CompactionNotice::Skipped,
+                        CompactionOutcome::Failed(error) => CompactionNotice::Failed(error),
                     };
                     let _ = self.sender.send(Event::Compaction { id: self.id, notice });
                 }
@@ -1807,7 +1905,8 @@ impl AgentRun<'_> {
             // `close` cut this turn and already sent the report: the interrupt it raised must not
             // also be reported as an interruption, and the thread waits for its owner.
             if control.is_closed() {
-                let _ = writeln!(self.log, "= Closed");
+                self.records
+                    .write(&records::Record::Outcome { outcome: records::Outcome::Closed, text: String::new() });
                 continue;
             }
             let (kind, text) = match result {
@@ -1817,9 +1916,19 @@ impl AgentRun<'_> {
                 }
                 Err(e) => (AgentEvent::Failed, format!("{e:#}")),
             };
-            let _ = writeln!(self.log, "= {kind:?}: {text}");
+            let outcome = records::Outcome::from(kind);
+            self.records.write(&records::Record::Outcome { outcome, text: text.clone() });
             let _ = self.sender.send(Event::Agent { id: self.id, kind, text });
         }
+    }
+
+    /// The shared approval gate; a dead session has none to ask. The lock is released before
+    /// `admit`, which blocks for as long as the user takes.
+    fn gate(&self) -> Result<Arc<approvals::Gate>, String> {
+        self.swarm
+            .upgrade()
+            .map(|tree| Arc::clone(&lock(&tree).approvals))
+            .ok_or_else(|| "the session ended".to_string())
     }
 
     /// A tree tool's result, or `None` when `call` is not one. The tree is upgraded for the call
@@ -1833,23 +1942,28 @@ impl AgentRun<'_> {
     fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
         // `close` ends the turn and the agent with it, so it is answered here before any dispatch.
         if call.function.name == tools::CLOSE {
-            let Ok(args) = tools::parse_args::<CloseArgs>(&call.function.arguments) else {
-                return "error: invalid arguments: close takes one `report` string".to_string();
+            let output = match tools::parse_args::<CloseArgs>(&call.function.arguments) {
+                Err(_) => "error: invalid arguments: close takes one `report` string".to_string(),
+                Ok(args) if args.report.trim().is_empty() => {
+                    "error: a close needs a report; say what you did and what you did not test".to_string()
+                }
+                Ok(_) if self.parent.is_none() => "error: the root has no owner and cannot close itself".to_string(),
+                Ok(args) => {
+                    let _ =
+                        self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
+                    control.close();
+                    "closed; your report is on its way".to_string()
+                }
             };
-            if args.report.trim().is_empty() {
-                return "error: a close needs a report; say what you did and what you did not test".to_string();
-            }
-            if self.parent.is_none() {
-                return "error: the root has no owner and cannot close itself".to_string();
-            }
-            let _ = self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
-            control.close();
-            return "closed; your report is on its way".to_string();
+            // A close answers its own call: without a Tool record the assistant message would
+            // name a call that never has a result, which a replay would read as a dangling turn.
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
+            return output;
         }
-        // The log keeps the capped summary, never the raw arguments: a `write_file` carries a whole
-        // file, whose content would land on disk in plain text.
+        // The session record keeps the full fidelity the plaintext log never had: raw arguments
+        // live in the assistant record this call follows, the output lands as its own `Tool`
+        // record. The capped summary still goes to the user's progress card.
         let summary = describe(&call.function.name, &call.function.arguments);
-        let _ = writeln!(self.log, "· {} ({} bytes) {summary}", call.function.name, call.function.arguments.len());
         let started = Instant::now();
         let seq = (call.function.name != prompt::REPLY).then(|| {
             let seq = self.calls;
@@ -1866,7 +1980,7 @@ impl AgentRun<'_> {
             && let Some(refusal) = policy.refuse(&call.function.name, &call.function.arguments)
         {
             let output = format!("error: {refusal}");
-            let _ = writeln!(self.log, "{output}");
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
             if let Some(seq) = seq {
                 progress(
                     self.sender,
@@ -1891,18 +2005,37 @@ impl AgentRun<'_> {
         } else if let Some(result) = self.tree_tool(call) {
             tools::outcome(result)
         } else {
-            tools::execute_guarded(
-                self.working_dir,
-                &call.function.name,
-                &call.function.arguments,
-                &policy,
-                Some(control.flag()),
-                &mut self.conflicts,
-                &mut self.seen,
-                context,
-            )
+            let gated = matches!(call.function.name.as_str(), tools::BASH | tools::WRITE_FILE | tools::EDIT);
+            let mut denied: Option<String> = None;
+            if gated && policy.refuse(&call.function.name, &call.function.arguments).is_none() {
+                // A dead session has no gate to ask: the call fails, and still closes its card.
+                match self.gate() {
+                    Ok(gate) => {
+                        let (key, display) = gate_key(&call.function.name, &call.function.arguments);
+                        // A denial is the call's output: the card still closes, as failed.
+                        denied = gate
+                            .admit(self.id, &call.function.name, &key, &display, Some(control.flag()), self.sender)
+                            .err()
+                            .map(|reason| format!("error: {reason}"));
+                    }
+                    Err(reason) => denied = Some(format!("error: {reason}")),
+                }
+            }
+            match denied {
+                Some(output) => output,
+                None => tools::execute_guarded(
+                    self.working_dir,
+                    &call.function.name,
+                    &call.function.arguments,
+                    &policy,
+                    Some(control.flag()),
+                    &mut self.conflicts,
+                    &mut self.seen,
+                    context,
+                ),
+            }
         };
-        let _ = writeln!(self.log, "{output}");
+        self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
         if let Some(seq) = seq {
             let preview = tools::preview(&call.function.name, &output);
             let secs = started.elapsed().as_secs_f64();
@@ -1966,6 +2099,18 @@ mod tests {
         loop {
             if let Progress::Finished { preview, .. } = next_progress(queue) {
                 return preview;
+            }
+        }
+    }
+
+    /// The next approval request from `agent`, skipping streamed output and tool progress:
+    /// its request id, the tool, and what the call does.
+    fn next_approval(queue: &Receiver<Event>, agent: usize) -> (u64, String, String) {
+        loop {
+            match next_event(queue) {
+                Event::ApprovalRequest { id, request, tool, call } if id == agent => return (request, tool, call),
+                Event::Progress { .. } => {}
+                other => panic!("expected an approval request for agent {agent}, got {other:?}"),
             }
         }
     }
@@ -2062,6 +2207,8 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(approvals::Gate::new(approvals::Tier::Yolo, true)),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
@@ -2075,8 +2222,15 @@ mod tests {
             model: "m".into(),
             theme: config::Theme::Auto,
             max_depth,
+            max_time: None,
+            max_cost: None,
+            pricing: HashMap::new(),
             dir: root.to_path_buf(),
+            rule_dir: root.join("overseer").clone(),
             home: root.to_path_buf(),
+            // The harness's gate starts at `yolo`: existing tests must not stop on a prompt.
+            approvals: approvals::Tier::Yolo,
+            mcp_project: config::McpProject::On,
             compaction: crate::config::CompactionSettings::default(),
         }
     }
@@ -2342,7 +2496,7 @@ mod tests {
         assert!(log.contains("> one"), "{log}");
         assert!(log.contains("= Finished: done"), "{log}");
         assert!(
-            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.log"),
+            read_uri(&h, Swarm::ROOT, "history://").contains("agent-2.jsonl"),
             "{}",
             read_uri(&h, Swarm::ROOT, "history://")
         );
@@ -2466,7 +2620,7 @@ mod tests {
             parent: Some(1),
             depth: 1,
             max_depth: 3,
-            dir: Path::new("/tmp"),
+            dir: home.path(),
             policy: &policy,
             profile: None,
             role: profiles::Role::Worker,
@@ -2474,6 +2628,7 @@ mod tests {
             children: vec![3],
             skills: &skills,
             mcp: &mcp,
+            rules: &rules::Rules::load(Path::new("/nonexistent"), home.path()),
             root: false,
         };
         let rendered = prompt::agent_prompt(&facts);
@@ -2526,6 +2681,39 @@ mod tests {
         let deepest = advertised(&narrow, 0);
         assert!(!deepest.contains(&prompt::SPAWN_AGENT.to_string()), "spawn_agent offered with no depth left");
         assert!(deepest.contains(&prompt::MESSAGE_AGENT.to_string()));
+    }
+
+    /// The rule files of the directory an agent starts in reach its system prompt without anyone
+    /// reading them: the first recorded request's system message carries the file's text and path.
+    #[test]
+    fn the_rules_of_the_root_directory_reach_the_first_request() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("AGENTS.md"), "be brief").unwrap();
+        fs::create_dir(root.path().join("logs")).unwrap();
+        let (sender, queue) = mpsc::channel();
+        let recording = Arc::new(llm::testing::Recording::new(Arc::new(Scripted::new(vec![text("hi")]))));
+        let llm: Arc<dyn llm::Llm> = recording.clone();
+        let models = Arc::new(llm::testing::Fixed(llm));
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            models,
+            Arc::new(profiles::Catalogue::default()),
+            Arc::new(pipelines::Catalogue::default()),
+            Arc::new(test_config(root.path(), 3)),
+            root.path().join("logs"),
+            sender,
+            Arc::new(mcp::Registry::load(root.path())),
+            Arc::new(approvals::Gate::new(approvals::Tier::Yolo, true)),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+        )));
+        Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
+        assert_eq!(swarm.lock().unwrap().tell_root("go").unwrap(), format!("sent to {}", codename(1)));
+        let _ = next_event(&queue);
+        let requests = recording.requests.lock().unwrap().clone();
+        let system = requests[0].iter().find(|m| m.role == "system").unwrap();
+        let content = system.content.as_deref().unwrap();
+        let path = fs::canonicalize(root.path()).unwrap().join("AGENTS.md").display().to_string();
+        assert!(content.contains("be brief"), "{content}");
+        assert!(content.contains(&path), "{content}");
     }
 
     #[test]
@@ -2685,8 +2873,13 @@ mod tests {
     struct Sleepy;
 
     impl Llm for Sleepy {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
-            Ok(call("c1", tools::BASH, &json!({"command": "sleep 30"})))
+        fn chat(
+            &self,
+            _: &[Message],
+            _: &Value,
+            _: Option<&AtomicBool>,
+        ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
+            Ok((call("c1", tools::BASH, &json!({"command": "sleep 30"})), None))
         }
     }
 
@@ -2742,8 +2935,71 @@ mod tests {
             "{}",
             list(&h.swarm, Swarm::ROOT)
         );
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("> do it") && log.contains("· reply") && log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn a_turns_records_keep_full_fidelity_and_render_back_to_legacy_lines() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "echo hi"})), text("done")]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "run it"), format!("{} started", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Finished, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        // (a) Every line parses as a record.
+        let parsed: Vec<records::Record> =
+            text.lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}"))).collect();
+        let kinds: Vec<&str> = parsed
+            .iter()
+            .map(|record| match record {
+                records::Record::Instruction { .. } => "instruction",
+                records::Record::Assistant { .. } => "assistant",
+                records::Record::Tool { .. } => "tool",
+                records::Record::Outcome { .. } => "outcome",
+            })
+            .collect();
+        // The final answer is itself an assistant record (text, no calls).
+        assert_eq!(kinds, ["instruction", "assistant", "tool", "assistant", "outcome"]);
+        // (b) The assistant record carries the raw arguments verbatim: full fidelity.
+        let Some(records::Record::Assistant { message }) =
+            parsed.iter().find(|r| matches!(r, records::Record::Assistant { .. }))
+        else {
+            panic!("no assistant record");
+        };
+        let calls = message.tool_calls.as_deref().unwrap_or_default();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].function.arguments, json!({"command": "echo hi"}).to_string());
+        // (c) history:// renders the legacy lines from those records.
+        let log = read_uri(&h, Swarm::ROOT, "history://2");
+        assert!(log.contains("> run it"), "{log}");
+        assert!(log.contains("· bash"), "{log}");
+        assert!(log.contains("= Finished: done"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupted_turn_records_its_outcome_and_no_finished() {
+        // The second turn gets its own long command: with an instant scripted reply it could
+        // finish before this test reads the file, adding a Finished outcome it never saw written.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "sleep 30"})),
+            call("c2", tools::BASH, &json!({"command": "sleep 30"})),
+            text("done"),
+        ]);
+        assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
+        let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
+        let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "now", "urgent": true}));
+        assert_eq!(sent, format!("interrupted {}; it reads your message now", codename(2)));
+        assert!(matches!(next_agent_event(&h.queue), Event::Agent { id: 2, kind: AgentEvent::Interrupted, .. }));
+        let text = fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap();
+        let parsed: Vec<records::Record> = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        let outcomes: Vec<&records::Outcome> = parsed
+            .iter()
+            .filter_map(|record| match record {
+                records::Record::Outcome { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, [&records::Outcome::Interrupted]);
     }
 
     #[test]
@@ -2777,7 +3033,12 @@ mod tests {
     fn a_panicking_agent_does_not_keep_the_swarm_busy() {
         struct Panic;
         impl Llm for Panic {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> anyhow::Result<(Message, Option<llm::Usage>)> {
                 panic!("boom")
             }
         }
@@ -2948,7 +3209,7 @@ mod tests {
         let finished = Event::Agent { id: 2, kind: AgentEvent::Finished, text: "urgent done".into() };
         assert_eq!(next_event(&h.queue), finished);
         h.swarm.lock().unwrap().finish_turn(2, AgentEvent::Finished, "");
-        let log = fs::read_to_string(h.logs.path().join("agent-2.log")).unwrap();
+        let log = records::render(&fs::read_to_string(h.logs.path().join("agent-2.jsonl")).unwrap());
         assert!(log.contains("interrupted by overseer"), "{log}");
         assert!(log.contains("> now"), "{log}");
     }
@@ -3149,7 +3410,7 @@ mod tests {
         let mut log = String::new();
         while !log.contains("finished] built and tested") {
             assert!(Instant::now() < deadline, "the root never read the report: {log}");
-            log = fs::read_to_string(h.logs.path().join("agent-1.log")).unwrap_or_default();
+            log = records::render(&fs::read_to_string(h.logs.path().join("agent-1.jsonl")).unwrap_or_default());
             thread::sleep(Duration::from_millis(10));
         }
         let archived = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "archive"}));
@@ -3275,5 +3536,77 @@ mod tests {
         assert!(line.contains("stopped"), "{line}");
         assert_eq!(h.swarm.lock().unwrap().agent_state(Swarm::ROOT, id), Ok(State::Stopped));
         assert!(!h.swarm.lock().unwrap().busy(), "a stopped pipeline stops counting as work");
+    }
+
+    #[test]
+    fn a_gated_call_waits_for_the_user_and_the_answer_runs_it() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "ls"})), text("done")]);
+        fs::write(h.root.path().join("a"), "").unwrap();
+        // The harness starts at `yolo`: one cycle brings it to `ask`.
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().tell_root("run").unwrap();
+        let (request, tool, call) = next_approval(&h.queue, 1);
+        assert_eq!(tool, tools::BASH);
+        assert_eq!(call, "ls");
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Once);
+        let finished = next_finished(&h.queue);
+        assert!(!finished.failed, "{finished:?}");
+        assert_eq!(finished.head, "a\nrepo");
+        assert_eq!(next_agent_event(&h.queue), Event::Agent { id: 1, kind: AgentEvent::Finished, text: "done".into() });
+    }
+
+    #[test]
+    fn a_denied_call_returns_an_error_and_stays_cached() {
+        // Two cycles bring `yolo` to `cached-ask`: only there is a refusal remembered.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "ls"})),
+            text("first done"),
+            call("c2", tools::BASH, &json!({"command": "ls"})),
+            text("second done"),
+        ]);
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().tell_root("run").unwrap();
+        let (request, _, _) = next_approval(&h.queue, 1);
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Deny);
+        let finished = next_finished(&h.queue);
+        assert!(finished.failed, "{finished:?}");
+        assert!(finished.head.contains("did not approve"), "{finished:?}");
+        // The same command replays the cached refusal at once, with no new prompt.
+        h.swarm.lock().unwrap().tell_root("again").unwrap();
+        // The replayed refusal makes the same card fail again; the turn then ends on the
+        // second scripted answer.
+        let finished = next_finished(&h.queue);
+        assert!(finished.failed, "{finished:?}");
+        assert!(finished.head.contains("earlier in this session"), "{finished:?}");
+        assert_eq!(
+            next_agent_event(&h.queue),
+            Event::Agent { id: 1, kind: AgentEvent::Finished, text: "second done".into() }
+        );
+    }
+
+    #[test]
+    fn a_stop_releases_a_pending_prompt() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"}))]);
+        h.swarm.lock().unwrap().approvals.cycle();
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        let (request, gate_tool, gate_call) = next_approval(&h.queue, 2);
+        assert_eq!(gate_tool, tools::BASH);
+        assert_eq!(gate_call, "sleep 30", "the worker, not the root, asked");
+        let stopped = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"}));
+        assert!(stopped.contains("stopped"), "{stopped}");
+        // The prompt leaves the screen first: nobody waits on that request any more.
+        assert_eq!(next_event(&h.queue), Event::ApprovalWithdrawn { request });
+        assert_eq!(
+            next_agent_event(&h.queue),
+            Event::Agent { id: 2, kind: AgentEvent::Interrupted, text: "your owner cut this turn short".into() }
+        );
+        // The answer arrives late, after the stop: it must not resurrect anything.
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Once);
+        let deadline = Instant::now() + WAIT;
+        while h.swarm.lock().unwrap().approvals.pending_count() > 0 {
+            assert!(Instant::now() < deadline, "the pending prompt outlived the stop");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

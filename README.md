@@ -22,9 +22,10 @@ base_url = "https://api.openai.com/v1" # any OpenAI-compatible /chat/completions
 model = "gpt-4.1"
 theme = "auto"                        # auto | dark | light | mono; omitted means auto
 compaction = { context_window = 200000 } # optional: see below
+approvals = "ask"                     # ask | cached-ask | write | yolo; omitted means ask
 ```
 
-The first three keys are required; `theme` is optional. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
+The first three keys are required; `theme` and `approvals` are optional. `approvals` gates `bash`, `write_file` and `edit` in the TUI: `ask` prompts on every gated call, `cached-ask` prompts the first time each distinct call appears and replays the answer for the rest of the session, `write` lets the two file tools through and applies cached-ask to bash, and `yolo` never prompts. At a prompt, `y` allows that call once, `n` refuses it and `esc` refuses too; `a` allows the call for the rest of the session whatever the tier, so a repeated call stops asking. Line mode has no terminal to answer in, so there a gated call is refused unless the tier is `yolo`. `auto` follows a non-empty `NO_COLOR` (every slot then takes the terminal's own foreground, and selection is reverse video) and is otherwise the dark ramp; an explicit `theme` outranks `NO_COLOR`. The API key comes from `OVERSEER_API_KEY`, or from `~/.config/overseer/.env` when the environment does not set it:
 
 ```sh
 OVERSEER_API_KEY=...
@@ -55,6 +56,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+o / ctrl+0|expand every tool card, or collapse it back: a shell command always shows whole, and every other card starts as one row and expands to the whole body plus what the call returned|
 |F4|open the picked agent's view, or close it|
 |F5|hand the mouse back to the terminal, so its own selection and copy work; F5 captures it again, in either view|
+|F8|cycle the approval tier (ask → cached-ask → write → yolo); the tier shows in the status line, and a pending prompt answers with `y` allow once, `a` always allow, `n` deny, `esc` deny|
 |click an agent row|open that agent's view; click its `esc back to fleet` line to come back|
 |drag the rule left of the panel|resize the agent panel: the transcript keeps at least 40 columns, the panel never drops below 20, and the width it is left at opens the next run|
 |↑ / ↓|inside an agent view: the previous or next agent|
@@ -65,7 +67,9 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+d|quit once no agent is busy|
 |ctrl+c|quit now|
 
-With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/agent-<id>.log`; `tail -f` one to watch it.
+With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent writes machine-readable JSONL session records — every instruction, committed assistant reply (tool-call arguments included, in full), tool result and turn outcome — to `~/.local/state/overseer/sessions/<start time>/agent-<id>.jsonl`, the substrate resume, search and export build on; `history://<id>` renders those records back into the readable shape, so `tail -f` has an equivalent to watch.
+
+Headless: `overseer -p "prompt"` runs one turn — the answer to stdout, everything else on stderr, exit 1 when the root never answered — and `overseer --mode json` writes each shown event as one compact JSON line on stdout instead, so a consumer filters by `type` (`jq -r 'select(.type=="answer") | .text'`). The two combine; `--mode text` forces line mode like the other flags, with plain text output. Shown event types: `answer` (the root's final answer), `notice`, `error`, `debug` (each with `text`), `agent` (`id`, `name`, `kind` = says/finished/failed/interrupted, `text`), `out` (`id`, `name`, `text`), and `tool` (`id`, `call`, `phase` = start/done; on `done` also `name`, `secs`, `status`, `head`, `more`, `failed`). Usage errors exit 2.
 
 ## Release
 

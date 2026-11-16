@@ -1,3 +1,4 @@
+use crate::bounds;
 use crate::compaction::{Compaction, CompactionOutcome, context_tokens, should_compact};
 use crate::llm::{Llm, Message, ToolCall};
 use anyhow::{Result, bail};
@@ -13,12 +14,16 @@ pub(crate) const INTERRUPTED: &str = "interrupted";
 const MAX_TOOL_ROUNDS: usize = 200;
 
 /// The model-facing inputs of one turn: the client, the tool schemas it may call, how to run them,
-/// the flag an overseer order sets to cut the turn short, and how compaction is wired in.
+/// and the flag an overseer order sets to cut the turn short.
 pub(crate) struct Turn<'a> {
     pub(crate) llm: &'a dyn Llm,
     pub(crate) tool_defs: &'a Value,
     pub(crate) execute: &'a mut dyn FnMut(&ToolCall) -> String,
     pub(crate) cancel: Option<&'a AtomicBool>,
+    /// Invoked with the reply the moment it is committed to history: the session-record writer
+    /// uses it to keep the model's answer in the JSONL log. `None` in tests.
+    pub(crate) on_commit: Option<&'a mut dyn FnMut(&Message)>,
+    pub(crate) bounds: Option<&'a bounds::Bounds>,
     /// Present when compaction is enabled; the settings decide when it fires.
     pub(crate) compaction: Option<Compaction<'a>>,
     /// Set by `/compact`: the next safe point compacts regardless of the threshold, and the flag
@@ -27,6 +32,7 @@ pub(crate) struct Turn<'a> {
     /// Called once per attempt, so the caller can log what happened.
     pub(crate) on_compact: Option<&'a mut dyn FnMut(CompactionOutcome)>,
 }
+
 impl Turn<'_> {
     /// Runs one turn to completion and returns the model's final text.
     ///
@@ -36,8 +42,16 @@ impl Turn<'_> {
         let mut base = history.len();
         history.push(Message::user(input));
         let mut rounds = 0;
+        // One compaction per turn: the keep budget lands the context under the recovery band, so a
+        // second attempt in the same turn would only pay for another summary.
         let mut compacted = false;
         loop {
+            // Budget first: a blown bound is terminal for the session, so it owns the message even
+            // when the fleet stop also raised the interrupt flag in the same instant.
+            if let Some(refusal) = self.over_budget() {
+                history.truncate(base);
+                bail!(refusal);
+            }
             if cancelled(self.cancel) {
                 history.truncate(base);
                 bail!(INTERRUPTED);
@@ -46,8 +60,6 @@ impl Turn<'_> {
                 // Read inside the guard: with compaction off the request must not be consumed, so
                 // `Swarm::compact` can refuse it instead of acking a no-op.
                 let forced = self.force_compact.is_some_and(|flag| flag.swap(false, Ordering::SeqCst));
-                // One compaction per turn: the keep budget lands the context under the recovery
-                // band, so a second attempt in the same turn would only pay for another summary.
                 if forced || (!compacted && should_compact(context_tokens(history), compaction.settings)) {
                     let outcome = compaction.run(history, self.llm, self.cancel, base);
                     if let CompactionOutcome::Compacted(report) = &outcome {
@@ -61,7 +73,11 @@ impl Turn<'_> {
                 }
             }
             let reply = match self.llm.chat(history, self.tool_defs, self.cancel) {
-                Ok(reply) => reply,
+                Ok((mut reply, usage)) => {
+                    // Kept on the message so the next turn's trigger can use the provider's count.
+                    reply.usage = usage;
+                    reply
+                }
                 Err(e) => {
                     history.truncate(base);
                     return Err(e);
@@ -69,6 +85,10 @@ impl Turn<'_> {
             };
             // An order that landed while the call was in flight still owns the outcome: the
             // answer it raced is not the one that was asked for.
+            if let Some(refusal) = self.over_budget() {
+                history.truncate(base);
+                bail!(refusal);
+            }
             if cancelled(self.cancel) {
                 history.truncate(base);
                 bail!(INTERRUPTED);
@@ -79,6 +99,9 @@ impl Turn<'_> {
             if !asks && text.trim().is_empty() {
                 history.truncate(base);
                 bail!("model returned neither text nor tool calls");
+            }
+            if let Some(on_commit) = self.on_commit.as_deref_mut() {
+                on_commit(&reply);
             }
             history.push(reply);
             if !asks {
@@ -96,6 +119,10 @@ impl Turn<'_> {
                 history.last().and_then(|message| message.tool_calls.clone()).unwrap_or_default();
             let mut outputs: Vec<(String, String)> = Vec::with_capacity(calls.len());
             for call in &calls {
+                if let Some(refusal) = self.over_budget() {
+                    history.truncate(base);
+                    bail!(refusal);
+                }
                 if cancelled(self.cancel) {
                     history.truncate(base);
                     bail!(INTERRUPTED);
@@ -109,6 +136,13 @@ impl Turn<'_> {
     }
 }
 
+impl Turn<'_> {
+    /// Why the session bound refuses to continue, or `None` while it fits.
+    fn over_budget(&self) -> Option<String> {
+        self.bounds.and_then(bounds::Bounds::refusal)
+    }
+}
+
 /// Whether an overseer order cut this turn short.
 pub(crate) fn cancelled(flag: Option<&AtomicBool>) -> bool {
     flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
@@ -118,6 +152,7 @@ pub(crate) fn cancelled(flag: Option<&AtomicBool>) -> bool {
 mod tests {
     use super::*;
     use crate::config::CompactionSettings;
+    use crate::llm::Usage;
     use crate::llm::testing::{Scripted, call, text};
     use anyhow::bail;
     use serde_json::json;
@@ -136,6 +171,8 @@ mod tests {
                 "out".to_string()
             },
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: None,
             force_compact: None,
             on_compact: None,
@@ -154,7 +191,12 @@ mod tests {
     fn failed_chat_leaves_history_untouched() {
         struct Failing;
         impl Llm for Failing {
-            fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
+            fn chat(
+                &self,
+                _: &[Message],
+                _: &Value,
+                _: Option<&AtomicBool>,
+            ) -> Result<(Message, Option<crate::llm::Usage>)> {
                 bail!("boom")
             }
         }
@@ -165,6 +207,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: None,
             force_compact: None,
             on_compact: None,
@@ -191,6 +235,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: None,
             force_compact: None,
             on_compact: None,
@@ -219,6 +265,8 @@ mod tests {
                 "out".to_string()
             },
             cancel: Some(&flag),
+            on_commit: None,
+            bounds: None,
             compaction: None,
             force_compact: None,
             on_compact: None,
@@ -227,6 +275,27 @@ mod tests {
         assert_eq!(err.to_string(), "interrupted");
         assert_eq!(ran, 1, "the second call of the batch still ran");
         assert!(history.is_empty(), "an interrupted turn left history behind");
+    }
+
+    #[test]
+    fn a_blown_session_budget_fails_the_turn_before_any_model_call() {
+        let llm = Scripted::new(vec![text("never asked")]);
+        let budget = bounds::Bounds::expired_for_test();
+        let mut history = vec![Message::system("sys".into())];
+        let mut turn = Turn {
+            llm: &llm,
+            tool_defs: &json!([]),
+            execute: &mut |_: &ToolCall| String::new(),
+            cancel: None,
+            on_commit: None,
+            bounds: Some(&budget),
+            compaction: None,
+            force_compact: None,
+            on_compact: None,
+        };
+        let err = turn.run(&mut history, "go").unwrap_err();
+        assert_eq!(err.to_string(), "session budget exceeded: time");
+        assert_eq!(history.len(), 1, "the user line of a refused turn stays out of the history");
     }
 
     /// A history two turns deep, so the next turn has something older to compact.
@@ -250,6 +319,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: Some(Compaction { settings: &settings }),
             force_compact: None,
             on_compact: None,
@@ -271,6 +342,8 @@ mod tests {
                 tool_defs: &json!([]),
                 execute: &mut |_: &ToolCall| String::new(),
                 cancel: None,
+                on_commit: None,
+                bounds: None,
                 compaction: Some(Compaction { settings: &settings }),
                 force_compact: None,
                 on_compact: Some(&mut |report| reports.push(report)),
@@ -295,6 +368,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: Some(Compaction { settings: &settings }),
             force_compact: Some(&flag),
             on_compact: None,
@@ -307,10 +382,16 @@ mod tests {
     /// A model whose summary call fails and whose answer does not: compaction never fails the turn.
     struct NoSummary;
     impl Llm for NoSummary {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
-            Ok(text("answer"))
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<(Message, Option<Usage>)> {
+            Ok((text("answer"), None))
         }
-        fn chat_capped(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>, _: u64) -> Result<Message> {
+        fn chat_capped(
+            &self,
+            _: &[Message],
+            _: &Value,
+            _: Option<&AtomicBool>,
+            _: u64,
+        ) -> Result<(Message, Option<Usage>)> {
             bail!("summary failed")
         }
     }
@@ -325,6 +406,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: Some(Compaction { settings: &settings }),
             force_compact: None,
             on_compact: None,
@@ -337,9 +420,9 @@ mod tests {
     /// Serves one summary, then fails the answer: the rollback runs on a compacted history.
     struct SummaryThenFails(AtomicUsize);
     impl Llm for SummaryThenFails {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<(Message, Option<Usage>)> {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Ok(text("the summary"));
+                return Ok((text("the summary"), None));
             }
             bail!("boom")
         }
@@ -355,6 +438,8 @@ mod tests {
             tool_defs: &json!([]),
             execute: &mut |_: &ToolCall| String::new(),
             cancel: None,
+            on_commit: None,
+            bounds: None,
             compaction: Some(Compaction { settings: &settings }),
             force_compact: None,
             on_compact: None,

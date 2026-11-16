@@ -58,7 +58,7 @@ pub(crate) fn context_tokens(history: &[Message]) -> u64 {
     history
         .iter()
         .rev()
-        .find_map(|message| message.usage.map(|usage| usage.total_tokens))
+        .find_map(|message| message.usage.map(|usage| usage.counts().0 + usage.counts().1))
         .unwrap_or_else(|| estimate_tokens(history))
 }
 
@@ -256,7 +256,7 @@ impl Compaction<'_> {
         let max_tokens = (self.settings.reserve_tokens.saturating_mul(8) / 10).min(MAX_SUMMARY_TOKENS);
         let request = [Message::system(SUMMARIZATION_SYSTEM_PROMPT.into()), Message::user(&user)];
         let reply = match llm.chat_capped(&request, &json!([]), cancel, max_tokens) {
-            Ok(reply) => reply,
+            Ok((reply, _usage)) => reply,
             Err(e) => return CompactionOutcome::Failed(format!("{e:#}")),
         };
         let Some(body) = reply.content.filter(|text| !text.trim().is_empty()) else {
@@ -275,7 +275,6 @@ impl Compaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Usage;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn assistant(text: &str) -> Message {
@@ -368,7 +367,7 @@ mod tests {
     #[test]
     fn context_tokens_prefers_reported_usage() {
         let mut history = history();
-        let usage = Usage { prompt_tokens: 1, completion_tokens: 1, total_tokens: 999 };
+        let usage = crate::llm::testing::usage(1, 998);
         history[2].usage = Some(usage);
         assert_eq!(context_tokens(&history), 999);
         assert_eq!(context_tokens(&history[..2]), estimate_tokens(&history[..2]));
@@ -444,10 +443,15 @@ mod tests {
         called: AtomicUsize,
     }
     impl Llm for Stub {
-        fn chat(&self, _: &[Message], _: &serde_json::Value, _: Option<&AtomicBool>) -> anyhow::Result<Message> {
+        fn chat(
+            &self,
+            _: &[Message],
+            _: &serde_json::Value,
+            _: Option<&AtomicBool>,
+        ) -> anyhow::Result<(Message, Option<crate::llm::Usage>)> {
             self.called.fetch_add(1, Ordering::SeqCst);
             Ok(match self.reply.clone() {
-                Some(text) => assistant(&text),
+                Some(text) => (assistant(&text), None),
                 None => anyhow::bail!("model failed"),
             })
         }

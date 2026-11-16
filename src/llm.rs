@@ -21,16 +21,6 @@ fn excerpt(body: &str) -> String {
     format!("{}…", body.get(..end).unwrap_or_default())
 }
 
-/// What the provider reported for one model call, when it reports usage at all. Field names are
-/// the wire's own, so the response deserializes without a rename table.
-#[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Usage {
-    pub(crate) prompt_tokens: u64,
-    pub(crate) completion_tokens: u64,
-    pub(crate) total_tokens: u64,
-}
-
 /// One chat message in the chat-completions wire format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Message {
@@ -41,8 +31,8 @@ pub(crate) struct Message {
     pub(crate) tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
-    /// The usage the provider reported for this assistant message. Never serialized: it is
-    /// bookkeeping, not wire format.
+    /// The usage the provider reported for this assistant message, kept so compaction can size the
+    /// conversation from the provider's own count. Never serialized: it is bookkeeping.
     #[serde(skip)]
     pub(crate) usage: Option<Usage>,
     /// The raw summary body when this message is an injected compaction summary; `content` then
@@ -74,14 +64,7 @@ impl Message {
     /// An injected compaction summary: `body` is the raw text the summarizer produced, `rendered`
     /// the wrapper sent to the model.
     pub(crate) fn summary(body: String, rendered: String) -> Self {
-        Self {
-            role: "user".into(),
-            content: Some(rendered),
-            tool_calls: None,
-            tool_call_id: None,
-            usage: None,
-            summary: Some(body),
-        }
+        Self { summary: Some(body), ..Self::new("user", rendered) }
     }
 }
 
@@ -116,19 +99,41 @@ pub(crate) enum Piece<'a> {
     Reasoning(&'a str),
 }
 
+/// The token counts a provider reports for one model call. Most servers spell them
+/// `prompt_tokens`/`completion_tokens`, so each field takes both spellings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct Usage {
+    #[serde(default, alias = "prompt_tokens")]
+    input_tokens: u64,
+    #[serde(default, alias = "completion_tokens")]
+    output_tokens: u64,
+}
+
+impl Usage {
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.input_tokens, self.output_tokens)
+    }
+}
+
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
-    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message>;
+    /// `cancel` is the owner's interrupt flag, read between streamed lines.
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)>;
 
-    /// The same call with a token cap on the reply, used for the compaction summary. A backend
-    /// without a cap ignores it.
+    /// The same call with a ceiling on the reply, for the compaction summary. A backend without a
+    /// cap ignores it.
     fn chat_capped(
         &self,
         messages: &[Message],
         tools: &Value,
         cancel: Option<&AtomicBool>,
         max_tokens: u64,
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<Usage>)> {
         let _ = max_tokens;
         self.chat(messages, tools, cancel)
     }
@@ -140,10 +145,10 @@ pub(crate) trait Llm: Send + Sync {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
-        let message = self.chat(messages, tools, cancel)?;
+    ) -> Result<(Message, Option<Usage>)> {
+        let (message, usage) = self.chat(messages, tools, cancel)?;
         report(&message, on_piece);
-        Ok(message)
+        Ok((message, usage))
     }
 }
 
@@ -172,6 +177,7 @@ pub(crate) struct Backend {
     api_key: String,
     default_model: String,
     debug: Option<DebugSink>,
+    meter: Option<Arc<crate::bounds::Bounds>>,
     clients: Clients,
 }
 
@@ -181,6 +187,7 @@ impl Backend {
         api_key: String,
         default_model: String,
         debug: Option<DebugSink>,
+        meter: Option<Arc<crate::bounds::Bounds>>,
     ) -> Result<Self> {
         // reqwest's 30 s default is shorter than a long model answer.
         let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
@@ -190,6 +197,7 @@ impl Backend {
             api_key,
             default_model,
             debug,
+            meter,
             clients: Mutex::new(HashMap::new()),
         })
     }
@@ -208,6 +216,7 @@ impl Models for Backend {
                 model,
                 effort.map(str::to_string),
                 self.debug.clone(),
+                self.meter.clone(),
             ))
         }))
     }
@@ -221,6 +230,7 @@ pub(crate) struct OpenAiClient {
     /// Sent as `reasoning_effort`; `None` leaves the provider's own default.
     effort: Option<String>,
     debug: Option<DebugSink>,
+    meter: Option<Arc<crate::bounds::Bounds>>,
 }
 
 impl OpenAiClient {
@@ -231,26 +241,35 @@ impl OpenAiClient {
         model: String,
         effort: Option<String>,
         debug: Option<DebugSink>,
+        meter: Option<Arc<crate::bounds::Bounds>>,
     ) -> Self {
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug }
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug, meter }
     }
 }
 
 impl Llm for OpenAiClient {
-    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
-        self.exchange(messages, tools, cancel, None, &mut |_| ())
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)> {
+        let body = self.post(messages, tools, None, false)?;
+        let (message, usage) = parse_response(&body)?;
+        self.charge(usage);
+        Ok((message, usage))
     }
 
-    /// The summary is not shown as it streams, and a stalled read cannot be aborted from this
-    /// thread, so the request runs on a worker while this one polls the interrupt flag: `/stop`
-    /// returns at once instead of waiting for up to 16k output tokens.
+    /// A summary is not shown as it streams, and a stalled read cannot be aborted in place, so the
+    /// request runs on a worker while this thread polls the interrupt flag: `/stop` returns at once
+    /// instead of waiting for up to 16k output tokens.
     fn chat_capped(
         &self,
         messages: &[Message],
         tools: &Value,
         cancel: Option<&AtomicBool>,
         max_tokens: u64,
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<Usage>)> {
         if cancelled(cancel) {
             bail!(INTERRUPTED);
         }
@@ -261,6 +280,7 @@ impl Llm for OpenAiClient {
             model: self.model.clone(),
             effort: self.effort.clone(),
             debug: self.debug.clone(),
+            meter: self.meter.clone(),
         };
         let messages = messages.to_vec();
         let tools = tools.clone();
@@ -287,15 +307,41 @@ impl Llm for OpenAiClient {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
-        self.exchange(messages, tools, cancel, None, on_piece)
+    ) -> Result<(Message, Option<Usage>)> {
+        let response = self.send(messages, tools, None, true)?;
+        let streamed = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        if !streamed {
+            // A provider that ignored `stream` sends one whole response instead.
+            let body = response.text().context("reading model response failed")?;
+            let (message, usage) = parse_response(&body)?;
+            report(&message, on_piece);
+            self.charge(usage);
+            return Ok((message, usage));
+        }
+        let (message, usage) = read_stream(std::io::BufReader::new(response), cancel, on_piece)?;
+        self.charge(usage);
+        Ok((message, usage))
     }
 }
 
 impl OpenAiClient {
-    /// One request, streamed. Every blocking call goes through here so the interrupt flag is read
-    /// between lines: a compaction summary costs up to 16k output tokens and must not hold an
-    /// interrupt until it finishes. A provider that ignored `stream` answers whole instead.
+    /// Bills the meter for the tokens a successful call reported. A call that reported none is
+    /// counted as unbilled instead of silently escaping a cost bound.
+    fn charge(&self, usage: Option<Usage>) {
+        let Some(meter) = &self.meter else { return };
+        match usage {
+            Some(usage) => meter.charge(&self.model, usage.counts()),
+            None if meter.wants_usage() => meter.note_unbilled(),
+            None => {}
+        }
+    }
+
+    /// One request, read as a stream so the interrupt flag is read between lines. A provider that
+    /// ignored `stream` answers whole instead.
     fn exchange(
         &self,
         messages: &[Message],
@@ -303,10 +349,7 @@ impl OpenAiClient {
         cancel: Option<&AtomicBool>,
         max_tokens: Option<u64>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
-        if cancelled(cancel) {
-            bail!(INTERRUPTED);
-        }
+    ) -> Result<(Message, Option<Usage>)> {
         let response = self.send(messages, tools, max_tokens, true)?;
         let streamed = response
             .headers()
@@ -314,37 +357,64 @@ impl OpenAiClient {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("text/event-stream"));
         if streamed {
-            return read_stream(std::io::BufReader::new(response), cancel, on_piece);
+            let (message, usage) = read_stream(std::io::BufReader::new(response), cancel, on_piece)?;
+            self.charge(usage);
+            return Ok((message, usage));
         }
         let status = response.status();
         let body = response.text().context("reading model response failed")?;
         if !status.is_success() {
             bail!("model returned HTTP {status}: {}", excerpt(&body));
         }
-        let message = parse_response(&body)?;
+        let (message, usage) = parse_response(&body)?;
         report(&message, on_piece);
-        Ok(message)
+        self.charge(usage);
+        Ok((message, usage))
     }
 
-    fn payload(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Value {
+    fn post(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Result<String> {
+        let response = self.send(messages, tools, max_tokens, stream)?;
+        let status = response.status();
+        let body = response.text().context("reading model response failed")?;
+        if !status.is_success() {
+            bail!("model returned HTTP {status}: {}", excerpt(&body));
+        }
+        Ok(body)
+    }
+
+    fn payload(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        max_tokens: Option<u64>,
+        stream: bool,
+        usage: bool,
+    ) -> Value {
         let mut payload =
             json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
-        if let Some(effort) = &self.effort
-            && let Some(object) = payload.as_object_mut()
-        {
-            object.insert("reasoning_effort".into(), Value::String(effort.clone()));
-        }
         if let Some(max_tokens) = max_tokens
             && let Some(object) = payload.as_object_mut()
         {
             object.insert("max_tokens".into(), Value::from(max_tokens));
         }
-        // OpenAI reports no usage on a stream without this; a provider that ignores the option
-        // simply yields no usage, and the token estimate covers that.
-        if stream && let Some(object) = payload.as_object_mut() {
+        // Gated: some servers reject the field, and with no cost bound the tokens are not needed.
+        if stream
+            && usage
+            && let Some(object) = payload.as_object_mut()
+        {
             object.insert("stream_options".into(), json!({ "include_usage": true }));
         }
+        if let Some(effort) = &self.effort
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        }
         payload
+    }
+
+    /// Whether this client asks its provider for token counts on streamed calls.
+    fn wants_usage(&self) -> bool {
+        self.meter.as_ref().is_some_and(|meter| meter.wants_usage())
     }
 
     fn send(
@@ -354,17 +424,25 @@ impl OpenAiClient {
         max_tokens: Option<u64>,
         stream: bool,
     ) -> Result<reqwest::blocking::Response> {
-        let payload = self.payload(messages, tools, max_tokens, stream);
-        if let Some(sink) = &self.debug {
-            sink(&payload.to_string());
+        let mut payload = self.payload(messages, tools, max_tokens, stream, self.wants_usage());
+        let sent = |payload: &Value| {
+            if let Some(sink) = &self.debug {
+                sink(&payload.to_string());
+            }
+            self.http
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(payload)
+                .send()
+                .context("request to model failed")
+        };
+        let mut response = sent(&payload)?;
+        // A server that rejects `stream_options` with a 400 gets one retry without it: the answer
+        // is worth streaming even if its tokens cannot be billed.
+        if stream && self.wants_usage() && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            payload = self.payload(messages, tools, max_tokens, stream, false);
+            response = sent(&payload)?;
         }
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .context("request to model failed")?;
         let status = response.status();
         if stream && !status.is_success() {
             let body = response.text().context("reading model response failed")?;
@@ -377,6 +455,7 @@ impl OpenAiClient {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
     usage: Option<Usage>,
 }
 
@@ -385,24 +464,28 @@ struct Choice {
     message: Message,
 }
 
-fn parse_response(body: &str) -> Result<Message> {
+fn parse_response(body: &str) -> Result<(Message, Option<Usage>)> {
     let response: ChatResponse =
         serde_json::from_str(body).with_context(|| format!("unexpected model response: {}", excerpt(body)))?;
-    let mut message =
-        response.choices.into_iter().next().map(|c| c.message).context("model response has no choices")?;
-    message.usage = response.usage;
-    Ok(message)
+    response
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| (choice.message, response.usage))
+        .context("model response has no choices")
 }
 
+/// One `data:` line of a chat-completions stream.
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
     /// A provider reports a mid-stream failure here, with no choices.
     error: Option<serde_json::Value>,
-    usage: Option<Usage>,
 }
-/// One `data:` line of a chat-completions stream.
+
 #[derive(Deserialize)]
 struct StreamChoice {
     /// Which of the request's `n` answers this chunk belongs to; only the first is kept.
@@ -444,11 +527,11 @@ fn read_stream(
     reader: impl std::io::BufRead,
     cancel: Option<&AtomicBool>,
     on_piece: &mut dyn FnMut(Piece<'_>),
-) -> Result<Message> {
+) -> Result<(Message, Option<Usage>)> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
-    let mut usage: Option<Usage> = None;
     let mut complete = false;
+    let mut usage = None;
     for line in reader.lines() {
         if cancelled(cancel) {
             bail!(INTERRUPTED);
@@ -469,6 +552,10 @@ fn read_stream(
             serde_json::from_str(data).with_context(|| format!("unexpected stream chunk: {}", excerpt(data)))?;
         if let Some(error) = chunk.error {
             bail!("model stream failed: {error}");
+        }
+        if chunk.usage.is_some() {
+            // Servers send usage on a final chunk whose `choices` is empty; the last one wins.
+            usage = chunk.usage;
         }
         for choice in chunk.choices {
             if choice.index != 0 {
@@ -491,9 +578,6 @@ fn read_stream(
                 merge_fragment(&mut calls, fragment)?;
             }
         }
-        if chunk.usage.is_some() {
-            usage = chunk.usage;
-        }
     }
     if !complete {
         bail!("model stream ended before it finished");
@@ -511,7 +595,9 @@ fn read_stream(
     }
     let tool_calls = (!calls.is_empty()).then_some(calls);
     let content = (!content.is_empty()).then_some(content);
-    Ok(Message { role: "assistant".into(), content, tool_calls, tool_call_id: None, usage, summary: None })
+    let message =
+        Message { role: "assistant".into(), content, tool_calls, tool_call_id: None, usage: None, summary: None };
+    Ok((message, usage))
 }
 
 fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
@@ -565,19 +651,13 @@ impl StreamLlm {
 }
 
 impl Llm for StreamLlm {
-    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
-        self.chat_stream(messages, tools, cancel, &mut |_| ())
-    }
-
-    fn chat_capped(
+    fn chat(
         &self,
         messages: &[Message],
         tools: &Value,
         cancel: Option<&AtomicBool>,
-        max_tokens: u64,
-    ) -> Result<Message> {
-        // A summary is not shown as it streams; the cap is forwarded to the inner client.
-        self.inner.chat_capped(messages, tools, cancel, max_tokens)
+    ) -> Result<(Message, Option<Usage>)> {
+        self.chat_stream(messages, tools, cancel, &mut |_| ())
     }
 
     fn chat_stream(
@@ -586,7 +666,7 @@ impl Llm for StreamLlm {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<Usage>)> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
         self.inner.chat_stream(messages, tools, cancel, &mut |piece| {
@@ -603,6 +683,11 @@ impl Llm for StreamLlm {
 pub(crate) mod testing {
     use super::*;
     use std::sync::Mutex;
+
+    /// A usage a scripted provider reports, for tests that need one.
+    pub(crate) fn usage(input: u64, output: u64) -> Usage {
+        serde_json::from_value(json!({ "input_tokens": input, "output_tokens": output })).unwrap()
+    }
 
     pub(crate) fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
         ToolCall {
@@ -644,12 +729,12 @@ pub(crate) mod testing {
     }
 
     impl Llm for Scripted {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<(Message, Option<Usage>)> {
             let mut replies = self.0.lock().unwrap();
             if replies.is_empty() {
                 bail!("script exhausted");
             }
-            Ok(replies.remove(0))
+            Ok((replies.remove(0), None))
         }
     }
 
@@ -659,6 +744,41 @@ pub(crate) mod testing {
     impl Models for Fixed {
         fn get(&self, _: Option<&str>, _: Option<&str>) -> Arc<dyn Llm> {
             Arc::clone(&self.0)
+        }
+    }
+
+    /// Records every request it sees, then delegates: a test reads back what reached the model.
+    pub(crate) struct Recording {
+        inner: Arc<dyn Llm>,
+        pub(crate) requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Recording {
+        pub(crate) fn new(inner: Arc<dyn Llm>) -> Self {
+            Self { inner, requests: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Llm for Recording {
+        fn chat(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<(Message, Option<Usage>)> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat(messages, tools, cancel)
+        }
+
+        fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+            on_piece: &mut dyn FnMut(Piece<'_>),
+        ) -> Result<(Message, Option<Usage>)> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat_stream(messages, tools, cancel, on_piece)
         }
     }
 }
@@ -679,7 +799,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = String::new();
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             if let Piece::Text(text) = piece {
                 seen.push_str(text);
             }
@@ -702,7 +822,7 @@ mod tests {
             "\"function\":{\"name\":\"file\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
         assert_eq!(message.tool_calls.unwrap()[0].function.name, "read_file");
     }
 
@@ -757,7 +877,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = Vec::new();
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             seen.push(match piece {
                 Piece::Text(text) => format!("text {text}"),
                 Piece::Reasoning(text) => format!("think {text}"),
@@ -831,15 +951,16 @@ mod tests {
 
     #[test]
     fn parses_text_reply_with_null_tool_calls() {
-        let m = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hello","tool_calls":null}}]}"#)
-            .unwrap();
+        let (m, _) =
+            parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hello","tool_calls":null}}]}"#)
+                .unwrap();
         assert_eq!(m.content.as_deref(), Some("hello"));
         assert_eq!(m.tool_calls, None);
     }
 
     #[test]
     fn parses_tool_call_reply() {
-        let m = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#).unwrap();
+        let (m, _) = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#).unwrap();
         let calls = m.tool_calls.unwrap();
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].function.name, "bash");
@@ -861,18 +982,18 @@ mod tests {
     #[test]
     fn a_request_carries_the_effort_only_when_one_is_set() {
         let http = reqwest::blocking::Client::new();
-        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None);
-        let body = plain.payload(&[], &json!([]), None, false);
+        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, None);
+        let body = plain.payload(&[], &json!([]), None, false, false);
         assert!(body.get("reasoning_effort").is_none());
-        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None);
-        let body = effortful.payload(&[], &json!([]), None, false);
+        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None, None);
+        let body = effortful.payload(&[], &json!([]), None, false, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["model"], "m");
     }
 
     #[test]
     fn the_backend_reuses_one_client_per_pair() {
-        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None).unwrap();
+        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None, None).unwrap();
         let first = backend.get(None, None);
         assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
         assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
@@ -880,153 +1001,66 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_response_reports_its_usage() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],
-            "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
-        let message = parse_response(body).unwrap();
-        assert_eq!(message.usage, Some(Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }));
+    fn a_response_carries_the_provider_usage() {
+        let (m, usage) = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content.as_deref(), Some("hi"));
+        assert_eq!(usage, Some(Usage { input_tokens: 7, output_tokens: 3 }));
+        // A response without one reports no usage, and the client bills nothing.
+        let (_, none) = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#).unwrap();
+        assert_eq!(none, None);
     }
 
     #[test]
-    fn a_stream_reports_the_usage_of_its_last_chunk() {
+    fn a_streams_final_usage_chunk_reaches_the_caller() {
         let sse = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,",
-            "\"total_tokens\":6}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
             "data: [DONE]\n\n",
         );
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
-        assert_eq!(message.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }));
-    }
-
-    #[test]
-    fn a_response_without_usage_carries_none() {
-        let message = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#).unwrap();
-        assert_eq!(message.usage, None);
-        let sse =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        assert_eq!(read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap().usage, None);
-    }
-
-    #[test]
-    fn usage_is_asked_for_on_a_stream_and_only_there() {
-        let client =
-            OpenAiClient::new(reqwest::blocking::Client::new(), "http://x/v1", "k".into(), "m".into(), None, None);
-        assert!(client.payload(&[], &json!([]), None, false).get("stream_options").is_none());
-        assert_eq!(client.payload(&[], &json!([]), None, true)["stream_options"], json!({"include_usage": true}));
-    }
-
-    /// A blocking call goes over the wire as a stream, so the interrupt flag reaches it between
-    /// lines instead of after the whole answer.
-    #[test]
-    fn a_blocking_call_reads_a_streamed_answer() {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let read = socket.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                let text = String::from_utf8_lossy(&request);
-                if let (Some(head), Some(length)) = (text.find("\r\n\r\n"), content_length(&text))
-                    && request.len() >= head + 4 + length
-                {
-                    break;
-                }
-            }
-            let text = String::from_utf8_lossy(&request).to_string();
-            assert!(text.contains("\"stream\":true"), "a blocking call must stream: {text}");
-            let body = concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,",
-                "\"total_tokens\":2}}\n\n",
-                "data: [DONE]\n\n",
-            );
-            let head =
-                format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n", body.len());
-            socket.write_all(head.as_bytes()).unwrap();
-            socket.write_all(body.as_bytes()).unwrap();
-        });
-        let client = OpenAiClient::new(
-            reqwest::blocking::Client::new(),
-            &format!("http://{addr}/v1"),
-            "k".into(),
-            "m".into(),
-            None,
-            None,
-        );
-        let message = client.chat(&[], &json!([]), None).unwrap();
+        let (message, usage) = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
         assert_eq!(message.content.as_deref(), Some("hi"));
-        assert_eq!(message.usage.map(|usage| usage.total_tokens), Some(2));
-        server.join().unwrap();
+        assert_eq!(usage, Some(Usage { input_tokens: 5, output_tokens: 2 }));
     }
 
-    /// A stalled summary read cannot be aborted in place; `chat_capped` polls the flag instead. The
-    /// summary costs up to 16k output tokens and must not hold `/stop` for that long.
     #[test]
-    fn an_interrupt_stops_a_stalled_summary_call() {
-        use std::io::{Read, Write};
+    fn the_stream_options_key_appears_only_for_a_cost_bound() {
+        let http = reqwest::blocking::Client::new();
+        let bounded = crate::bounds::Bounds::new(None, Some(1.0), HashMap::new());
+        let client =
+            OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, Some(Arc::new(bounded)));
+        assert!(client.payload(&[], &json!([]), None, true, true).get("stream_options").is_some());
+        assert!(
+            client.payload(&[], &json!([]), None, false, true).get("stream_options").is_none(),
+            "non-streaming asks for usage inline"
+        );
+        let unbounded = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), None, None, None);
+        assert!(unbounded.payload(&[], &json!([]), None, true, false).get("stream_options").is_none());
+    }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 1024];
-            let _ = socket.read(&mut buffer);
-            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
-            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"thinking\"}}]}\n\n";
-            socket.write_all(head.as_bytes()).unwrap();
-            socket.write_all(chunk.as_bytes()).unwrap();
-            socket.flush().unwrap();
-            // Hold the connection open: only the flag can end the call.
-            std::thread::sleep(Duration::from_secs(2));
-            let _ = socket.write_all(b"data: [DONE]\n\n");
-        });
-        let cancel = Arc::new(AtomicBool::new(false));
-        let trigger = Arc::clone(&cancel);
-        let stopper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            trigger.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
+    #[test]
+    fn a_priced_model_is_billed_and_an_unpriced_one_is_not() {
+        let pricing = HashMap::from([("m".into(), crate::bounds::Price { input: 3.0, output: 15.0 })]);
+        let meter = Arc::new(crate::bounds::Bounds::new(None, Some(100.0), pricing));
+        let http = reqwest::blocking::Client::new();
         let client = OpenAiClient::new(
-            reqwest::blocking::Client::new(),
-            &format!("http://{addr}/v1"),
+            http.clone(),
+            "http://x/v1",
             "k".into(),
             "m".into(),
             None,
             None,
+            Some(Arc::clone(&meter)),
         );
-        let started = std::time::Instant::now();
-        let error = client.chat_capped(&[], &json!([]), Some(&cancel), 100).unwrap_err();
-        assert_eq!(error.to_string(), INTERRUPTED);
-        assert!(started.elapsed() < Duration::from_secs(1), "the call waited for the answer anyway");
-        stopper.join().unwrap();
-        server.join().unwrap();
-    }
-
-    fn content_length(request: &str) -> Option<usize> {
-        request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
-        })
-    }
-
-    #[test]
-    fn a_capped_call_carries_its_cap_and_the_default_ignores_it() {
-        let client =
-            OpenAiClient::new(reqwest::blocking::Client::new(), "http://x/v1", "k".into(), "m".into(), None, None);
-        assert_eq!(client.payload(&[], &json!([]), Some(64), false)["max_tokens"], 64);
-        assert!(client.payload(&[], &json!([]), None, false).get("max_tokens").is_none());
-        let scripted = testing::Scripted::new(vec![testing::text("hi")]);
-        let reply = scripted.chat_capped(&[], &json!([]), None, 5).unwrap();
-        assert_eq!(reply.content.as_deref(), Some("hi"), "a backend with no cap answers anyway");
+        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
+        assert_eq!(meter.spent(), 18.0);
+        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 0 }));
+        assert_eq!(meter.spent(), 21.0);
+        let other =
+            OpenAiClient::new(http, "http://x/v1", "k".into(), "unpriced".into(), None, None, Some(Arc::clone(&meter)));
+        other.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
+        assert_eq!(meter.spent(), 21.0, "a model the table does not name counts $0");
     }
 }
