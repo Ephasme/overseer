@@ -79,10 +79,31 @@ pub(crate) enum Piece<'a> {
     Reasoning(&'a str),
 }
 
+/// The token counts a provider reports for one model call. Most servers spell them
+/// `prompt_tokens`/`completion_tokens`, so each field takes both spellings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct Usage {
+    #[serde(default, alias = "prompt_tokens")]
+    input_tokens: u64,
+    #[serde(default, alias = "completion_tokens")]
+    output_tokens: u64,
+}
+
+impl Usage {
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.input_tokens, self.output_tokens)
+    }
+}
+
 /// Turns a conversation into the next assistant message. Lets tests script the model.
 pub(crate) trait Llm: Send + Sync {
     /// `cancel` is the owner's interrupt flag, read between streamed lines.
-    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message>;
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)>;
 
     /// The same call, reporting pieces as they arrive. A backend without streaming reports them once.
     fn chat_stream(
@@ -91,10 +112,10 @@ pub(crate) trait Llm: Send + Sync {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
-        let message = self.chat(messages, tools, cancel)?;
+    ) -> Result<(Message, Option<Usage>)> {
+        let (message, usage) = self.chat(messages, tools, cancel)?;
         report(&message, on_piece);
-        Ok(message)
+        Ok((message, usage))
     }
 }
 
@@ -123,6 +144,7 @@ pub(crate) struct Backend {
     api_key: String,
     default_model: String,
     debug: Option<DebugSink>,
+    meter: Option<Arc<crate::bounds::Bounds>>,
     clients: Clients,
 }
 
@@ -132,6 +154,7 @@ impl Backend {
         api_key: String,
         default_model: String,
         debug: Option<DebugSink>,
+        meter: Option<Arc<crate::bounds::Bounds>>,
     ) -> Result<Self> {
         // reqwest's 30 s default is shorter than a long model answer.
         let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build()?;
@@ -141,6 +164,7 @@ impl Backend {
             api_key,
             default_model,
             debug,
+            meter,
             clients: Mutex::new(HashMap::new()),
         })
     }
@@ -159,6 +183,7 @@ impl Models for Backend {
                 model,
                 effort.map(str::to_string),
                 self.debug.clone(),
+                self.meter.clone(),
             ))
         }))
     }
@@ -172,6 +197,7 @@ pub(crate) struct OpenAiClient {
     /// Sent as `reasoning_effort`; `None` leaves the provider's own default.
     effort: Option<String>,
     debug: Option<DebugSink>,
+    meter: Option<Arc<crate::bounds::Bounds>>,
 }
 
 impl OpenAiClient {
@@ -182,15 +208,23 @@ impl OpenAiClient {
         model: String,
         effort: Option<String>,
         debug: Option<DebugSink>,
+        meter: Option<Arc<crate::bounds::Bounds>>,
     ) -> Self {
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug }
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, model, effort, debug, meter }
     }
 }
 
 impl Llm for OpenAiClient {
-    fn chat(&self, messages: &[Message], tools: &Value, _cancel: Option<&AtomicBool>) -> Result<Message> {
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)> {
         let body = self.post(messages, tools, false)?;
-        parse_response(&body)
+        let (message, usage) = parse_response(&body)?;
+        self.charge(usage);
+        Ok((message, usage))
     }
 
     fn chat_stream(
@@ -199,7 +233,7 @@ impl Llm for OpenAiClient {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<Usage>)> {
         let response = self.send(messages, tools, true)?;
         let streamed = response
             .headers()
@@ -209,15 +243,29 @@ impl Llm for OpenAiClient {
         if !streamed {
             // A provider that ignored `stream` sends one whole response instead.
             let body = response.text().context("reading model response failed")?;
-            let message = parse_response(&body)?;
+            let (message, usage) = parse_response(&body)?;
             report(&message, on_piece);
-            return Ok(message);
+            self.charge(usage);
+            return Ok((message, usage));
         }
-        read_stream(std::io::BufReader::new(response), cancel, on_piece)
+        let (message, usage) = read_stream(std::io::BufReader::new(response), cancel, on_piece)?;
+        self.charge(usage);
+        Ok((message, usage))
     }
 }
 
 impl OpenAiClient {
+    /// Bills the meter for the tokens a successful call reported. A call that reported none is
+    /// counted as unbilled instead of silently escaping a cost bound.
+    fn charge(&self, usage: Option<Usage>) {
+        let Some(meter) = &self.meter else { return };
+        match usage {
+            Some(usage) => meter.charge(&self.model, usage.counts()),
+            None if meter.wants_usage() => meter.note_unbilled(),
+            None => {}
+        }
+    }
+
     fn post(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<String> {
         let response = self.send(messages, tools, stream)?;
         let status = response.status();
@@ -228,9 +276,16 @@ impl OpenAiClient {
         Ok(body)
     }
 
-    fn payload(&self, messages: &[Message], tools: &Value, stream: bool) -> Value {
+    fn payload(&self, messages: &[Message], tools: &Value, stream: bool, usage: bool) -> Value {
         let mut payload =
             json!({ "model": self.model, "messages": messages, "tools": tools, "stream": stream, "n": 1 });
+        // Gated: some servers reject the field, and with no cost bound the tokens are not needed.
+        if stream
+            && usage
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("stream_options".into(), json!({ "include_usage": true }));
+        }
         if let Some(effort) = &self.effort
             && let Some(object) = payload.as_object_mut()
         {
@@ -239,18 +294,31 @@ impl OpenAiClient {
         payload
     }
 
+    /// Whether this client asks its provider for token counts on streamed calls.
+    fn wants_usage(&self) -> bool {
+        self.meter.as_ref().is_some_and(|meter| meter.wants_usage())
+    }
+
     fn send(&self, messages: &[Message], tools: &Value, stream: bool) -> Result<reqwest::blocking::Response> {
-        let payload = self.payload(messages, tools, stream);
-        if let Some(sink) = &self.debug {
-            sink(&payload.to_string());
+        let mut payload = self.payload(messages, tools, stream, self.wants_usage());
+        let sent = |payload: &Value| {
+            if let Some(sink) = &self.debug {
+                sink(&payload.to_string());
+            }
+            self.http
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(payload)
+                .send()
+                .context("request to model failed")
+        };
+        let mut response = sent(&payload)?;
+        // A server that rejects `stream_options` with a 400 gets one retry without it: the answer
+        // is worth streaming even if its tokens cannot be billed.
+        if stream && self.wants_usage() && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            payload = self.payload(messages, tools, stream, false);
+            response = sent(&payload)?;
         }
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .context("request to model failed")?;
         let status = response.status();
         if stream && !status.is_success() {
             let body = response.text().context("reading model response failed")?;
@@ -263,6 +331,8 @@ impl OpenAiClient {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -270,10 +340,15 @@ struct Choice {
     message: Message,
 }
 
-fn parse_response(body: &str) -> Result<Message> {
+fn parse_response(body: &str) -> Result<(Message, Option<Usage>)> {
     let response: ChatResponse =
         serde_json::from_str(body).with_context(|| format!("unexpected model response: {}", excerpt(body)))?;
-    response.choices.into_iter().next().map(|c| c.message).context("model response has no choices")
+    response
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| (choice.message, response.usage))
+        .context("model response has no choices")
 }
 
 /// One `data:` line of a chat-completions stream.
@@ -281,6 +356,8 @@ fn parse_response(body: &str) -> Result<Message> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
     /// A provider reports a mid-stream failure here, with no choices.
     error: Option<serde_json::Value>,
 }
@@ -326,10 +403,11 @@ fn read_stream(
     reader: impl std::io::BufRead,
     cancel: Option<&AtomicBool>,
     on_piece: &mut dyn FnMut(Piece<'_>),
-) -> Result<Message> {
+) -> Result<(Message, Option<Usage>)> {
     let mut content = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut complete = false;
+    let mut usage = None;
     for line in reader.lines() {
         if cancelled(cancel) {
             bail!(INTERRUPTED);
@@ -350,6 +428,10 @@ fn read_stream(
             serde_json::from_str(data).with_context(|| format!("unexpected stream chunk: {}", excerpt(data)))?;
         if let Some(error) = chunk.error {
             bail!("model stream failed: {error}");
+        }
+        if chunk.usage.is_some() {
+            // Servers send usage on a final chunk whose `choices` is empty; the last one wins.
+            usage = chunk.usage;
         }
         for choice in chunk.choices {
             if choice.index != 0 {
@@ -389,7 +471,7 @@ fn read_stream(
     }
     let tool_calls = (!calls.is_empty()).then_some(calls);
     let content = (!content.is_empty()).then_some(content);
-    Ok(Message { role: "assistant".into(), content, tool_calls, tool_call_id: None })
+    Ok((Message { role: "assistant".into(), content, tool_calls, tool_call_id: None }, usage))
 }
 
 fn merge_fragment(calls: &mut Vec<ToolCall>, fragment: Fragment) -> Result<()> {
@@ -443,7 +525,12 @@ impl StreamLlm {
 }
 
 impl Llm for StreamLlm {
-    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+    fn chat(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Message, Option<Usage>)> {
         self.chat_stream(messages, tools, cancel, &mut |_| ())
     }
 
@@ -453,7 +540,7 @@ impl Llm for StreamLlm {
         tools: &Value,
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<Usage>)> {
         // A turn makes several model calls; the frontend needs to see where one answer ends.
         (self.sink)(StreamStep::Start);
         self.inner.chat_stream(messages, tools, cancel, &mut |piece| {
@@ -502,12 +589,12 @@ pub(crate) mod testing {
     }
 
     impl Llm for Scripted {
-        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<Message> {
+        fn chat(&self, _: &[Message], _: &Value, _: Option<&AtomicBool>) -> Result<(Message, Option<Usage>)> {
             let mut replies = self.0.lock().unwrap();
             if replies.is_empty() {
                 bail!("script exhausted");
             }
-            Ok(replies.remove(0))
+            Ok((replies.remove(0), None))
         }
     }
 
@@ -517,6 +604,41 @@ pub(crate) mod testing {
     impl Models for Fixed {
         fn get(&self, _: Option<&str>, _: Option<&str>) -> Arc<dyn Llm> {
             Arc::clone(&self.0)
+        }
+    }
+
+    /// Records every request it sees, then delegates: a test reads back what reached the model.
+    pub(crate) struct Recording {
+        inner: Arc<dyn Llm>,
+        pub(crate) requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Recording {
+        pub(crate) fn new(inner: Arc<dyn Llm>) -> Self {
+            Self { inner, requests: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl Llm for Recording {
+        fn chat(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<(Message, Option<Usage>)> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat(messages, tools, cancel)
+        }
+
+        fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &Value,
+            cancel: Option<&AtomicBool>,
+            on_piece: &mut dyn FnMut(Piece<'_>),
+        ) -> Result<(Message, Option<Usage>)> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.inner.chat_stream(messages, tools, cancel, on_piece)
         }
     }
 }
@@ -537,7 +659,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = String::new();
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             if let Piece::Text(text) = piece {
                 seen.push_str(text);
             }
@@ -560,7 +682,7 @@ mod tests {
             "\"function\":{\"name\":\"file\"}}]}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
         assert_eq!(message.tool_calls.unwrap()[0].function.name, "read_file");
     }
 
@@ -615,7 +737,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
         let mut seen = Vec::new();
-        let message = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
+        let (message, _) = read_stream(std::io::Cursor::new(sse), None, &mut |piece| {
             seen.push(match piece {
                 Piece::Text(text) => format!("text {text}"),
                 Piece::Reasoning(text) => format!("think {text}"),
@@ -689,15 +811,16 @@ mod tests {
 
     #[test]
     fn parses_text_reply_with_null_tool_calls() {
-        let m = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hello","tool_calls":null}}]}"#)
-            .unwrap();
+        let (m, _) =
+            parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hello","tool_calls":null}}]}"#)
+                .unwrap();
         assert_eq!(m.content.as_deref(), Some("hello"));
         assert_eq!(m.tool_calls, None);
     }
 
     #[test]
     fn parses_tool_call_reply() {
-        let m = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#).unwrap();
+        let (m, _) = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#).unwrap();
         let calls = m.tool_calls.unwrap();
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].function.name, "bash");
@@ -719,21 +842,85 @@ mod tests {
     #[test]
     fn a_request_carries_the_effort_only_when_one_is_set() {
         let http = reqwest::blocking::Client::new();
-        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None);
-        let body = plain.payload(&[], &json!([]), false);
+        let plain = OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, None);
+        let body = plain.payload(&[], &json!([]), false, false);
         assert!(body.get("reasoning_effort").is_none());
-        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None);
-        let body = effortful.payload(&[], &json!([]), false);
+        let effortful = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), Some("high".into()), None, None);
+        let body = effortful.payload(&[], &json!([]), false, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["model"], "m");
     }
 
     #[test]
     fn the_backend_reuses_one_client_per_pair() {
-        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None).unwrap();
+        let backend = Backend::new("http://x/v1", "k".into(), "default".into(), None, None).unwrap();
         let first = backend.get(None, None);
         assert!(Arc::ptr_eq(&first, &backend.get(None, None)), "the default pair is built once");
         assert!(!Arc::ptr_eq(&first, &backend.get(Some("other"), None)));
         assert!(!Arc::ptr_eq(&first, &backend.get(None, Some("high"))));
+    }
+
+    #[test]
+    fn a_response_carries_the_provider_usage() {
+        let (m, usage) = parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content.as_deref(), Some("hi"));
+        assert_eq!(usage, Some(Usage { input_tokens: 7, output_tokens: 3 }));
+        // A response without one reports no usage, and the client bills nothing.
+        let (_, none) = parse_response(r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#).unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn a_streams_final_usage_chunk_reaches_the_caller() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (message, usage) = read_stream(std::io::Cursor::new(sse), None, &mut |_| ()).unwrap();
+        assert_eq!(message.content.as_deref(), Some("hi"));
+        assert_eq!(usage, Some(Usage { input_tokens: 5, output_tokens: 2 }));
+    }
+
+    #[test]
+    fn the_stream_options_key_appears_only_for_a_cost_bound() {
+        let http = reqwest::blocking::Client::new();
+        let bounded = crate::bounds::Bounds::new(None, Some(1.0), HashMap::new());
+        let client =
+            OpenAiClient::new(http.clone(), "http://x/v1", "k".into(), "m".into(), None, None, Some(Arc::new(bounded)));
+        assert!(client.payload(&[], &json!([]), true, true).get("stream_options").is_some());
+        assert!(
+            client.payload(&[], &json!([]), false, true).get("stream_options").is_none(),
+            "non-streaming asks for usage inline"
+        );
+        let unbounded = OpenAiClient::new(http, "http://x/v1", "k".into(), "m".into(), None, None, None);
+        assert!(unbounded.payload(&[], &json!([]), true, false).get("stream_options").is_none());
+    }
+
+    #[test]
+    fn a_priced_model_is_billed_and_an_unpriced_one_is_not() {
+        let pricing = HashMap::from([("m".into(), crate::bounds::Price { input: 3.0, output: 15.0 })]);
+        let meter = Arc::new(crate::bounds::Bounds::new(None, Some(100.0), pricing));
+        let http = reqwest::blocking::Client::new();
+        let client = OpenAiClient::new(
+            http.clone(),
+            "http://x/v1",
+            "k".into(),
+            "m".into(),
+            None,
+            None,
+            Some(Arc::clone(&meter)),
+        );
+        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
+        assert_eq!(meter.spent(), 18.0);
+        client.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 0 }));
+        assert_eq!(meter.spent(), 21.0);
+        let other =
+            OpenAiClient::new(http, "http://x/v1", "k".into(), "unpriced".into(), None, None, Some(Arc::clone(&meter)));
+        other.charge(Some(Usage { input_tokens: 1_000_000, output_tokens: 1_000_000 }));
+        assert_eq!(meter.spent(), 21.0, "a model the table does not name counts $0");
     }
 }

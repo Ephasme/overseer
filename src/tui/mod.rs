@@ -469,17 +469,17 @@ mod tests {
         app.apply(UiEvent::ApprovalRequest { agent: 2, request: 7, tool: "bash".into(), call: "ls".into() });
         assert_eq!(
             keyed(&mut app, KeyCode::Char('y')),
-            Some(crate::swarm::Event::Approve { request: 7, choice: crate::approvals::Choice::Once })
+            Some(crate::swarm::Event::Resolve { request: 7, choice: crate::approvals::Choice::Once })
         );
         app.apply(UiEvent::ApprovalRequest { agent: 2, request: 8, tool: "bash".into(), call: "ls".into() });
         assert_eq!(
             keyed(&mut app, KeyCode::Char('a')),
-            Some(crate::swarm::Event::Approve { request: 8, choice: crate::approvals::Choice::Always })
+            Some(crate::swarm::Event::Resolve { request: 8, choice: crate::approvals::Choice::Always })
         );
         app.apply(UiEvent::ApprovalRequest { agent: 2, request: 9, tool: "bash".into(), call: "ls".into() });
         assert_eq!(
             keyed(&mut app, KeyCode::Char('n')),
-            Some(crate::swarm::Event::Approve { request: 9, choice: crate::approvals::Choice::Deny })
+            Some(crate::swarm::Event::Resolve { request: 9, choice: crate::approvals::Choice::Deny })
         );
         app.apply(UiEvent::ApprovalRequest { agent: 2, request: 10, tool: "bash".into(), call: "ls".into() });
         assert_eq!(keyed(&mut app, KeyCode::Char('x')), None, "an unrelated key sends nothing");
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(app.take_prompt(), "", "nothing was typed into the composer either");
         assert_eq!(
             keyed(&mut app, KeyCode::Char('y')),
-            Some(crate::swarm::Event::Approve { request: 10, choice: crate::approvals::Choice::Once })
+            Some(crate::swarm::Event::Resolve { request: 10, choice: crate::approvals::Choice::Once })
         );
         assert!(!app.approvals_open());
     }
@@ -509,7 +509,7 @@ mod tests {
         assert!(app.approvals_open(), "a control chord leaves the prompt alone");
         assert_eq!(
             keyed_with(&mut app, KeyCode::Char('Y'), KeyModifiers::SHIFT),
-            Some(Event::Approve { request: 4, choice: crate::approvals::Choice::Once })
+            Some(Event::Resolve { request: 4, choice: crate::approvals::Choice::Once })
         );
     }
 

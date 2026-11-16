@@ -559,19 +559,14 @@ fn proc_write(_ctx: &mut Ctx, rest: &str, content: &str) -> Result<String, Strin
     jobs::write(rest, content)
 }
 
-/// The directory the configuration lives in, which `rule://` searches after the repository's own.
-fn config_dir(scope: &Scope<'_>) -> std::path::PathBuf {
-    config::path(&scope.config.home).parent().map_or_else(|| scope.config.home.clone(), Path::to_path_buf)
-}
-
 fn rule_read(ctx: &mut Ctx, rest: &str) -> Result<String, String> {
     let Some(scope) = ctx.scope else {
         return Err("`rule://` needs an agent session: this caller has none".to_string());
     };
     if rest.is_empty() {
-        return Ok(rules::list(&config_dir(scope), scope.working_dir));
+        return Ok(rules::list(&scope.config.rule_dir, scope.working_dir));
     }
-    let (text, cut) = rules::read(&config_dir(scope), scope.working_dir, rest)?;
+    let (text, cut) = rules::read(&scope.config.rule_dir, scope.working_dir, rest)?;
     Ok(tools::with_note(text, cut))
 }
 

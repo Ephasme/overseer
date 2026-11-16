@@ -1623,7 +1623,7 @@ impl App {
         };
         choice.map(|choice| {
             self.approvals.remove(0);
-            Event::Approve { request, choice }
+            Event::Resolve { request, choice }
         })
     }
 
@@ -3842,7 +3842,8 @@ mod tests {
         assert_eq!(rows.len(), slash::COMMANDS.len(), "/ offers every command: {rows:?}");
         assert!(rows[0].starts_with("/resume <id>"), "{rows:?}");
         assert!(rows[1].starts_with("/pipeline <name|list|stop>"), "{rows:?}");
-        assert!(rows[4].starts_with("/login <server>"), "the table's order is the popup's: {rows:?}");
+        assert!(rows[4].starts_with("/approve <server>"), "the table's order is the popup's: {rows:?}");
+        assert!(rows[5].starts_with("/login <server>"), "the table's order is the popup's: {rows:?}");
         type_key(&mut app, KeyCode::Char('m'));
         assert_eq!(menu_rows(&app), ["/mcp  show the MCP servers"], "only what was typed is offered");
         type_key(&mut app, KeyCode::Char(' '));

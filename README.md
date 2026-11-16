@@ -64,7 +64,9 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |ctrl+d|quit once no agent is busy|
 |ctrl+c|quit now|
 
-With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent logs its instructions, tool calls and results to `~/.local/state/overseer/sessions/<start time>/agent-<id>.log`; `tail -f` one to watch it.
+With stdin or stdout redirected, or with `OVERSEER_PLAIN=1`, it runs in line mode instead: one prompt per stdin line, answers on stdout, agent activity and tool calls on stderr. Either way, agent reports wake the overseer on their own. An agent's `bash` command is killed after 300 seconds. Each agent writes machine-readable JSONL session records — every instruction, committed assistant reply (tool-call arguments included, in full), tool result and turn outcome — to `~/.local/state/overseer/sessions/<start time>/agent-<id>.jsonl`, the substrate resume, search and export build on; `history://<id>` renders those records back into the readable shape, so `tail -f` has an equivalent to watch.
+
+Headless: `overseer -p "prompt"` runs one turn — the answer to stdout, everything else on stderr, exit 1 when the root never answered — and `overseer --mode json` writes each shown event as one compact JSON line on stdout instead, so a consumer filters by `type` (`jq -r 'select(.type=="answer") | .text'`). The two combine; `--mode text` forces line mode like the other flags, with plain text output. Shown event types: `answer` (the root's final answer), `notice`, `error`, `debug` (each with `text`), `agent` (`id`, `name`, `kind` = says/finished/failed/interrupted, `text`), `out` (`id`, `name`, `text`), and `tool` (`id`, `call`, `phase` = start/done; on `done` also `name`, `secs`, `status`, `head`, `more`, `failed`). Usage errors exit 2.
 
 ## Release
 

@@ -30,13 +30,14 @@
 | `src/main.rs` | picks the frontend, creates both channels, connects the MCP servers, starts the session thread |
 | `src/session.rs` | the router: user input to the root, agent events to their owner and the frontends |
 | `src/event.rs` | `UiEvent`, everything the core asks a frontend to show |
-| `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out |
+| `src/plain.rs` | line-mode frontend: stdin lines in, plain lines out, and `-p`/`--print` / `--mode json` |
 | `src/tui/mod.rs` | terminal lifecycle and its panic hook, the event loop, key bindings, the mouse capture F5 hands back |
 | `src/tui/app.rs` | transcript entries, composer, agent panel, status line, wrapping |
 | `src/tui/theme.rs` | the palette in three variants (dark, light, mono) and the `NO_COLOR` rule behind `theme = "auto"` |
 | `src/swarm.rs` | the agent tree: the shared `Swarm`, per-agent threads, ownership, depth, tool dispatch |
 | `src/names.rs` | agent codenames: two word lists mixed from the id, and the `name (id)` label |
 | `src/prompt.rs` | the one system prompt, the tool schemas, the tool-name constants |
+| `src/records.rs` | JSONL session records: one writer per agent, and the renderer `history://` reads back |
 | `src/repos.rs` | git-repository discovery under the configured roots |
 | `src/secrets.rs` | `OVERSEER_API_KEY` from the environment or `~/.config/overseer/.env` |
 | `src/agent.rs` | `Turn::run`, the model ↔ tools loop every agent runs |
