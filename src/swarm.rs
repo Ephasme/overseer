@@ -493,7 +493,7 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => field(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE | tools::EDIT => field(args.path.as_ref()).to_string(),
-        tools::GLOB | tools::GREP | tools::PYTHON | tools::BUN => {
+        tools::GLOB | tools::GREP | tools::PYTHON => {
             first_line(args.pattern.as_ref().or(args.code.as_ref())).to_string()
         }
         _ => String::new(),

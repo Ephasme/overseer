@@ -31,7 +31,6 @@ pub(crate) const GRANTABLE_TOOLS: &[&str] = &[
     tools::GLOB,
     tools::GREP,
     tools::PYTHON,
-    tools::BUN,
     SPAWN_AGENT,
     MESSAGE_AGENT,
     CONTROL_AGENT,

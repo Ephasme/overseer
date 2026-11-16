@@ -1,4 +1,4 @@
-//! Persistent Python and Bun kernels behind the `python` and `bun` tools.
+//! Persistent Python kernels behind the `python` tool.
 //!
 //! One kernel per (canonical working directory, runtime), shared by every agent of the session:
 //! variables survive between calls. The bridge is a small script the runtime executes; it speaks
@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Runtime {
     Python,
-    Bun,
     /// A program that does not exist, so a test can exercise the missing-runtime refusal.
     #[cfg(test)]
     Test,
@@ -34,7 +33,6 @@ impl Runtime {
     fn program(self) -> &'static str {
         match self {
             Self::Python => "python3",
-            Self::Bun => "bun",
             #[cfg(test)]
             Self::Test => "overseer-test-missing-runtime",
         }
@@ -45,7 +43,6 @@ impl Runtime {
     fn flags(self) -> &'static [&'static str] {
         match self {
             Self::Python => &["-E", "-s", "-u", "-c"],
-            Self::Bun => &["-e"],
             #[cfg(test)]
             Self::Test => &["-c"],
         }
@@ -55,7 +52,6 @@ impl Runtime {
     fn bridge(self) -> &'static str {
         match self {
             Self::Python => PYTHON_BRIDGE,
-            Self::Bun => BUN_BRIDGE,
             #[cfg(test)]
             Self::Test => "",
         }
@@ -533,100 +529,6 @@ for line in sys.stdin:
     print(json.dumps(reply), flush=True)
 "#;
 
-const BUN_BRIDGE: &str = r#"
-const state = {};
-
-// One parser owns the buffer: every stdin chunk lands here, complete lines go to whichever
-// consumer is next — a pending tool reply first, otherwise the run queue. No second listener.
-let buffer = "";
-let replyResolvers = [];
-let queue = [];
-let running = false;
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  while (true) {
-    const index = buffer.indexOf("\n");
-    if (index < 0) break;
-    const line = buffer.slice(0, index).trim();
-    buffer = buffer.slice(index + 1);
-    if (!line) continue;
-    const resolve = replyResolvers.shift();
-    if (resolve) resolve(line);
-    else queue.push(line);
-  }
-  pump();
-});
-function readLine() {
-  return new Promise((resolve) => {
-    const index = buffer.indexOf("\n");
-    if (index >= 0) {
-      const line = buffer.slice(0, index).trim();
-      buffer = buffer.slice(index + 1);
-      resolve(line);
-    } else {
-      replyResolvers.push(resolve);
-    }
-  });
-}
-
-async function tool(name, args) {
-  const payload = args === undefined ? "{}" : typeof args === "string" ? args : JSON.stringify(args);
-  process.stdout.write(JSON.stringify({kind: "tool", name, arguments: payload}) + "\n");
-  const line = await readLine();
-  if (!line) process.exit(0);
-  return JSON.parse(line).output ?? "";
-}
-
-async function pump() {
-  if (running) return;
-  running = true;
-  while (queue.length) {
-    await runLine(queue.shift());
-  }
-  running = false;
-}
-async function runLine(line) {
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    return;
-  }
-  if (message.kind !== "run") return;
-  const parts = [];
-  const oldLog = console.log;
-  const oldError = console.error;
-  console.log = (...args) => parts.push(args.map(String).join(" "));
-  console.error = (...args) => parts.push(args.map(String).join(" "));
-  let ok = true;
-  let error;
-  try {
-    const fn = new Function("state", "tool", `"use strict"; return (async () => { ${message.code ?? ""} })();`);
-    await fn(state, tool);
-  } catch (e) {
-    ok = false;
-    error = String(e);
-  } finally {
-    console.log = oldLog;
-    console.error = oldError;
-  }
-  // Cap at the source: a giant output must not reach the manager whole.
-  let output = parts.join("\n").trimEnd();
-  if (output.length > 28000) output = output.slice(0, 28000) + "\n[output truncated: first 28000 bytes shown]";
-  process.stdout.write(JSON.stringify({kind: "result", ok, output, ...(error ? {error} : {})}) + "\n");
-}
-process.stdin.on("end", () => {
-  // Wait for any in-flight call before exiting, so a reply frame is never cut short.
-  const stop = setInterval(() => {
-    if (!running && replyResolvers.length === 0) {
-      clearInterval(stop);
-      process.exit(0);
-    }
-  }, 10);
-});
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,23 +552,6 @@ mod tests {
         call(&working, Runtime::Python, "x = 1", BASH_TIMEOUT, None, no_tool!()).unwrap();
         let out = call(&working, Runtime::Python, "print(x + 1)", BASH_TIMEOUT, None, no_tool!()).unwrap();
         assert_eq!(out, "2");
-    }
-
-    /// The Bun tests need the runtime; CI runners and some machines lack it, and the missing
-    /// runtime path is covered separately by `a_runtime_the_machine_lacks_is_refused_before_any_pipe`.
-    fn bun_available() -> bool {
-        Command::new("bun").arg("--version").output().is_ok()
-    }
-
-    #[test]
-    fn bun_state_survives_between_calls() {
-        if !bun_available() {
-            return;
-        }
-        let working = dir();
-        call(&working, Runtime::Bun, "state.y = 41", BASH_TIMEOUT, None, no_tool!()).unwrap();
-        let out = call(&working, Runtime::Bun, "console.log(state.y + 1)", BASH_TIMEOUT, None, no_tool!()).unwrap();
-        assert_eq!(out, "42");
     }
 
     #[test]
@@ -703,18 +588,6 @@ mod tests {
         assert!(calls[0].1.contains("\"path\":\"a.txt\"") || calls[0].1.contains("\"path\": \"a.txt\""), "{calls:?}");
     }
 
-    #[test]
-    fn a_bun_tool_call_is_awaited_and_answered() {
-        if !bun_available() {
-            return;
-        }
-        let working = dir();
-        let seen = &mut |_: &str, _: &str| -> Result<String, String> { Ok("file body".to_string()) };
-        let out =
-            call(&working, Runtime::Bun, "console.log(await tool('read_file', {path: 'a'}))", BASH_TIMEOUT, None, seen)
-                .unwrap();
-        assert_eq!(out, "file body");
-    }
 
     #[test]
     fn an_oversized_result_is_truncated_with_a_note() {
@@ -803,9 +676,8 @@ mod tests {
     #[test]
     fn a_missing_runtime_names_the_program() {
         // macOS says "entity not found"; Linux says "No such file or directory".
-        assert_eq!(spawn_error(Runtime::Bun, "entity not found"), "bun is not installed");
+        assert_eq!(spawn_error(Runtime::Python, "entity not found"), "python3 is not installed");
         assert_eq!(spawn_error(Runtime::Python, "No such file or directory"), "python3 is not installed");
-        assert_eq!(spawn_error(Runtime::Bun, "permission denied"), "permission denied");
     }
 
     #[test]

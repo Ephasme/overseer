@@ -82,7 +82,6 @@ pub(crate) const GLOB: &str = "glob";
 pub(crate) const GREP: &str = "grep";
 /// The persistent runtimes: one kernel per (working directory, runtime), shared between calls.
 pub(crate) const PYTHON: &str = "python";
-pub(crate) const BUN: &str = "bun";
 /// The progress-note tool an agent writes to its owner with.
 pub(crate) const REPLY: &str = "reply";
 /// The tool an agent ends its turn and reports with.
@@ -269,7 +268,7 @@ impl Policy {
                 format!("tool {name} is not granted to this agent; it may call {}", self.allow_tools.join(" "))
             });
         }
-        if (name == WRITE_FILE || name == EDIT || name == PYTHON || name == BUN) && self.read_only {
+        if (name == WRITE_FILE || name == EDIT || name == PYTHON) && self.read_only {
             return Some(format!("this agent is read-only: {name} is refused"));
         }
         // The tool list already hides these from a read-only worker, but a policy is re-read on
@@ -518,11 +517,6 @@ pub(crate) fn definitions() -> Value {
             "name": PYTHON,
             "description": format!("Run Python in a persistent kernel for this working directory: variables survive between calls; printed output is the result. Call an overseer tool from code with `tool('write_file', {{'path': …, 'content': …}})`; it returns that tool's result text. A read-only agent cannot call this. The {budget}-second budget covers the whole call; a kernel that outlives it is killed with its state.", budget = BASH_TIMEOUT.as_secs()),
             "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
-        }},
-        {"type": "function", "function": {
-            "name": BUN,
-            "description": format!("Run Bun (JavaScript/TypeScript) in a persistent kernel for this working directory: variables survive between calls; printed output is the result. Call an overseer tool from code with `await tool('write_file', {{'path': …, 'content': …}})`; it returns that tool's result text. A read-only agent cannot call this. The {budget}-second budget covers the whole call; a kernel that outlives it is killed with its state.", budget = BASH_TIMEOUT.as_secs()),
-            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
         }}
     ])
 }
@@ -666,16 +660,16 @@ fn run(
         }
         GLOB => parse_args::<GlobArgs>(arguments).and_then(|args| glob_files(working_dir, &args)),
         GREP => parse_args::<GrepArgs>(arguments).and_then(|args| grep_files(working_dir, &args)),
-        PYTHON | BUN => parse_args::<KernelArgs>(arguments).and_then(|args| {
+        PYTHON => parse_args::<KernelArgs>(arguments).and_then(|args| {
             kernel::call(
                 working_dir,
-                if name == PYTHON { kernel::Runtime::Python } else { kernel::Runtime::Bun },
+                kernel::Runtime::Python,
                 &args.code,
                 timeout,
                 cancel,
                 &mut |tool_name, tool_arguments| {
                     // A kernel calling itself would recurse forever; refuse before dispatching.
-                    if matches!(tool_name, PYTHON | BUN) {
+                    if tool_name == PYTHON {
                         return Err("a kernel cannot call itself".to_string());
                     }
                     Ok(execute_guarded(
