@@ -282,6 +282,18 @@ impl AgentEvent {
     }
 }
 
+/// The record outcome a turn-ending event writes. `Reply` never ends a turn; it maps with
+/// `Finished` only because the match must be exhaustive.
+impl From<AgentEvent> for records::Outcome {
+    fn from(kind: AgentEvent) -> Self {
+        match kind {
+            AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
+            AgentEvent::Failed => records::Outcome::Failed,
+            AgentEvent::Interrupted => records::Outcome::Interrupted,
+        }
+    }
+}
+
 /// Everything that wakes the overseer.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Event {
@@ -1134,7 +1146,8 @@ impl Swarm {
                 if start_rx.recv().is_err() {
                     return;
                 }
-                let _ = sender.send(Event::Instruction { id, text: instruction });
+                let _ = sender.send(Event::Instruction { id, text: instruction.clone() });
+                records.write(&records::Record::Instruction { text: instruction });
                 let run_flag = Arc::new(AtomicBool::new(false));
                 let host = pipelines::SwarmHost {
                     swarm: tree,
@@ -1160,12 +1173,8 @@ impl Swarm {
                     }
                     Err(text) => (AgentEvent::Failed, text),
                 };
-                let outcome_kind = match kind {
-                    AgentEvent::Failed => records::Outcome::Failed,
-                    AgentEvent::Interrupted => records::Outcome::Interrupted,
-                    AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
-                };
-                records.write(&records::Record::Outcome { outcome: outcome_kind, text: text.clone() });
+                let outcome = records::Outcome::from(kind);
+                records.write(&records::Record::Outcome { outcome, text: text.clone() });
                 let _ = sender.send(Event::Agent { id, kind, text });
             })
         };
@@ -1739,11 +1748,7 @@ impl AgentRun<'_> {
                 }
                 Err(e) => (AgentEvent::Failed, format!("{e:#}")),
             };
-            let outcome = match kind {
-                AgentEvent::Failed => records::Outcome::Failed,
-                AgentEvent::Interrupted => records::Outcome::Interrupted,
-                AgentEvent::Finished | AgentEvent::Reply => records::Outcome::Finished,
-            };
+            let outcome = records::Outcome::from(kind);
             self.records.write(&records::Record::Outcome { outcome, text: text.clone() });
             let _ = self.sender.send(Event::Agent { id: self.id, kind, text });
         }
@@ -1760,18 +1765,23 @@ impl AgentRun<'_> {
     fn execute(&mut self, call: &ToolCall, control: &Control, context: &tools::Context<'_>) -> String {
         // `close` ends the turn and the agent with it, so it is answered here before any dispatch.
         if call.function.name == tools::CLOSE {
-            let Ok(args) = tools::parse_args::<CloseArgs>(&call.function.arguments) else {
-                return "error: invalid arguments: close takes one `report` string".to_string();
+            let output = match tools::parse_args::<CloseArgs>(&call.function.arguments) {
+                Err(_) => "error: invalid arguments: close takes one `report` string".to_string(),
+                Ok(args) if args.report.trim().is_empty() => {
+                    "error: a close needs a report; say what you did and what you did not test".to_string()
+                }
+                Ok(_) if self.parent.is_none() => "error: the root has no owner and cannot close itself".to_string(),
+                Ok(args) => {
+                    let _ =
+                        self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
+                    control.close();
+                    "closed; your report is on its way".to_string()
+                }
             };
-            if args.report.trim().is_empty() {
-                return "error: a close needs a report; say what you did and what you did not test".to_string();
-            }
-            if self.parent.is_none() {
-                return "error: the root has no owner and cannot close itself".to_string();
-            }
-            let _ = self.sender.send(Event::Agent { id: self.id, kind: AgentEvent::Finished, text: args.report });
-            control.close();
-            return "closed; your report is on its way".to_string();
+            // A close answers its own call: without a Tool record the assistant message would
+            // name a call that never has a result, which a replay would read as a dangling turn.
+            self.records.write(&records::Record::Tool { call_id: call.id.clone(), output: output.clone() });
+            return output;
         }
         // The session record keeps the full fidelity the plaintext log never had: raw arguments
         // live in the assistant record this call follows, the output lands as its own `Tool`
@@ -2745,7 +2755,13 @@ mod tests {
 
     #[test]
     fn an_interrupted_turn_records_its_outcome_and_no_finished() {
-        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"})), text("done")]);
+        // The second turn gets its own long command: with an instant scripted reply it could
+        // finish before this test reads the file, adding a Finished outcome it never saw written.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "sleep 30"})),
+            call("c2", tools::BASH, &json!({"command": "sleep 30"})),
+            text("done"),
+        ]);
         assert_eq!(spawn(&h.swarm, Swarm::ROOT, &h.repo, "one"), format!("{} started", codename(2)));
         let Progress::Started { .. } = next_progress(&h.queue) else { panic!("the command never started") };
         let sent = tool(&h.swarm, Swarm::ROOT, prompt::MESSAGE_AGENT, &json!({"id": 2, "text": "now", "urgent": true}));

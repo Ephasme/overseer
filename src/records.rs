@@ -87,10 +87,17 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    /// Opens (creating if absent) the record file at `path`. Call sites map the error with
-    /// `config::io_error`, as they did for the plaintext log.
     pub(crate) fn create(path: &Path) -> std::io::Result<Writer> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // The records hold full-fidelity payloads (commands, file bodies, raw output): they
+        // stay private to the session's user, whatever the process umask is.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         Ok(Writer { file: Mutex::new(file) })
     }
 
@@ -106,23 +113,22 @@ impl Writer {
 
 /// Renders records back into the plaintext log shape the agents and tests read:
 /// `> instruction`, `· tool (args bytes) summary`, the raw output, `= Outcome: text`.
-/// Unparsable lines (a crashed partial write, an unknown kind) are skipped silently, and a
-/// `Tool` record with no matching assistant call still renders as its bare output.
+///
+/// The caller bounds memory: `history://` reads the file through `tools::read_limited`, so
+/// this never sees more than the read budget. Unparsable lines (a crashed partial write, an
+/// unknown kind) are skipped silently. A `Tool` record with no matching assistant call still
+/// renders as its bare output, whatever a future format change does.
 pub(crate) fn render(text: &str) -> String {
     let records: Vec<Record> = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
     let mut consumed = vec![false; records.len()];
-    let mut lines: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for (i, record) in records.iter().enumerate() {
-        match record {
-            Record::Instruction { text } => lines.push(format!("> {text}")),
+        let candidate = match record {
+            Record::Instruction { text } => format!("> {text}"),
             Record::Assistant { message } => {
                 for call in message.tool_calls.iter().flatten() {
-                    let name = &call.function.name;
-                    let args = &call.function.arguments;
-                    let summary = describe(name, args);
-                    lines.push(format!("· {name} ({} bytes) {summary}", args.len()));
-                    // Matched by call id, not order alone: a batch's results land in call order,
-                    // but only the id pairing is guaranteed.
+                    // Matched by call id, not order alone: a batch's results land in call
+                    // order, but only the id pairing is guaranteed.
                     let matched = records.iter().enumerate().skip(i + 1).find(|(j, r)| match r {
                         Record::Tool { call_id, .. } if call_id == &call.id => {
                             // `enumerate` precedes `skip`, so `j` is already absolute.
@@ -134,18 +140,28 @@ pub(crate) fn render(text: &str) -> String {
                         if let Some(slot) = consumed.get_mut(j) {
                             *slot = true;
                         }
-                        lines.push(output.clone());
+                        // The legacy log printed the `·` line just before execution, so a
+                        // call with no result (a `close`, a batch cut short) never had one.
+                        let summary = describe(&call.function.name, &call.function.arguments);
+                        out.push(format!(
+                            "· {} ({} bytes) {summary}",
+                            call.function.name,
+                            call.function.arguments.len()
+                        ));
+                        out.push(output.clone());
                     }
                 }
+                continue;
             }
             // An unpaired tool result still shows, whatever a future format change does.
-            Record::Tool { output, .. } if !consumed.get(i).copied().unwrap_or(false) => lines.push(output.clone()),
-            Record::Tool { .. } => {}
-            Record::Outcome { outcome: Outcome::Closed, .. } => lines.push("= Closed".to_string()),
-            Record::Outcome { outcome, text } => lines.push(format!("= {}: {text}", outcome.as_label())),
-        }
+            Record::Tool { output, .. } if !consumed.get(i).copied().unwrap_or(false) => output.clone(),
+            Record::Tool { .. } => continue,
+            Record::Outcome { outcome: Outcome::Closed, .. } => "= Closed".to_string(),
+            Record::Outcome { outcome, text } => format!("= {}: {text}", outcome.as_label()),
+        };
+        out.push(candidate);
     }
-    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
+    if out.is_empty() { String::new() } else { format!("{}\n", out.join("\n")) }
 }
 
 #[cfg(test)]
