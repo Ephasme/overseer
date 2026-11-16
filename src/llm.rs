@@ -237,20 +237,48 @@ impl OpenAiClient {
 }
 
 impl Llm for OpenAiClient {
-    fn chat(&self, messages: &[Message], tools: &Value, _cancel: Option<&AtomicBool>) -> Result<Message> {
-        let body = self.post(messages, tools, None, false)?;
-        parse_response(&body)
+    fn chat(&self, messages: &[Message], tools: &Value, cancel: Option<&AtomicBool>) -> Result<Message> {
+        self.exchange(messages, tools, cancel, None, &mut |_| ())
     }
 
+    /// The summary is not shown as it streams, and a stalled read cannot be aborted from this
+    /// thread, so the request runs on a worker while this one polls the interrupt flag: `/stop`
+    /// returns at once instead of waiting for up to 16k output tokens.
     fn chat_capped(
         &self,
         messages: &[Message],
         tools: &Value,
-        _cancel: Option<&AtomicBool>,
+        cancel: Option<&AtomicBool>,
         max_tokens: u64,
     ) -> Result<Message> {
-        let body = self.post(messages, tools, Some(max_tokens), false)?;
-        parse_response(&body)
+        if cancelled(cancel) {
+            bail!(INTERRUPTED);
+        }
+        let worker = Self {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            debug: self.debug.clone(),
+        };
+        let messages = messages.to_vec();
+        let tools = tools.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The flag is read here, not on the worker: dropping the receiver is what ends this.
+            let _ = sender.send(worker.exchange(&messages, &tools, None, Some(max_tokens), &mut |_| ()));
+        });
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(reply) => return reply,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if cancelled(cancel) => bail!(INTERRUPTED),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("the summary request ended without an answer");
+                }
+            }
+        }
     }
 
     fn chat_stream(
@@ -260,32 +288,42 @@ impl Llm for OpenAiClient {
         cancel: Option<&AtomicBool>,
         on_piece: &mut dyn FnMut(Piece<'_>),
     ) -> Result<Message> {
-        let response = self.send(messages, tools, None, true)?;
+        self.exchange(messages, tools, cancel, None, on_piece)
+    }
+}
+
+impl OpenAiClient {
+    /// One request, streamed. Every blocking call goes through here so the interrupt flag is read
+    /// between lines: a compaction summary costs up to 16k output tokens and must not hold an
+    /// interrupt until it finishes. A provider that ignored `stream` answers whole instead.
+    fn exchange(
+        &self,
+        messages: &[Message],
+        tools: &Value,
+        cancel: Option<&AtomicBool>,
+        max_tokens: Option<u64>,
+        on_piece: &mut dyn FnMut(Piece<'_>),
+    ) -> Result<Message> {
+        if cancelled(cancel) {
+            bail!(INTERRUPTED);
+        }
+        let response = self.send(messages, tools, max_tokens, true)?;
         let streamed = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("text/event-stream"));
-        if !streamed {
-            // A provider that ignored `stream` sends one whole response instead.
-            let body = response.text().context("reading model response failed")?;
-            let message = parse_response(&body)?;
-            report(&message, on_piece);
-            return Ok(message);
+        if streamed {
+            return read_stream(std::io::BufReader::new(response), cancel, on_piece);
         }
-        read_stream(std::io::BufReader::new(response), cancel, on_piece)
-    }
-}
-
-impl OpenAiClient {
-    fn post(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Result<String> {
-        let response = self.send(messages, tools, max_tokens, stream)?;
         let status = response.status();
         let body = response.text().context("reading model response failed")?;
         if !status.is_success() {
             bail!("model returned HTTP {status}: {}", excerpt(&body));
         }
-        Ok(body)
+        let message = parse_response(&body)?;
+        report(&message, on_piece);
+        Ok(message)
     }
 
     fn payload(&self, messages: &[Message], tools: &Value, max_tokens: Option<u64>, stream: bool) -> Value {
@@ -876,6 +914,109 @@ mod tests {
             OpenAiClient::new(reqwest::blocking::Client::new(), "http://x/v1", "k".into(), "m".into(), None, None);
         assert!(client.payload(&[], &json!([]), None, false).get("stream_options").is_none());
         assert_eq!(client.payload(&[], &json!([]), None, true)["stream_options"], json!({"include_usage": true}));
+    }
+
+    /// A blocking call goes over the wire as a stream, so the interrupt flag reaches it between
+    /// lines instead of after the whole answer.
+    #[test]
+    fn a_blocking_call_reads_a_streamed_answer() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let (Some(head), Some(length)) = (text.find("\r\n\r\n"), content_length(&text))
+                    && request.len() >= head + 4 + length
+                {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            assert!(text.contains("\"stream\":true"), "a blocking call must stream: {text}");
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,",
+                "\"total_tokens\":2}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(body.as_bytes()).unwrap();
+        });
+        let client = OpenAiClient::new(
+            reqwest::blocking::Client::new(),
+            &format!("http://{addr}/v1"),
+            "k".into(),
+            "m".into(),
+            None,
+            None,
+        );
+        let message = client.chat(&[], &json!([]), None).unwrap();
+        assert_eq!(message.content.as_deref(), Some("hi"));
+        assert_eq!(message.usage.map(|usage| usage.total_tokens), Some(2));
+        server.join().unwrap();
+    }
+
+    /// A stalled summary read cannot be aborted in place; `chat_capped` polls the flag instead. The
+    /// summary costs up to 16k output tokens and must not hold `/stop` for that long.
+    #[test]
+    fn an_interrupt_stops_a_stalled_summary_call() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer);
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+            let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"thinking\"}}]}\n\n";
+            socket.write_all(head.as_bytes()).unwrap();
+            socket.write_all(chunk.as_bytes()).unwrap();
+            socket.flush().unwrap();
+            // Hold the connection open: only the flag can end the call.
+            std::thread::sleep(Duration::from_secs(2));
+            let _ = socket.write_all(b"data: [DONE]\n\n");
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let client = OpenAiClient::new(
+            reqwest::blocking::Client::new(),
+            &format!("http://{addr}/v1"),
+            "k".into(),
+            "m".into(),
+            None,
+            None,
+        );
+        let started = std::time::Instant::now();
+        let error = client.chat_capped(&[], &json!([]), Some(&cancel), 100).unwrap_err();
+        assert_eq!(error.to_string(), INTERRUPTED);
+        assert!(started.elapsed() < Duration::from_secs(1), "the call waited for the answer anyway");
+        stopper.join().unwrap();
+        server.join().unwrap();
+    }
+
+    fn content_length(request: &str) -> Option<usize> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+        })
     }
 
     #[test]
