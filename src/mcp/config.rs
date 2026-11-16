@@ -218,7 +218,6 @@ struct RawAuth {
 /// Every server the file declares: `Ok` for one to connect, `Err` for a name and why it cannot be.
 pub(crate) type Discovery = Vec<Result<ServerConfig, (String, String)>>;
 
-
 /// Reads the server list; a missing file is an empty list, an unreadable one is one failure.
 ///
 /// `project` is a directory that may hold a `.mcp.json`; its servers are merged after the home
