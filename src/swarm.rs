@@ -1,4 +1,5 @@
 use crate::agent::{INTERRUPTED, Turn};
+use crate::approvals;
 use crate::config;
 use crate::conflict;
 use crate::edit;
@@ -343,6 +344,20 @@ pub(crate) enum Event {
         id: usize,
         text: String,
     },
+    /// A gated tool call waits for the user's approval.
+    ApprovalRequest {
+        id: usize,
+        request: u64,
+        tool: String,
+        call: String,
+    },
+    /// The user answered a pending approval prompt.
+    Approve {
+        request: u64,
+        choice: approvals::Choice,
+    },
+    /// The user cycled the approval tier.
+    CycleTier,
 }
 
 impl Event {
@@ -588,6 +603,8 @@ pub(crate) struct Swarm {
     agents: Vec<Agent>,
     /// Every agent shares the servers the process connected; a late one reaches the next turn.
     mcp: Arc<mcp::Registry>,
+    /// The user's approval gate for gated tool calls, shared by every agent and the pipeline host.
+    approvals: Arc<approvals::Gate>,
     /// `local://` notes, by name: one store per session, shared by every agent.
     local: HashMap<String, String>,
     /// `out://` texts, by the 1-based sequence they were written in.
@@ -609,6 +626,7 @@ impl Swarm {
         log_dir: PathBuf,
         sender: Sender<Event>,
         mcp: Arc<mcp::Registry>,
+        approvals: Arc<approvals::Gate>,
     ) -> Self {
         Self {
             models,
@@ -619,6 +637,7 @@ impl Swarm {
             sender,
             agents: Vec::new(),
             mcp,
+            approvals,
             local: HashMap::new(),
             outs: VecDeque::new(),
             out_seq: 0,
@@ -1052,7 +1071,21 @@ impl Swarm {
     pub(crate) fn start_pipeline(swarm: &Arc<Mutex<Swarm>>, caller: usize, name: &str) -> Result<usize, String> {
         // Two starts must not allocate the same id while the tree lock is released.
         let _reserved = spawning();
-        let (depth, working_dir, policy, remaining_depth, id, log_path, control, sender, pipeline, cfg, profiles, mcp) = {
+        let (
+            depth,
+            working_dir,
+            policy,
+            remaining_depth,
+            id,
+            log_path,
+            control,
+            sender,
+            pipeline,
+            cfg,
+            profiles,
+            mcp,
+            approvals,
+        ) = {
             let tree = lock(swarm);
             let caller_agent = tree.agent(caller).ok_or_else(|| format!("no agent {caller}"))?;
             let label = caller_agent.label();
@@ -1104,6 +1137,7 @@ impl Swarm {
                 Arc::clone(&tree.config),
                 Arc::clone(&tree.profiles),
                 Arc::clone(&tree.mcp),
+                Arc::clone(&tree.approvals),
             )
         };
         let log = OpenOptions::new()
@@ -1137,6 +1171,7 @@ impl Swarm {
                     skills,
                     profiles,
                     mcp,
+                    approvals,
                     config: cfg,
                     remaining_depth,
                     sender: sender.clone(),
@@ -1724,6 +1759,15 @@ impl AgentRun<'_> {
         }
     }
 
+    /// The shared approval gate; a dead session has none to ask. The lock is released before
+    /// `admit`, which blocks for as long as the user takes.
+    fn gate(&self) -> Result<Arc<approvals::Gate>, String> {
+        self.swarm
+            .upgrade()
+            .map(|tree| Arc::clone(&lock(&tree).approvals))
+            .ok_or_else(|| "the session ended".to_string())
+    }
+
     /// A tree tool's result, or `None` when `call` is not one. The tree is upgraded for the call
     /// only, so a worker whose session is gone cannot reach it and cannot keep it alive.
     fn tree_tool(&self, call: &ToolCall) -> Option<Result<String, String>> {
@@ -1793,16 +1837,45 @@ impl AgentRun<'_> {
         } else if let Some(result) = self.tree_tool(call) {
             tools::outcome(result)
         } else {
-            tools::execute_guarded(
-                self.working_dir,
-                &call.function.name,
-                &call.function.arguments,
-                &policy,
-                Some(control.flag()),
-                &mut self.conflicts,
-                &mut self.seen,
-                context,
-            )
+            let gated = matches!(call.function.name.as_str(), tools::BASH | tools::WRITE_FILE | tools::EDIT);
+            let mut denied: Option<String> = None;
+            if gated && policy.refuse(&call.function.name, &call.function.arguments).is_none() {
+                let gate = match self.gate() {
+                    Ok(gate) => gate,
+                    // No session means no turn left to report to: nothing will read the output.
+                    Err(reason) => return format!("error: {reason}"),
+                };
+                let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                let (key, display) = if call.function.name == tools::BASH {
+                    let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or_default();
+                    // The key is the raw command, newlines kept: two commands that differ only
+                    // after the first line are two approvals.
+                    (command.trim().to_string(), describe(&call.function.name, &call.function.arguments))
+                } else {
+                    // The key is the raw path, never `describe`'s shortened form: two distinct
+                    // long paths must not share one cached answer.
+                    let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
+                    (path.to_string(), describe(&call.function.name, &call.function.arguments))
+                };
+                // A denial is the call's output: the card still closes, as failed.
+                denied = gate
+                    .admit(self.id, &call.function.name, &key, &display, Some(control.flag()), self.sender)
+                    .err()
+                    .map(|reason| format!("error: {reason}"));
+            }
+            match denied {
+                Some(output) => output,
+                None => tools::execute_guarded(
+                    self.working_dir,
+                    &call.function.name,
+                    &call.function.arguments,
+                    &policy,
+                    Some(control.flag()),
+                    &mut self.conflicts,
+                    &mut self.seen,
+                    context,
+                ),
+            }
         };
         let _ = writeln!(self.log, "{output}");
         if let Some(seq) = seq {
@@ -1868,6 +1941,18 @@ mod tests {
         loop {
             if let Progress::Finished { preview, .. } = next_progress(queue) {
                 return preview;
+            }
+        }
+    }
+
+    /// The next approval request from `agent`, skipping streamed output and tool progress:
+    /// its request id, the tool, and what the call does.
+    fn next_approval(queue: &Receiver<Event>, agent: usize) -> (u64, String, String) {
+        loop {
+            match next_event(queue) {
+                Event::ApprovalRequest { id, request, tool, call } if id == agent => return (request, tool, call),
+                Event::Progress { .. } => {}
+                other => panic!("expected an approval request for agent {agent}, got {other:?}"),
             }
         }
     }
@@ -1964,6 +2049,7 @@ mod tests {
             logs.path().to_path_buf(),
             sender,
             mcp,
+            Arc::new(approvals::Gate::new(approvals::Tier::Yolo, true)),
         )));
         Swarm::start_root(&swarm, root.path().to_path_buf()).unwrap();
         Harness { swarm, queue, repo, logs, root }
@@ -1979,6 +2065,8 @@ mod tests {
             max_depth,
             dir: root.to_path_buf(),
             home: root.to_path_buf(),
+            // The harness's gate starts at `yolo`: existing tests must not stop on a prompt.
+            approvals: approvals::Tier::Yolo,
         }
     }
 
@@ -3136,5 +3224,75 @@ mod tests {
         assert!(line.contains("stopped"), "{line}");
         assert_eq!(h.swarm.lock().unwrap().agent_state(Swarm::ROOT, id), Ok(State::Stopped));
         assert!(!h.swarm.lock().unwrap().busy(), "a stopped pipeline stops counting as work");
+    }
+
+    #[test]
+    fn a_gated_call_waits_for_the_user_and_the_answer_runs_it() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "ls"})), text("done")]);
+        fs::write(h.root.path().join("a"), "").unwrap();
+        // The harness starts at `yolo`: one cycle brings it to `ask`.
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().tell_root("run").unwrap();
+        let (request, tool, call) = next_approval(&h.queue, 1);
+        assert_eq!(tool, tools::BASH);
+        assert_eq!(call, "ls");
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Once);
+        let finished = next_finished(&h.queue);
+        assert!(!finished.failed, "{finished:?}");
+        assert_eq!(finished.head, "a\nrepo");
+        assert_eq!(next_agent_event(&h.queue), Event::Agent { id: 1, kind: AgentEvent::Finished, text: "done".into() });
+    }
+
+    #[test]
+    fn a_denied_call_returns_an_error_and_stays_cached() {
+        // Two cycles bring `yolo` to `cached-ask`: only there is a refusal remembered.
+        let h = harness(vec![
+            call("c1", tools::BASH, &json!({"command": "ls"})),
+            text("first done"),
+            call("c2", tools::BASH, &json!({"command": "ls"})),
+            text("second done"),
+        ]);
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().approvals.cycle();
+        h.swarm.lock().unwrap().tell_root("run").unwrap();
+        let (request, _, _) = next_approval(&h.queue, 1);
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Deny);
+        let finished = next_finished(&h.queue);
+        assert!(finished.failed, "{finished:?}");
+        assert!(finished.head.contains("did not approve"), "{finished:?}");
+        // The same command replays the cached refusal at once, with no new prompt.
+        h.swarm.lock().unwrap().tell_root("again").unwrap();
+        // The replayed refusal makes the same card fail again; the turn then ends on the
+        // second scripted answer.
+        let finished = next_finished(&h.queue);
+        assert!(finished.failed, "{finished:?}");
+        assert!(finished.head.contains("earlier in this session"), "{finished:?}");
+        assert_eq!(
+            next_agent_event(&h.queue),
+            Event::Agent { id: 1, kind: AgentEvent::Finished, text: "second done".into() }
+        );
+    }
+
+    #[test]
+    fn a_stop_releases_a_pending_prompt() {
+        let h = harness(vec![call("c1", tools::BASH, &json!({"command": "sleep 30"}))]);
+        h.swarm.lock().unwrap().approvals.cycle();
+        spawn(&h.swarm, Swarm::ROOT, &h.repo, "one");
+        let (request, gate_tool, gate_call) = next_approval(&h.queue, 2);
+        assert_eq!(gate_tool, tools::BASH);
+        assert_eq!(gate_call, "sleep 30", "the worker, not the root, asked");
+        let stopped = tool(&h.swarm, Swarm::ROOT, prompt::CONTROL_AGENT, &json!({"id": 2, "action": "stop"}));
+        assert!(stopped.contains("stopped"), "{stopped}");
+        assert_eq!(
+            next_agent_event(&h.queue),
+            Event::Agent { id: 2, kind: AgentEvent::Interrupted, text: "your owner cut this turn short".into() }
+        );
+        // The answer arrives late, after the stop: it must not resurrect anything.
+        h.swarm.lock().unwrap().approvals.answer(request, approvals::Choice::Once);
+        let deadline = Instant::now() + WAIT;
+        while h.swarm.lock().unwrap().approvals.pending_count() > 0 {
+            assert!(Instant::now() < deadline, "the pending prompt outlived the stop");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

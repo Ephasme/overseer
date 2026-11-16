@@ -40,7 +40,9 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>) {
             | UiEvent::AgentThought { .. }
             | UiEvent::Boundary { .. }
             | UiEvent::Instruction { .. }
-            | UiEvent::Busy(_) => {}
+            | UiEvent::Busy(_)
+            | UiEvent::Approvals(_)
+            | UiEvent::ApprovalRequest { .. } => {}
             UiEvent::Agents(roster) => agents = roster,
             UiEvent::Done => break,
         }

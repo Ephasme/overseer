@@ -474,6 +474,8 @@ pub(crate) struct SwarmHost {
     pub(crate) skills: Arc<skills::Catalogue>,
     pub(crate) profiles: Arc<profiles::Catalogue>,
     pub(crate) mcp: Arc<mcp::Registry>,
+    /// The user's approval gate, shared with every agent.
+    pub(crate) approvals: Arc<crate::approvals::Gate>,
     pub(crate) config: Arc<config::Config>,
     pub(crate) remaining_depth: usize,
     pub(crate) sender: Sender<Event>,
@@ -493,6 +495,11 @@ impl SwarmHost {
     fn guarded(&self, tool: &str, arguments: &str) -> Result<String, String> {
         // Held for the whole call: the tree must outlive the handlers that reach through the weak.
         let _tree = self.tree()?;
+        // The pipeline host has no `edit` tool, so only bash and write_file are gated; a call the
+        // policy refuses errors inside `execute_guarded` and never prompts.
+        if matches!(tool, tools::BASH | tools::WRITE_FILE) && self.policy.refuse(tool, arguments).is_none() {
+            self.gate(tool, arguments)?;
+        }
         let weak = self.swarm.clone();
         let scope = url::Scope {
             caller: self.id,
@@ -521,6 +528,20 @@ impl SwarmHost {
             Some(reason) => Err(reason.to_string()),
             None => Ok(result),
         }
+    }
+
+    /// The approval gate for this host's gated calls, keyed like an agent's.
+    fn gate(&self, tool: &str, arguments: &str) -> Result<(), String> {
+        let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+        let display = swarm::describe(tool, arguments);
+        let key = if tool == tools::BASH {
+            let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or_default();
+            command.trim().to_string()
+        } else {
+            let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
+            path.to_string()
+        };
+        self.approvals.admit(self.id, tool, &key, &display, Some(self.run_flag.as_ref()), &self.sender)
     }
 
     /// One tree tool, dispatched exactly as an agent's own call is.

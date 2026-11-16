@@ -1,3 +1,4 @@
+use crate::approvals;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -5,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"";
+const EXAMPLE: &str = "roots = [\"~/code\"]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-4.1\"\n# Delegations allowed below the root agent; 0 forbids spawning.\nmax_depth = 3\n# Where the root agent starts.\ndir = \"~/code\"\n# approvals = \"ask\" # ask | cached-ask | write | yolo: gate bash, write_file and edit";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +18,8 @@ struct RawConfig {
     theme: Option<String>,
     max_depth: Option<usize>,
     dir: Option<String>,
+    /// Omitted means `ask`.
+    approvals: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +35,8 @@ pub(crate) struct Config {
     pub(crate) dir: PathBuf,
     /// Resolved once at startup, so no later call re-reads the environment.
     pub(crate) home: PathBuf,
+    /// The tool-call approval tier, from `approvals`.
+    pub(crate) approvals: approvals::Tier,
 }
 
 /// Delegations allowed below the root when `config.toml` names no `max_depth`.
@@ -193,12 +198,17 @@ fn parse(text: &str, home: &Path) -> Result<Config> {
         roots.push(canonical);
     }
     let theme = raw.theme.as_deref().map_or(Ok(Theme::Auto), Theme::parse)?;
+    let approvals = raw
+        .approvals
+        .as_deref()
+        .map_or(Ok(approvals::Tier::Ask), |text| approvals::Tier::parse(text).map_err(anyhow::Error::msg))?;
     // The root works in the user's home, not in the world-writable directory a child falls back to.
     let dir = canonical_dir(raw.dir.as_deref().unwrap_or("~"), home)?;
     Ok(Config {
         roots,
         base_url: raw.base_url,
         model: raw.model,
+        approvals,
         theme,
         max_depth: raw.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
         dir,

@@ -25,6 +25,10 @@ pub(crate) enum UiEvent {
     Progress { id: usize, progress: Progress },
     /// An agent's `out://` text, shown as the agent wrote it.
     Out { id: usize, text: String },
+    /// A gated tool call waits for the user's decision.
+    ApprovalRequest { agent: usize, request: u64, tool: String, call: String },
+    /// The current approval tier, sent at startup and after each cycle.
+    Approvals(crate::approvals::Tier),
     /// The tree after a change.
     Agents(Vec<AgentView>),
     /// An agent turn started or finished.

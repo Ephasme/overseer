@@ -1,4 +1,5 @@
 mod agent;
+mod approvals;
 mod artifacts;
 mod clipboard;
 mod config;
@@ -67,6 +68,8 @@ fn main() -> Result<()> {
     let stop = input_tx.clone();
     let quit = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::clone(&quit);
+    let interactive = tui_available();
+    let approvals = Arc::new(approvals::Gate::new(cfg.approvals, interactive));
     let model = profiles
         .get(profiles::SUPERVISOR)
         .and_then(|profile| profile.model.clone())
@@ -74,10 +77,22 @@ fn main() -> Result<()> {
     // Read before the core takes the config: the palette is fixed before the first frame.
     let theme = cfg.theme;
     let core = thread::spawn(move || {
-        session::run(models, profiles, pipelines, &cfg, log_dir, session_input, input_rx, ui_tx, mcp, shutdown)
+        session::run(
+            models,
+            profiles,
+            pipelines,
+            &cfg,
+            log_dir,
+            session_input,
+            input_rx,
+            ui_tx,
+            mcp,
+            approvals,
+            shutdown,
+        )
     });
 
-    let frontend = if tui_available() {
+    let frontend = if interactive {
         tui::run(ui_rx, input_tx, &model, theme)
     } else {
         plain::run(ui_rx, input_tx);
