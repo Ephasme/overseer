@@ -18,6 +18,9 @@ pub(crate) struct Turn<'a> {
     pub(crate) tool_defs: &'a Value,
     pub(crate) execute: &'a mut dyn FnMut(&ToolCall) -> String,
     pub(crate) cancel: Option<&'a AtomicBool>,
+    /// Invoked with the reply the moment it is committed to history: the session-record writer
+    /// uses it to keep the model's answer in the JSONL log. `None` in tests.
+    pub(crate) on_commit: Option<&'a mut dyn FnMut(&Message)>,
 }
 
 impl Turn<'_> {
@@ -53,6 +56,9 @@ impl Turn<'_> {
             if !asks && text.trim().is_empty() {
                 history.truncate(base);
                 bail!("model returned neither text nor tool calls");
+            }
+            if let Some(on_commit) = self.on_commit.as_deref_mut() {
+                on_commit(&reply);
             }
             history.push(reply);
             if !asks {
@@ -167,6 +173,7 @@ mod tests {
                 "out".to_string()
             },
             cancel: Some(&flag),
+            on_commit: None,
         };
         let err = turn.run(&mut history, "go").unwrap_err();
         assert_eq!(err.to_string(), "interrupted");
