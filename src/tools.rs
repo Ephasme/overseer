@@ -4,6 +4,7 @@ use crate::conflict;
 use crate::diff;
 use crate::edit;
 use crate::jobs;
+use crate::kernel;
 use crate::mcp;
 use crate::profiles;
 use crate::skills;
@@ -25,13 +26,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_OUTPUT_BYTES: usize = 30_000;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 30_000;
 
 /// Largest file `read_file`'s `:conflicts` selector scans whole, so listing blocks cannot exhaust memory.
 const MAX_SCAN_BYTES: u64 = 8 << 20;
 
 /// A command that outlives this is killed: one stuck worker must not stall the fleet forever.
-const BASH_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const BASH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long the pipes may stay open after the command itself exited: a child it backgrounded
 /// inherits them, and joining its drain would wait for that child.
@@ -49,7 +50,7 @@ fn groups() -> MutexGuard<'static, Vec<i32>> {
 
 /// Spawns `command` and registers its process group while holding the registry lock, so a sweep
 /// cannot drain the list between the start and the registration and leave the command behind.
-fn spawn_grouped(command: &mut Command) -> Result<(Child, i32), String> {
+pub(crate) fn spawn_grouped(command: &mut Command) -> Result<(Child, i32), String> {
     let mut live = groups();
     let child = command.spawn().map_err(|e| e.to_string())?;
     let group = i32::try_from(child.id()).map_err(|e| e.to_string())?;
@@ -57,7 +58,7 @@ fn spawn_grouped(command: &mut Command) -> Result<(Child, i32), String> {
     Ok((child, group))
 }
 
-fn deregister(group: i32) {
+pub(crate) fn deregister(group: i32) {
     groups().retain(|live| *live != group);
 }
 
@@ -68,6 +69,7 @@ pub(crate) fn kill_running() {
         let _ = Command::new("kill").arg("-9").arg(format!("-{group}")).status();
     }
     jobs::kill_all();
+    crate::kernel::kill_all();
 }
 
 /// Names of the worker's file and shell tools. The schema and the dispatch both use these.
@@ -75,6 +77,11 @@ pub(crate) const BASH: &str = "bash";
 pub(crate) const READ_FILE: &str = "read_file";
 pub(crate) const WRITE_FILE: &str = "write_file";
 pub(crate) const EDIT: &str = "edit";
+/// The structured search tools, so a policy without `bash` can still find files and lines.
+pub(crate) const GLOB: &str = "glob";
+pub(crate) const GREP: &str = "grep";
+/// The persistent runtimes: one kernel per (working directory, runtime), shared between calls.
+pub(crate) const PYTHON: &str = "python";
 /// The progress-note tool an agent writes to its owner with.
 pub(crate) const REPLY: &str = "reply";
 /// The tool an agent ends its turn and reports with.
@@ -261,7 +268,7 @@ impl Policy {
                 format!("tool {name} is not granted to this agent; it may call {}", self.allow_tools.join(" "))
             });
         }
-        if (name == WRITE_FILE || name == EDIT) && self.read_only {
+        if (name == WRITE_FILE || name == EDIT || name == PYTHON) && self.read_only {
             return Some(format!("this agent is read-only: {name} is refused"));
         }
         // The tool list already hides these from a read-only worker, but a policy is re-read on
@@ -495,6 +502,21 @@ pub(crate) fn definitions() -> Value {
             "name": EDIT,
             "description": "Change an existing file by line ranges taken from a numbered `read_file`. This agent must have read the file and the file must be unchanged since. Patch rows: `PUT N.=M:` replaces lines N..M with the `+TEXT` rows that follow, `PUT <N:` / `PUT >N:` / `PUT >$:` inserts, `CUT N.=M` deletes, `REM` deletes the file, `MV DEST` renames. Anchors are the original line numbers. Returns a compact diff. Use `write_file` to create a file.",
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "patch": {"type": "string"}}, "required": ["path", "patch"]}
+        }},
+        {"type": "function", "function": {
+            "name": GLOB,
+            "description": "List files matching a glob pattern, relative to the working directory. Respects .gitignore, skips dotfiles and binary files. A pattern without `/` matches at any depth. One path per line, sorted.",
+            "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}
+        }},
+        {"type": "function", "function": {
+            "name": GREP,
+            "description": "Search file contents with a regular expression, returning `path:line: text` rows. Respects .gitignore, skips dotfiles and binary files. `path` optionally scopes the search to a directory or a file.",
+            "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}
+        }},
+        {"type": "function", "function": {
+            "name": PYTHON,
+            "description": format!("Run Python in a persistent kernel for this working directory: variables survive between calls; printed output is the result. Call an overseer tool from code with `tool('write_file', {{'path': …, 'content': …}})`; it returns that tool's result text. A read-only agent cannot call this. The {budget}-second budget covers the whole call; a kernel that outlives it is killed with its state.", budget = BASH_TIMEOUT.as_secs()),
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}
         }}
     ])
 }
@@ -529,6 +551,27 @@ struct EditArgs {
     patch: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobArgs {
+    pattern: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepArgs {
+    pattern: String,
+    /// Scope the search to a directory or a file, relative to the working directory.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelArgs {
+    code: String,
+}
+
 /// Parses tool arguments, turning a serde failure into the text the model reads.
 pub(crate) fn parse_args<'a, T: Deserialize<'a>>(arguments: &'a str) -> Result<T, String> {
     serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))
@@ -548,6 +591,32 @@ pub(crate) struct Context<'a> {
     pub(crate) scope: Option<&'a url::Scope<'a>>,
 }
 
+/// Runs one bridge tool call, bounded after the fact by `budget` and `cancel`.
+///
+/// The kernel's whole-call deadline needs a hung tool to fail the call. `on_tool` borrows the
+/// caller's per-agent state (`conflicts`, the edit store), which cannot move to a watchdog thread;
+/// the real bound is therefore the tools themselves: file tools and the searches always finish,
+/// `bash` and background jobs kill themselves at their own timeout, MCP servers answer or error.
+/// What this check buys: a tool that nonetheless blocked until `budget` elapses makes the kernel
+/// call fail loudly on the next loop iteration instead of hiding behind a successful reply.
+pub(crate) fn bounded_tool_call(
+    on_tool: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    name: &str,
+    arguments: &str,
+    budget: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Result<String, String>, ()> {
+    let started = Instant::now();
+    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(());
+    }
+    let result = on_tool(name, arguments);
+    if started.elapsed() > budget {
+        return Err(());
+    }
+    Ok(result)
+}
+
 /// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_guarded(
@@ -562,7 +631,7 @@ pub(crate) fn execute_guarded(
 ) -> String {
     match policy.refuse(name, arguments) {
         Some(refusal) => outcome(Err(refusal)),
-        None => outcome(run(working_dir, name, arguments, conflicts, seen, BASH_TIMEOUT, cancel, context)),
+        None => outcome(run(working_dir, name, arguments, policy, conflicts, seen, BASH_TIMEOUT, cancel, context)),
     }
 }
 
@@ -571,6 +640,7 @@ fn run(
     working_dir: &Path,
     name: &str,
     arguments: &str,
+    policy: &Policy,
     conflicts: &mut conflict::Registry,
     seen: &mut edit::Store,
     timeout: Duration,
@@ -588,10 +658,120 @@ fn run(
         EDIT => {
             parse_args::<EditArgs>(arguments).and_then(|args| edit::apply(working_dir, &args.path, &args.patch, seen))
         }
+        GLOB => parse_args::<GlobArgs>(arguments).and_then(|args| glob_files(working_dir, &args)),
+        GREP => parse_args::<GrepArgs>(arguments).and_then(|args| grep_files(working_dir, &args)),
+        PYTHON => parse_args::<KernelArgs>(arguments).and_then(|args| {
+            kernel::call(
+                working_dir,
+                kernel::Runtime::Python,
+                &args.code,
+                timeout,
+                cancel,
+                &mut |tool_name, tool_arguments| {
+                    // A kernel calling itself would recurse forever; refuse before dispatching.
+                    if tool_name == PYTHON {
+                        return Err("a kernel cannot call itself".to_string());
+                    }
+                    Ok(execute_guarded(
+                        working_dir,
+                        tool_name,
+                        tool_arguments,
+                        policy,
+                        cancel,
+                        conflicts,
+                        seen,
+                        context,
+                    ))
+                },
+            )
+        }),
         // An MCP server reports its own failures as text, which is what the model reads.
         _ if name.starts_with(mcp::PREFIX) => Ok(context.mcp.call(name, arguments)),
         _ => Err(format!("unknown tool {name}")),
     }
+}
+
+/// Rows a search tool shows before the `… N more` note.
+const MAX_SEARCH_ROWS: usize = 200;
+
+/// Longest one `grep` row shows of a matched line.
+const GREP_LINE_WIDTH: usize = 200;
+
+/// Lists files matching `pattern` under the working directory, relative and sorted.
+fn glob_files(working_dir: &Path, args: &GlobArgs) -> Result<String, String> {
+    let glob = globset::Glob::new(&args.pattern).map_err(|e| format!("invalid pattern: {e}"))?;
+    let matcher = glob.compile_matcher();
+    let mut found: Vec<String> = ignore::WalkBuilder::new(working_dir)
+        // .gitignore applies in a plain directory too: that is the walk the prompt warns about.
+        .require_git(false)
+        .build()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                return None;
+            }
+            let relative = entry.path().strip_prefix(working_dir).unwrap_or(entry.path());
+            if relative.as_os_str().is_empty() {
+                return None;
+            }
+            let display = relative.to_string_lossy().replace('\\', "/");
+            matcher.is_match(&display).then_some(display)
+        })
+        .collect();
+    found.sort();
+    if found.is_empty() {
+        return Ok(format!("no matches for {}", args.pattern));
+    }
+    Ok(paginate(found, "paths"))
+}
+
+/// Searches file contents with a regex, returning `path:line: text` rows, ordered by path then
+/// line number: a lexical sort would put `f:10:` before `f:2:`.
+fn grep_files(working_dir: &Path, args: &GrepArgs) -> Result<String, String> {
+    let pattern = regex::Regex::new(&args.pattern).map_err(|e| format!("invalid pattern: {e}"))?;
+    let root = args.path.as_deref().map_or_else(|| working_dir.to_path_buf(), |path| working_dir.join(path));
+    let label = args.path.clone().unwrap_or_else(|| ".".to_string());
+    let root = root.canonicalize().map_err(|e| config::io_error(label, &e))?;
+    let mut rows: Vec<(String, usize, String)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(&root).require_git(false).build() {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        if metadata.len() > MAX_SCAN_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else { continue };
+        if bytes.iter().take(512).any(|b| *b == 0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+        // Strip the walked root, not the raw working dir: a symlinked path (macOS /tmp) would
+        // otherwise fail the strip and leak absolute paths.
+        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
+        for (index, line) in text.lines().enumerate() {
+            if pattern.is_match(line) {
+                rows.push((relative.clone(), index + 1, shorten(line, GREP_LINE_WIDTH)));
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Ok(format!("no matches for {}", args.pattern));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    Ok(paginate(rows.into_iter().map(|(path, line, text)| format!("{path}:{line}: {text}")).collect(), "matches"))
+}
+
+/// Joins the first rows and, past the cap, appends the count of what is hidden.
+fn paginate(rows: Vec<String>, what: &str) -> String {
+    if rows.len() <= MAX_SEARCH_ROWS {
+        return rows.join("\n");
+    }
+    let hidden = rows.len() - MAX_SEARCH_ROWS;
+    let mut shown: Vec<String> = rows.into_iter().take(MAX_SEARCH_ROWS).collect();
+    shown.push(format!("… {hidden} more {what}"));
+    shown.join("\n")
 }
 
 /// How a `bash` command ended.
@@ -982,11 +1162,33 @@ fn shorten_bytes(text: &str, room: usize) -> &str {
 /// `label` is what the model sees in an error: a skill path is not the working directory's path,
 /// and naming it as one would send the model to the wrong place.
 pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), String> {
+    let (text, cut) = read_limited_bounded(path, label, true)?;
+    Ok((text?, cut))
+}
+
+/// The bounded read with the binary question split out: `read_file` refuses a binary file with a
+/// bash hint, but `history://` and `rule://` are written raw by the session itself — a NUL there
+/// would make an agent's log unreadable, so those reads keep a lossy decode and stay silent.
+pub(crate) fn read_limited_bounded(
+    path: &Path,
+    label: &str,
+    refuse_binary: bool,
+) -> Result<(Result<String, String>, bool), String> {
     let file = fs::File::open(path).map_err(|e| config::io_error(label, &e))?;
     let limit = u64::try_from(edit::MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
     let mut bytes = Vec::with_capacity(8 * 1024);
     file.take(limit).read_to_end(&mut bytes).map_err(|e| config::io_error(label, &e))?;
     let cut = bytes.len() > edit::MAX_READ_BYTES;
+    let binary = bytes.iter().take(512).any(|b| *b == 0);
+    if binary && refuse_binary {
+        let size = fs::metadata(path).map_or(0, |m| m.len());
+        return Ok((
+            Err(format!(
+                "{label}: binary file ({size} bytes); use bash `strings {label}` or `file {label}` to inspect it"
+            )),
+            cut,
+        ));
+    }
     if cut {
         // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
         let end = bytes
@@ -994,8 +1196,9 @@ pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), S
             .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
         bytes.truncate(end);
     }
-    let text = String::from_utf8(bytes).map_err(|_| format!("{label}: not valid UTF-8"))?;
-    Ok((text, cut))
+    // A binary file is decoded lossily when the caller accepts it: losing bytes beats losing the log.
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((Ok(text), cut))
 }
 
 /// The text as the model reads it, with the truncation note when the read stopped early.
@@ -1340,6 +1543,7 @@ mod tests {
             dir.path(),
             BASH,
             command,
+            &file_tools(),
             &mut state.conflicts,
             &mut state.seen,
             Duration::from_millis(200),
@@ -1514,6 +1718,7 @@ mod tests {
             dir.path(),
             BASH,
             r#"{"command":"sleep 300 &"}"#,
+            &file_tools(),
             &mut state.conflicts,
             &mut state.seen,
             Duration::from_millis(200),

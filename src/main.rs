@@ -8,6 +8,7 @@ mod edit;
 mod event;
 mod forge;
 mod jobs;
+mod kernel;
 mod llm;
 mod mcp;
 mod memory;

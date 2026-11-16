@@ -451,6 +451,8 @@ struct Described {
     text: Option<String>,
     command: Option<String>,
     action: Option<String>,
+    pattern: Option<String>,
+    code: Option<String>,
     id: Option<u64>,
     #[serde(default)]
     urgent: bool,
@@ -491,6 +493,9 @@ pub(crate) fn describe(name: &str, arguments: &str) -> String {
         prompt::REPLY => first_line(args.text.as_ref()).to_string(),
         tools::BASH => field(args.command.as_ref()).to_string(),
         tools::READ_FILE | tools::WRITE_FILE | tools::EDIT => field(args.path.as_ref()).to_string(),
+        tools::GLOB | tools::GREP | tools::PYTHON => {
+            first_line(args.pattern.as_ref().or(args.code.as_ref())).to_string()
+        }
         _ => String::new(),
     };
     if matches!(name, prompt::SPAWN_AGENT | prompt::MESSAGE_AGENT | tools::BASH) {
@@ -1425,8 +1430,9 @@ impl Swarm {
         }
         let path = self.log_dir.join(format!("agent-{id}.log"));
         let label = format!("history://{id}");
-        match tools::read_limited(&path, &label) {
-            Ok((text, cut)) => Ok(tools::with_note(text, cut)),
+        match tools::read_limited_bounded(&path, &label, false) {
+            Ok((Ok(text), cut)) => Ok(tools::with_note(text, cut)),
+            Ok((Err(e), _)) => Err(e),
             Err(_) => Err(format!("agent {} has no log yet", agent.label())),
         }
     }
