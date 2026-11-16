@@ -1430,8 +1430,9 @@ impl Swarm {
         }
         let path = self.log_dir.join(format!("agent-{id}.log"));
         let label = format!("history://{id}");
-        match tools::read_limited(&path, &label) {
-            Ok((text, cut)) => Ok(tools::with_note(text, cut)),
+        match tools::read_limited_bounded(&path, &label, false) {
+            Ok((Ok(text), cut)) => Ok(tools::with_note(text, cut)),
+            Ok((Err(e), _)) => Err(e),
             Err(_) => Err(format!("agent {} has no log yet", agent.label())),
         }
     }

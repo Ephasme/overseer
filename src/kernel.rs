@@ -11,9 +11,9 @@ use crate::tools::{MAX_OUTPUT_BYTES, deregister, spawn_grouped};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread;
@@ -40,10 +40,11 @@ impl Runtime {
         }
     }
 
-    /// The interpreter flags: `-I` isolates Python from user site-packages and environment.
+    /// The interpreter flags: `-E -s` keep Python from reading user env/site-packages while the
+    /// working directory stays on `sys.path`, so code can import local modules.
     fn flags(self) -> &'static [&'static str] {
         match self {
-            Self::Python => &["-I", "-u", "-c"],
+            Self::Python => &["-E", "-s", "-u", "-c"],
             Self::Bun => &["-e"],
             #[cfg(test)]
             Self::Test => &["-c"],
@@ -196,20 +197,27 @@ fn spawn_error(runtime: Runtime, raw: &str) -> String {
     }
 }
 
-/// The registry lock is held across the spawn, so two agents reaching for one kernel cannot each
-/// start their own interpreter.
-fn get_or_spawn(working_dir: &Path, runtime: Runtime) -> Result<Arc<Kernel>, String> {
-    let canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
-    let key = (canonical.clone(), runtime);
-    let mut kernels = kernels();
-    if let Some(kernel) = kernels.get(&key) {
-        return Ok(Arc::clone(kernel));
+/// One kernel spawn under the caller's name: the registry lock never covers `Command::spawn`, so a
+/// slow spawn cannot stall every other lookup.
+/// Reads bytes off `reader` up to and including the next newline, discarding them: the tail of an
+/// overlong frame line never enters memory.
+fn drain_to_newline(reader: &mut BufReader<ChildStdout>) {
+    let mut sink = [0u8; 1];
+    loop {
+        match reader.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if sink[0] == b'\n' => break,
+            Ok(_) => {}
+        }
     }
+}
+
+fn spawn_kernel(working_dir: &Path, runtime: Runtime) -> Result<Arc<Kernel>, String> {
     let mut command = Command::new(runtime.program());
     command
         .args(runtime.flags())
         .arg(runtime.bridge())
-        .current_dir(&canonical)
+        .current_dir(working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -229,18 +237,52 @@ fn get_or_spawn(working_dir: &Path, runtime: Runtime) -> Result<Arc<Kernel>, Str
     thread::spawn(move || pump_stdin(stdin, &line_receiver));
     let (sender, receiver) = channel();
     thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) if sender.send(parse_frame(&line)).is_err() => break,
-                Ok(_) => {}
-                Err(_) => {
+        let mut reader = BufReader::new(stdout);
+        // The frame is assembled from small reads, so a blocking pipe delivers it as it arrives;
+        // memory stays bounded because a line past the cap keeps its head and drains the rest.
+        loop {
+            let mut line = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let Ok(read) = reader.read(&mut buffer) else {
                     let _ = sender.send(Frame::Corrupt("stdout closed".to_string()));
+                    return;
+                };
+                if read == 0 {
+                    if line.is_empty() {
+                        let _ = sender.send(Frame::Corrupt("kernel exited".to_string()));
+                        return;
+                    }
+                    // EOF mid-line: emit what arrived, then the kernel is gone.
+                    let text = String::from_utf8_lossy(&line);
+                    let _ = sender.send(parse_frame(&text));
+                    let _ = sender.send(Frame::Corrupt("kernel exited".to_string()));
+                    return;
+                }
+                let chunk = buffer.get(..read).unwrap_or(&[]);
+                if let Some(newline) = chunk.iter().position(|b| *b == b'\n') {
+                    // Keep only the first MAX_OUTPUT_BYTES of the line; the rest of this
+                    // chunk is already in hand, and whatever follows drains below.
+                    let kept = MAX_OUTPUT_BYTES.saturating_sub(line.len()).min(newline);
+                    line.extend_from_slice(chunk.get(..kept).unwrap_or(&[]));
+                    let text = String::from_utf8_lossy(&line);
+                    if sender.send(parse_frame(&text)).is_err() {
+                        return;
+                    }
+                    break;
+                }
+                let kept = MAX_OUTPUT_BYTES.saturating_sub(line.len()).min(read);
+                line.extend_from_slice(chunk.get(..kept).unwrap_or(&[]));
+                if kept < read {
+                    drain_to_newline(&mut reader);
+                    let text = String::from_utf8_lossy(&line);
+                    if sender.send(parse_frame(&text)).is_err() {
+                        return;
+                    }
                     break;
                 }
             }
         }
-        let _ = sender.send(Frame::Corrupt("kernel exited".to_string()));
     });
     let kernel = Arc::new(Kernel {
         child: Mutex::new(child),
@@ -250,18 +292,48 @@ fn get_or_spawn(working_dir: &Path, runtime: Runtime) -> Result<Arc<Kernel>, Str
         group,
         call_lock: Mutex::new(()),
     });
-    kernels.insert(key, Arc::clone(&kernel));
     Ok(kernel)
 }
 
-/// Removes and kills one kernel: the caller has already diagnosed it as dead or reset.
-fn remove(canonical: &Path, runtime: Runtime) {
+fn get_or_spawn(working_dir: &Path, runtime: Runtime) -> Result<Arc<Kernel>, String> {
+    let canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
+    let key = (canonical.clone(), runtime);
+    let cached = kernels().get(&key).cloned();
+    if let Some(kernel) = cached {
+        // A kernel the machine already lost cannot serve this call: drop it and respawn.
+        let alive = kernel
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait()
+            .is_ok_and(|state| state.is_none());
+        if alive {
+            return Ok(kernel);
+        }
+        kill_kernel(&kernel);
+        kernels().remove(&key);
+    }
+    let kernel = spawn_kernel(&canonical, runtime)?;
+    kernels().insert(key, Arc::clone(&kernel));
+    Ok(kernel)
+}
+
+/// Removes and kills one kernel, only when the registry still holds the one that failed: another
+/// caller may already have replaced it with a fresh interpreter we must not kill.
+fn remove_failed(canonical: &Path, runtime: Runtime, failed: &Arc<Kernel>) {
     let key = (canonical.to_path_buf(), runtime);
-    let kernel = kernels().remove(&key);
-    if let Some(kernel) = kernel {
+    let current = kernels().get(&key).filter(|live| Arc::ptr_eq(live, failed)).cloned();
+    if let Some(kernel) = current {
+        kernels().remove(&key);
         kernel.kill();
         deregister(kernel.group);
     }
+}
+
+/// Kills the kernel this caller holds, whatever the registry now says.
+fn kill_kernel(kernel: &Kernel) {
+    kernel.kill();
+    deregister(kernel.group);
 }
 
 /// Kills every kernel still running: the session calls this on its way out.
@@ -280,7 +352,6 @@ const POLL: Duration = Duration::from_millis(25);
 fn lock_call<'a>(
     kernel: &'a Kernel,
     deadline: Instant,
-    timeout: Duration,
     cancel: Option<&'a std::sync::atomic::AtomicBool>,
 ) -> Result<MutexGuard<'a, ()>, String> {
     loop {
@@ -290,19 +361,19 @@ fn lock_call<'a>(
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         if Instant::now() >= deadline {
-            return Err(format!("killed after {}s (kernel state reset)", timeout.as_secs()));
+            return Err("timed out waiting for a busy kernel".to_string());
         }
         if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
-            return Err("interrupted by overseer (kernel state reset)".to_string());
+            return Err("interrupted by overseer while waiting for a busy kernel".to_string());
         }
         thread::sleep(POLL);
     }
 }
 
 /// Reports a dead kernel with its stderr tail, after resetting it.
-fn died(runtime: Runtime, cause: &str, kernel: &Kernel, canonical: &Path) -> String {
+fn died(runtime: Runtime, cause: &str, kernel: &Arc<Kernel>, canonical: &Path) -> String {
     let tail = kernel.tail();
-    remove(canonical, runtime);
+    remove_failed(canonical, runtime, kernel);
     format!("{} kernel died: {cause}; stderr: {tail}", runtime.program())
 }
 
@@ -321,7 +392,7 @@ pub(crate) fn call(
     let kernel = get_or_spawn(working_dir, runtime)?;
     let canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
     let deadline = Instant::now() + timeout;
-    let _call = lock_call(&kernel, deadline, timeout, cancel)?;
+    let _call = lock_call(&kernel, deadline, cancel)?;
     let line = json!({"kind": "run", "code": code}).to_string();
     if let Err(e) = kernel.write_line(&line) {
         return Err(died(runtime, &e, &kernel, &canonical));
@@ -340,11 +411,13 @@ pub(crate) fn call(
         };
         let Some(frame) = frame else {
             if Instant::now() >= deadline {
-                remove(&canonical, runtime);
+                kill_kernel(&kernel);
+                remove_failed(&canonical, runtime, &kernel);
                 break Err(format!("killed after {}s (kernel state reset)", timeout.as_secs()));
             }
             if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
-                remove(&canonical, runtime);
+                kill_kernel(&kernel);
+                remove_failed(&canonical, runtime, &kernel);
                 break Err("interrupted by overseer (kernel state reset)".to_string());
             }
             thread::sleep(POLL);
@@ -361,9 +434,21 @@ pub(crate) fn call(
                 };
             }
             Frame::Tool { name, arguments } => {
-                let reply = match on_tool(&name, &arguments) {
-                    Ok(text) => text,
-                    Err(e) => format!("error: {e}"),
+                // A stuck tool must not overrun the call's budget: give it what remains.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    kill_kernel(&kernel);
+                    remove_failed(&canonical, runtime, &kernel);
+                    break Err(format!("killed after {}s (kernel state reset)", timeout.as_secs()));
+                }
+                let reply = match crate::tools::bounded_tool_call(on_tool, &name, &arguments, remaining, cancel) {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(e)) => format!("error: {e}"),
+                    Err(()) => {
+                        kill_kernel(&kernel);
+                        remove_failed(&canonical, runtime, &kernel);
+                        break Err(format!("killed after {}s (kernel state reset)", timeout.as_secs()));
+                    }
                 };
                 // Capped before the pipe: a too-large frame would fill it and block both ends.
                 let line = json!({"kind": "tool-result", "output": truncate_note(&reply, "tool output")}).to_string();
@@ -372,7 +457,8 @@ pub(crate) fn call(
                 }
             }
             Frame::Corrupt(reason) => {
-                remove(&canonical, runtime);
+                kill_kernel(&kernel);
+                remove_failed(&canonical, runtime, &kernel);
                 break Err(format!(
                     "{} kernel returned a malformed frame ({reason}); its state was reset",
                     runtime.program()
@@ -437,6 +523,10 @@ for line in sys.stdin:
     finally:
         sys.stdout, sys.stderr = old_out, old_err
     output = (out.getvalue() + err.getvalue()).rstrip()
+    # Cap at the source: a giant `print` must not reach the manager whole, or the manager
+    # would buffer the entire line before it can truncate.
+    if len(output) > 28000:
+        output = output[:28000] + "\n[output truncated: first 28000 bytes shown]"
     reply = {"kind": "result", "ok": ok, "output": output}
     if error:
         reply["error"] = error
@@ -446,19 +536,26 @@ for line in sys.stdin:
 const BUN_BRIDGE: &str = r#"
 const state = {};
 
+// One parser owns the buffer: every stdin chunk lands here, complete lines go to whichever
+// consumer is next — a pending tool reply first, otherwise the run queue. No second listener.
 let buffer = "";
-let pendingResolve = null;
+let replyResolvers = [];
+let queue = [];
+let running = false;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
-  const index = buffer.indexOf("\n");
-  if (pendingResolve && index >= 0) {
+  while (true) {
+    const index = buffer.indexOf("\n");
+    if (index < 0) break;
     const line = buffer.slice(0, index).trim();
     buffer = buffer.slice(index + 1);
-    const resolve = pendingResolve;
-    pendingResolve = null;
-    resolve(line);
+    if (!line) continue;
+    const resolve = replyResolvers.shift();
+    if (resolve) resolve(line);
+    else queue.push(line);
   }
+  pump();
 });
 function readLine() {
   return new Promise((resolve) => {
@@ -468,7 +565,7 @@ function readLine() {
       buffer = buffer.slice(index + 1);
       resolve(line);
     } else {
-      pendingResolve = resolve;
+      replyResolvers.push(resolve);
     }
   });
 }
@@ -481,19 +578,6 @@ async function tool(name, args) {
   return JSON.parse(line).output ?? "";
 }
 
-let queue = [];
-let running = false;
-process.stdin.on("data", () => {
-  // Tool replies are already taken by readLine above; everything else queues for a run.
-  while (true) {
-    const index = buffer.indexOf("\n");
-    if (index < 0) break;
-    const line = buffer.slice(0, index).trim();
-    buffer = buffer.slice(index + 1);
-    if (line) queue.push(line);
-  }
-  pump();
-});
 async function pump() {
   if (running) return;
   running = true;
@@ -512,7 +596,9 @@ async function runLine(line) {
   if (message.kind !== "run") return;
   const parts = [];
   const oldLog = console.log;
+  const oldError = console.error;
   console.log = (...args) => parts.push(args.map(String).join(" "));
+  console.error = (...args) => parts.push(args.map(String).join(" "));
   let ok = true;
   let error;
   try {
@@ -523,14 +609,17 @@ async function runLine(line) {
     error = String(e);
   } finally {
     console.log = oldLog;
+    console.error = oldError;
   }
-  const output = parts.join("\n").trimEnd();
+  // Cap at the source: a giant output must not reach the manager whole.
+  let output = parts.join("\n").trimEnd();
+  if (output.length > 28000) output = output.slice(0, 28000) + "\n[output truncated: first 28000 bytes shown]";
   process.stdout.write(JSON.stringify({kind: "result", ok, output, ...(error ? {error} : {})}) + "\n");
 }
 process.stdin.on("end", () => {
   // Wait for any in-flight call before exiting, so a reply frame is never cut short.
   const stop = setInterval(() => {
-    if (!running) {
+    if (!running && replyResolvers.length === 0) {
       clearInterval(stop);
       process.exit(0);
     }
@@ -694,7 +783,7 @@ mod tests {
         // The same directory: a different one would reach a different kernel with no contention.
         let err = call(&working, Runtime::Python, "print('never')", Duration::from_millis(300), None, no_tool!())
             .unwrap_err();
-        assert!(err.contains("killed after 0s (kernel state reset)"), "{err}");
+        assert_eq!(err, "timed out waiting for a busy kernel");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         slow.join().unwrap();
     }

@@ -597,6 +597,32 @@ pub(crate) struct Context<'a> {
     pub(crate) scope: Option<&'a url::Scope<'a>>,
 }
 
+/// Runs one bridge tool call, bounded after the fact by `budget` and `cancel`.
+///
+/// The kernel's whole-call deadline needs a hung tool to fail the call. `on_tool` borrows the
+/// caller's per-agent state (`conflicts`, the edit store), which cannot move to a watchdog thread;
+/// the real bound is therefore the tools themselves: file tools and the searches always finish,
+/// `bash` and background jobs kill themselves at their own timeout, MCP servers answer or error.
+/// What this check buys: a tool that nonetheless blocked until `budget` elapses makes the kernel
+/// call fail loudly on the next loop iteration instead of hiding behind a successful reply.
+pub(crate) fn bounded_tool_call(
+    on_tool: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+    name: &str,
+    arguments: &str,
+    budget: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Result<String, String>, ()> {
+    let started = Instant::now();
+    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(());
+    }
+    let result = on_tool(name, arguments);
+    if started.elapsed() > budget {
+        return Err(());
+    }
+    Ok(result)
+}
+
 /// Runs a worker's tool call under its policy, killing a running command once `cancel` is set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_guarded(
@@ -682,9 +708,14 @@ fn glob_files(working_dir: &Path, args: &GlobArgs) -> Result<String, String> {
     let glob = globset::Glob::new(&args.pattern).map_err(|e| format!("invalid pattern: {e}"))?;
     let matcher = glob.compile_matcher();
     let mut found: Vec<String> = ignore::WalkBuilder::new(working_dir)
+        // .gitignore applies in a plain directory too: that is the walk the prompt warns about.
+        .require_git(false)
         .build()
         .filter_map(|entry| {
             let entry = entry.ok()?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                return None;
+            }
             let relative = entry.path().strip_prefix(working_dir).unwrap_or(entry.path());
             if relative.as_os_str().is_empty() {
                 return None;
@@ -700,13 +731,15 @@ fn glob_files(working_dir: &Path, args: &GlobArgs) -> Result<String, String> {
     Ok(paginate(found, "paths"))
 }
 
-/// Searches file contents with a regex, returning `path:line: text` rows, sorted.
+/// Searches file contents with a regex, returning `path:line: text` rows, ordered by path then
+/// line number: a lexical sort would put `f:10:` before `f:2:`.
 fn grep_files(working_dir: &Path, args: &GrepArgs) -> Result<String, String> {
     let pattern = regex::Regex::new(&args.pattern).map_err(|e| format!("invalid pattern: {e}"))?;
     let root = args.path.as_deref().map_or_else(|| working_dir.to_path_buf(), |path| working_dir.join(path));
-    let root = root.canonicalize().map_err(|e| config::io_error(args.path.clone().unwrap_or_default(), &e))?;
-    let mut rows: Vec<String> = Vec::new();
-    for entry in ignore::WalkBuilder::new(&root).build() {
+    let label = args.path.clone().unwrap_or_else(|| ".".to_string());
+    let root = root.canonicalize().map_err(|e| config::io_error(label, &e))?;
+    let mut rows: Vec<(String, usize, String)> = Vec::new();
+    for entry in ignore::WalkBuilder::new(&root).require_git(false).build() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -720,19 +753,20 @@ fn grep_files(working_dir: &Path, args: &GrepArgs) -> Result<String, String> {
             continue;
         }
         let Ok(text) = std::str::from_utf8(&bytes) else { continue };
-        let relative =
-            entry.path().strip_prefix(working_dir).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
+        // Strip the walked root, not the raw working dir: a symlinked path (macOS /tmp) would
+        // otherwise fail the strip and leak absolute paths.
+        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path()).to_string_lossy().replace('\\', "/");
         for (index, line) in text.lines().enumerate() {
             if pattern.is_match(line) {
-                rows.push(format!("{relative}:{}: {}", index + 1, shorten(line, GREP_LINE_WIDTH)));
+                rows.push((relative.clone(), index + 1, shorten(line, GREP_LINE_WIDTH)));
             }
         }
     }
     if rows.is_empty() {
         return Ok(format!("no matches for {}", args.pattern));
     }
-    rows.sort();
-    Ok(paginate(rows, "matches"))
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    Ok(paginate(rows.into_iter().map(|(path, line, text)| format!("{path}:{line}: {text}")).collect(), "matches"))
 }
 
 /// Joins the first rows and, past the cap, appends the count of what is hidden.
@@ -1134,15 +1168,32 @@ fn shorten_bytes(text: &str, room: usize) -> &str {
 /// `label` is what the model sees in an error: a skill path is not the working directory's path,
 /// and naming it as one would send the model to the wrong place.
 pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), String> {
+    let (text, cut) = read_limited_bounded(path, label, true)?;
+    Ok((text?, cut))
+}
+
+/// The bounded read with the binary question split out: `read_file` refuses a binary file with a
+/// bash hint, but `history://` and `rule://` are written raw by the session itself — a NUL there
+/// would make an agent's log unreadable, so those reads keep a lossy decode and stay silent.
+pub(crate) fn read_limited_bounded(
+    path: &Path,
+    label: &str,
+    refuse_binary: bool,
+) -> Result<(Result<String, String>, bool), String> {
     let file = fs::File::open(path).map_err(|e| config::io_error(label, &e))?;
     let limit = u64::try_from(edit::MAX_READ_BYTES).map_or(u64::MAX, |cap| cap.saturating_add(1));
     let mut bytes = Vec::with_capacity(8 * 1024);
     file.take(limit).read_to_end(&mut bytes).map_err(|e| config::io_error(label, &e))?;
     let cut = bytes.len() > edit::MAX_READ_BYTES;
     let binary = bytes.iter().take(512).any(|b| *b == 0);
-    if binary {
+    if binary && refuse_binary {
         let size = fs::metadata(path).map_or(0, |m| m.len());
-        return Err(format!("{label}: binary file ({size} bytes); use bash to inspect it (od, xxd, strings, file)"));
+        return Ok((
+            Err(format!(
+                "{label}: binary file ({size} bytes); use bash `strings {label}` or `file {label}` to inspect it"
+            )),
+            cut,
+        ));
     }
     if cut {
         // The budget can land inside a multi-byte character: keep the longest valid prefix below it.
@@ -1151,8 +1202,9 @@ pub(crate) fn read_limited(path: &Path, label: &str) -> Result<(String, bool), S
             .map_or(0, |head| std::str::from_utf8(head).map_or_else(|e| e.valid_up_to(), |_| head.len()));
         bytes.truncate(end);
     }
-    let text = String::from_utf8(bytes).map_err(|_| format!("{label}: not valid UTF-8"))?;
-    Ok((text, cut))
+    // A binary file is decoded lossily when the caller accepts it: losing bytes beats losing the log.
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((Ok(text), cut))
 }
 
 /// The text as the model reads it, with the truncation note when the read stopped early.
