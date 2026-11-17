@@ -1,9 +1,9 @@
-//! Durable session state: one `session.jsonl` (append-only tree records) and one
-//! `agent-<id>.history.json` per agent, under the session dir. Everything the resume path needs
-//! reads or writes through this module; nothing else touches the files.
+//! Durable session state: one `session.jsonl` (append-only tree records) and one immutable
+//! checkpoint per agent and committed turn, under the session dir. Everything the restore path
+//! needs reads or writes through this module; nothing else touches the files.
 
 use crate::llm::Message;
-use crate::{config, profiles, tools};
+use crate::{config, names, profiles, tools};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum TreeRecord {
-    /// The session header: when it started, where it lives, which session it resumes.
+    /// The session header: when it started, where it lives, which session it resumes or forks.
     Session {
         at: u64,
         dir: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<String>,
     },
     /// One agent entering the tree, live or already dead.
     Agent {
@@ -46,10 +48,31 @@ pub(crate) enum TreeRecord {
 }
 
 /// Which previous session a run resumes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResumeSource {
     pub(crate) id: String,
     pub(crate) dir: PathBuf,
+}
+
+/// What a new session starts from: the latest state, or a branch of one checkpoint of it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Restore {
+    Resume(ResumeSource),
+    Fork { source: ResumeSource, at: Option<ForkAt> },
+}
+impl Restore {
+    pub(crate) fn source(&self) -> &ResumeSource {
+        match self {
+            Self::Resume(source) | Self::Fork { source, .. } => source,
+        }
+    }
+}
+
+/// One agent's checkpoint, 0 meaning before its first committed turn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ForkAt {
+    pub(crate) agent: usize,
+    pub(crate) turn: usize,
 }
 
 /// The append-only `session.jsonl` of one session dir. Every write flushes and syncs, so a
@@ -271,23 +294,80 @@ pub(crate) fn rows(dir: &Path) -> Result<Vec<AgentRow>, String> {
     Ok(rows)
 }
 
-/// Load one agent's committed history. A missing file is a fresh history (the agent never
-/// completed a turn); an unparsable one is an error naming the file.
-pub(crate) fn load_history(path: &Path) -> Result<Vec<Message>, String> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(config::io_error(path.display(), &e)),
-    };
-    serde_json::from_str(&text).map_err(|e| format!("{}: not an agent history: {e}", path.display()))
+/// `<dir>/checkpoints/agent-<id>`.
+fn checkpoint_dir(dir: &Path, id: usize) -> PathBuf {
+    dir.join("checkpoints").join(format!("agent-{id}"))
 }
 
-/// Store one agent's committed history: temp file then rename, so a reader never sees half. Same
-/// pattern as `memory::write`.
-pub(crate) fn save_history(path: &Path, history: &[Message]) -> Result<(), String> {
+/// Whether the checkpoint dir holds any numbered file: a pre-checkpoint session's legacy history
+/// is only read when it does not.
+fn numbered(dir: &Path, id: usize) -> bool {
+    fs::read_dir(checkpoint_dir(dir, id)).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.strip_suffix(".history.json")
+                    .and_then(|number| number.parse::<usize>().ok())
+                    .is_some_and(|turn| turn > 0)
+            })
+        })
+    })
+}
+
+/// Where one turn's history lives: the numbered file, or a pre-checkpoint session's
+/// `agent-<id>.history.json` for turn 1. `None` for a turn this dir does not hold.
+fn checkpoint_file(dir: &Path, id: usize, turn: usize) -> Option<PathBuf> {
+    let file = checkpoint_dir(dir, id).join(format!("{turn}.history.json"));
+    if file.is_file() {
+        return Some(file);
+    }
+    let legacy = dir.join(format!("agent-{id}.history.json"));
+    (turn == 1 && legacy.is_file() && !self::numbered(dir, id)).then_some(legacy)
+}
+
+/// This agent's turns, ascending, through `checkpoint_file`.
+pub(crate) fn checkpoint_turns(dir: &Path, id: usize) -> Vec<usize> {
+    let mut turns: Vec<usize> = Vec::new();
+    if let Ok(entries) = fs::read_dir(checkpoint_dir(dir, id)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(number) = name.to_str().and_then(|name| name.strip_suffix(".history.json")) else {
+                continue;
+            };
+            let Ok(turn) = number.parse::<usize>() else { continue };
+            if turn > 0 && entry.path().is_file() {
+                turns.push(turn);
+            }
+        }
+    }
+    if turns.is_empty() && checkpoint_file(dir, id, 1).is_some() {
+        return vec![1];
+    }
+    turns.sort_unstable();
+    turns.dedup();
+    turns
+}
+
+/// Copy every checkpoint of one agent up to and including `upto` into another session dir, so a
+/// restored session keeps its source's address space; a legacy history lands as turn 1's file.
+pub(crate) fn copy_checkpoints(from: &Path, to: &Path, id: usize, upto: usize) -> Result<(), String> {
+    for turn in checkpoint_turns(from, id).into_iter().filter(|turn| *turn <= upto) {
+        let Some(source) = checkpoint_file(from, id, turn) else { continue };
+        let text = fs::read_to_string(&source).map_err(|e| config::io_error(source.display(), &e))?;
+        let history: Vec<Message> =
+            serde_json::from_str(&text).map_err(|e| format!("{}: not an agent history: {e}", source.display()))?;
+        save_checkpoint(to, id, turn, &history)?;
+    }
+    Ok(())
+}
+
+/// One committed history: temp file, sync, rename, so a reader never sees half.
+pub(crate) fn save_checkpoint(dir: &Path, id: usize, turn: usize, history: &[Message]) -> Result<(), String> {
+    let dir = checkpoint_dir(dir, id);
+    fs::create_dir_all(&dir).map_err(|e| config::io_error(dir.display(), &e))?;
+    let path = dir.join(format!("{turn}.history.json"));
     let text = serde_json::to_string(history).map_err(|e| format!("{}: serialize: {e}", path.display()))?;
     let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    // Synced before the rename: a crash must not leave an empty history where the tree record
+    // Synced before the rename: a crash must not leave an empty checkpoint where the tree record
     // already says the turn committed.
     let write = fs::File::create(&temp).and_then(|mut file| {
         file.write_all(text.as_bytes())?;
@@ -297,11 +377,52 @@ pub(crate) fn save_history(path: &Path, history: &[Message]) -> Result<(), Strin
         let _ = fs::remove_file(&temp);
         return Err(config::io_error(temp.display(), &e));
     }
-    if let Err(e) = fs::rename(&temp, path) {
+    if let Err(e) = fs::rename(&temp, &path) {
         let _ = fs::remove_file(&temp);
         return Err(config::io_error(path.display(), &e));
     }
     Ok(())
+}
+
+/// Turn 0 is the state before the agent's first committed turn: an empty history, no file read.
+pub(crate) fn checkpoint(dir: &Path, id: usize, turn: usize) -> Result<Vec<Message>, String> {
+    if turn == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(path) = checkpoint_file(dir, id, turn) else {
+        return Err(format!("{}: no checkpoint {turn}", checkpoint_dir(dir, id).display()));
+    };
+    let text = fs::read_to_string(&path).map_err(|e| config::io_error(path.display(), &e))?;
+    serde_json::from_str(&text).map_err(|e| format!("{}: not an agent history: {e}", path.display()))
+}
+
+/// The highest turn, or `(0, Vec::new())` when the agent has no checkpoint.
+pub(crate) fn newest_checkpoint(dir: &Path, id: usize) -> Result<(usize, Vec<Message>), String> {
+    match checkpoint_turns(dir, id).last() {
+        Some(&turn) => Ok((turn, checkpoint(dir, id, turn)?)),
+        None => Ok((0, Vec::new())),
+    }
+}
+
+/// `--checkpoints <id>`: one line per agent, with the address that forks it at its newest turn.
+pub(crate) fn checkpoint_report(dir: &Path, id: &str) -> Result<String, String> {
+    let rows = rows(dir)?;
+    let mut lines = vec![format!("session {}: {} agent(s)", printable(id), rows.len())];
+    for row in &rows {
+        let label = printable(&names::label(row.id, row.name.as_deref()));
+        let turns = checkpoint_turns(dir, row.id);
+        let state = match turns.last() {
+            Some(&turn) => format!(
+                "({} checkpoint(s), newest turn {turn})  --fork {}@{}:{turn}",
+                turns.len(),
+                printable(id),
+                row.id
+            ),
+            None => "(no checkpoints)".to_string(),
+        };
+        lines.push(format!("  {label}  {}  {state}", printable(&row.profile)));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The picker preview line for one session row. The title is the user's own first instruction, so
@@ -334,7 +455,6 @@ fn secs_ago(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm;
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -361,54 +481,122 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_history_round_trips() {
-        let dir = temp_dir();
-        let path = dir.path().join("agent-1.history.json");
-        let history = vec![
-            llm::Message::system("you are a supervisor".into()),
-            llm::Message::user("list the files"),
-            llm::Message {
-                usage: None,
-                summary: None,
-                role: "assistant".into(),
-                content: None,
-                tool_calls: Some(vec![llm::ToolCall {
-                    id: "call_1".into(),
-                    kind: "function".into(),
-                    function: llm::FunctionCall { name: "bash".into(), arguments: r#"{"command":"ls"}"#.into() },
-                }]),
-                tool_call_id: None,
-            },
-            llm::Message::tool("call_1", "a.txt\nb.txt".into()),
-            llm::Message::user("thanks"),
+    /// The three committed turns of one agent, as the thread writes them.
+    fn three_turns(dir: &Path) -> Vec<Vec<Message>> {
+        let turns = vec![
+            vec![Message::user("one")],
+            vec![Message::user("one"), Message::user("two")],
+            vec![Message::user("one"), Message::user("two"), Message::user("three")],
         ];
-        save_history(&path, &history).unwrap();
-        let loaded = load_history(&path).unwrap();
-        assert_eq!(loaded, history);
+        for (n, history) in turns.iter().enumerate() {
+            save_checkpoint(dir, 1, n + 1, history).unwrap();
+        }
+        turns
     }
 
     #[test]
-    fn a_missing_history_is_an_empty_one() {
+    fn checkpoints_are_numbered_and_the_newest_one_wins() {
         let dir = temp_dir();
-        let empty = load_history(&dir.path().join("agent-9.history.json")).unwrap();
-        assert!(empty.is_empty(), "{empty:?}");
+        let turns = three_turns(dir.path());
+        assert_eq!(checkpoint_turns(dir.path(), 1), [1, 2, 3]);
+        assert_eq!(newest_checkpoint(dir.path(), 1).unwrap(), (3, turns[2].clone()));
+        assert_eq!(checkpoint(dir.path(), 1, 2).unwrap(), turns[1]);
+        assert!(checkpoint(dir.path(), 1, 0).unwrap().is_empty(), "turn 0 is before the first commit");
+        let err = checkpoint(dir.path(), 1, 4).unwrap_err();
+        assert!(err.contains("no checkpoint 4"), "{err}");
+        assert_eq!(checkpoint_turns(dir.path(), 9), Vec::<usize>::new());
+        assert_eq!(newest_checkpoint(dir.path(), 9).unwrap(), (0, Vec::new()));
     }
 
     #[test]
-    fn a_corrupt_history_names_the_file() {
+    fn a_legacy_history_is_turn_one_and_is_read_in_place() {
         let dir = temp_dir();
-        let path = dir.path().join("agent-1.history.json");
-        fs::write(&path, "{not json").unwrap();
-        let err = load_history(&path).unwrap_err();
-        assert!(err.contains("agent-1.history.json"), "{err}");
+        let legacy = dir.path().join("agent-1.history.json");
+        let history = vec![Message::user("before checkpoints")];
+        fs::write(&legacy, serde_json::to_string(&history).unwrap()).unwrap();
+
+        assert_eq!(checkpoint_turns(dir.path(), 1), [1]);
+        assert_eq!(checkpoint(dir.path(), 1, 1).unwrap(), history);
+        assert_eq!(newest_checkpoint(dir.path(), 1).unwrap().0, 1);
+        let read = fs::read(&legacy).unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<Message>>(&read).unwrap(), history);
+        assert!(!dir.path().join("checkpoints/agent-1/1.history.json").exists(), "reading writes nothing");
+    }
+
+    #[test]
+    fn copy_checkpoints_stops_at_the_requested_turn() {
+        let from = temp_dir();
+        let to = temp_dir();
+        let turns = three_turns(from.path());
+        copy_checkpoints(from.path(), to.path(), 1, 2).unwrap();
+        assert_eq!(checkpoint_turns(to.path(), 1), [1, 2]);
+        assert_eq!(checkpoint(to.path(), 1, 2).unwrap(), turns[1]);
+        assert!(checkpoint(to.path(), 1, 3).is_err());
+    }
+
+    #[test]
+    fn a_legacy_history_is_copied_as_turn_one() {
+        let from = temp_dir();
+        let to = temp_dir();
+        let history = vec![Message::user("old")];
+        fs::write(from.path().join("agent-1.history.json"), serde_json::to_string(&history).unwrap()).unwrap();
+        copy_checkpoints(from.path(), to.path(), 1, 1).unwrap();
+        assert!(to.path().join("checkpoints/agent-1/1.history.json").is_file());
+        assert_eq!(checkpoint(to.path(), 1, 1).unwrap(), history);
+    }
+
+    #[test]
+    fn a_forked_header_round_trips_with_its_source() {
+        let dir = temp_dir();
+        let mut log = SessionLog::open(dir.path()).unwrap();
+        log.write(&TreeRecord::Session {
+            at: 42,
+            dir: "/tmp/s1".into(),
+            resumed_from: None,
+            forked_from: Some("1700000000-7".into()),
+        });
+        drop(log);
+        let records = read_tree(dir.path()).unwrap();
+        assert_eq!(
+            records,
+            [TreeRecord::Session {
+                at: 42,
+                dir: "/tmp/s1".into(),
+                resumed_from: None,
+                forked_from: Some("1700000000-7".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_report_names_each_agents_newest_fork() {
+        let dir = temp_dir();
+        let mut log = SessionLog::open(dir.path()).unwrap();
+        log.write(&TreeRecord::Session { at: 1, dir: "/tmp".into(), resumed_from: None, forked_from: None });
+        log.write(&agent_record(1));
+        log.write(&agent_record(2));
+        drop(log);
+        three_turns(dir.path());
+        save_checkpoint(dir.path(), 2, 1, &[Message::user("child")]).unwrap();
+
+        let report = checkpoint_report(dir.path(), "1700000000-42").unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "session 1700000000-42: 2 agent(s)");
+        assert_eq!(
+            lines[1],
+            "  harbor falcon 7 (1)  worker  (3 checkpoint(s), newest turn 3)  --fork 1700000000-42@1:3"
+        );
+        assert_eq!(
+            lines[2],
+            "  harbor falcon 7 (2)  worker  (1 checkpoint(s), newest turn 1)  --fork 1700000000-42@2:1"
+        );
     }
 
     #[test]
     fn tree_records_replay_identically() {
         let dir = temp_dir();
         let mut log = SessionLog::open(dir.path()).unwrap();
-        log.write(&TreeRecord::Session { at: 42, dir: "/tmp/s1".into(), resumed_from: None });
+        log.write(&TreeRecord::Session { at: 42, dir: "/tmp/s1".into(), resumed_from: None, forked_from: None });
         log.write(&agent_record(1));
         log.write(&agent_record(2));
         log.write(&TreeRecord::Rename { id: 2, name: "calm cloud 1".into() });
@@ -418,7 +606,10 @@ mod tests {
 
         let records = read_tree(dir.path()).unwrap();
         assert_eq!(records.len(), 6);
-        assert_eq!(records[0], TreeRecord::Session { at: 42, dir: "/tmp/s1".into(), resumed_from: None });
+        assert_eq!(
+            records[0],
+            TreeRecord::Session { at: 42, dir: "/tmp/s1".into(), resumed_from: None, forked_from: None }
+        );
         assert_eq!(records[1], agent_record(1));
         assert_eq!(records[3], TreeRecord::Rename { id: 2, name: "calm cloud 1".into() });
         assert_eq!(records[4], TreeRecord::State { id: 2, stopped: true, archived: false });
@@ -429,7 +620,7 @@ mod tests {
     fn a_corrupt_session_log_names_the_file_and_line() {
         let dir = temp_dir();
         let mut log = SessionLog::open(dir.path()).unwrap();
-        log.write(&TreeRecord::Session { at: 1, dir: "x".into(), resumed_from: None });
+        log.write(&TreeRecord::Session { at: 1, dir: "x".into(), resumed_from: None, forked_from: None });
         drop(log);
         let mut file = fs::OpenOptions::new().append(true).open(dir.path().join("session.jsonl")).unwrap();
         file.write_all(b"{broken\n").unwrap();
@@ -450,12 +641,17 @@ mod tests {
         fs::create_dir_all(root.join("1000-111")).unwrap();
         fs::create_dir_all(root.join("2000-222")).unwrap();
         let mut old = SessionLog::open(&root.join("1000-111")).unwrap();
-        old.write(&TreeRecord::Session { at: 1000, dir: "/tmp/old".into(), resumed_from: None });
+        old.write(&TreeRecord::Session { at: 1000, dir: "/tmp/old".into(), resumed_from: None, forked_from: None });
         old.write(&agent_record(1));
         old.write(&TreeRecord::Title { text: "older session".into() });
         drop(old);
         let mut new = SessionLog::open(&root.join("2000-222")).unwrap();
-        new.write(&TreeRecord::Session { at: 2000, dir: "/tmp/new".into(), resumed_from: Some("1000-111".into()) });
+        new.write(&TreeRecord::Session {
+            at: 2000,
+            dir: "/tmp/new".into(),
+            resumed_from: Some("1000-111".into()),
+            forked_from: None,
+        });
         new.write(&agent_record(1));
         drop(new);
         // A dir without a session.jsonl never lists.
@@ -473,7 +669,7 @@ mod tests {
     fn state_and_rename_fold_onto_the_agent_that_was_introduced() {
         let dir = temp_dir();
         let mut log = SessionLog::open(dir.path()).unwrap();
-        log.write(&TreeRecord::Session { at: 1, dir: "/tmp".into(), resumed_from: None });
+        log.write(&TreeRecord::Session { at: 1, dir: "/tmp".into(), resumed_from: None, forked_from: None });
         log.write(&agent_record(1));
         log.write(&agent_record(2));
         log.write(&TreeRecord::Rename { id: 2, name: "calm cloud 1".into() });
@@ -521,7 +717,7 @@ mod tests {
         let root = state.path().join("sessions");
         fs::create_dir_all(root.join("1000-111")).unwrap();
         let mut header_only = SessionLog::open(&root.join("1000-111")).unwrap();
-        header_only.write(&TreeRecord::Session { at: 1000, dir: "/tmp".into(), resumed_from: None });
+        header_only.write(&TreeRecord::Session { at: 1000, dir: "/tmp".into(), resumed_from: None, forked_from: None });
         drop(header_only);
 
         assert!(sessions(state.path()).is_empty(), "a header alone is not a resumable session");

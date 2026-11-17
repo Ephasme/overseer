@@ -7,7 +7,7 @@ use crate::mcp;
 use crate::names;
 use crate::pipelines;
 use crate::profiles;
-use crate::session_store::{ResumeSource, SessionLog, TreeRecord};
+use crate::session_store::{Restore, SessionLog, TreeRecord};
 use crate::swarm::{AgentEvent, CompactionNotice, Event, Swarm, lock};
 use crate::tools;
 use crate::url;
@@ -38,7 +38,7 @@ pub(crate) fn run(
     approvals: Arc<Gate>,
     shutdown: Arc<AtomicBool>,
     bounds: Arc<bounds::Bounds>,
-    resume: Option<ResumeSource>,
+    restore: Option<Restore>,
 ) -> Result<()> {
     let _ = ui.send(UiEvent::Notice(format!("{} · agent logs in {}", version::VERSION, log_dir.display())));
     let _ = ui.send(UiEvent::Approvals(approvals.tier()));
@@ -53,10 +53,14 @@ pub(crate) fn run(
             return Err(anyhow::Error::msg(e));
         }
     };
-    let resumed_from = resume.as_ref().map(|source| source.id.clone());
+    let (resumed_from, forked_from) = match &restore {
+        Some(Restore::Resume(source)) => (Some(source.id.clone()), None),
+        Some(Restore::Fork { source, .. }) => (None, Some(source.id.clone())),
+        None => (None, None),
+    };
     let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let mut log = session_log;
-    log.write(&TreeRecord::Session { at, dir: cfg.dir.display().to_string(), resumed_from: resumed_from.clone() });
+    log.write(&TreeRecord::Session { at, dir: cfg.dir.display().to_string(), resumed_from, forked_from });
     let swarm = Arc::new(Mutex::new(Swarm::new(
         models,
         profiles,
@@ -69,8 +73,8 @@ pub(crate) fn run(
         Arc::clone(&bounds),
         Some(log),
     )));
-    let started = match &resume {
-        Some(source) => Swarm::resume_tree(&swarm, source).map(Some),
+    let started = match &restore {
+        Some(restore) => Swarm::restore_tree(&swarm, restore).map(Some),
         None => Swarm::start_root(&swarm, &cfg.dir).map(|_| None),
     };
     match started {
@@ -700,7 +704,7 @@ mod tests {
         // The first session left a tree record and the root's committed history behind.
         let source = crate::session_store::ResumeSource { id: "first".into(), dir: first_logs.path().to_path_buf() };
         assert!(first_logs.path().join("session.jsonl").is_file());
-        assert!(first_logs.path().join("agent-1.history.json").is_file());
+        assert!(first_logs.path().join("checkpoints/agent-1/1.history.json").is_file());
 
         let (input, input_rx) = channel();
         let (ui, ui_rx) = channel();
@@ -720,7 +724,7 @@ mod tests {
                 Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
-                Some(source),
+                Some(Restore::Resume(source)),
             )
         });
         // The resume notice names the agents that came back.
