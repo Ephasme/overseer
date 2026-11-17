@@ -20,6 +20,8 @@ pub(crate) struct Args {
     pub(crate) max_cost: Option<f64>,
     /// `--warn-cost`: spend in USD past which the user is warned once; stops nothing.
     pub(crate) warn_cost: Option<f64>,
+    /// `--checkpoints`: list what a session can be forked from, then exit.
+    pub(crate) checkpoints: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

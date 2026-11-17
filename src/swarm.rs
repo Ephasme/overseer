@@ -15,7 +15,7 @@ use crate::prompt;
 use crate::records;
 use crate::repos;
 use crate::rules;
-use crate::session_store::{self, ResumeSource, SessionLog, TreeRecord};
+use crate::session_store::{self, Restore, SessionLog, TreeRecord};
 use crate::skills;
 use crate::tools;
 use crate::url;
@@ -988,7 +988,7 @@ impl Swarm {
     /// mid-turn. The log and the thread start with the tree lock released, as in `spawn`.
     pub(crate) fn start_root(swarm: &Arc<Mutex<Swarm>>, dir: &Path) -> Result<usize, String> {
         let _reserved = spawning();
-        let (id, log_path, history_path, control, llm, sender, profile, supervisor_policy) = {
+        let (id, log_path, log_dir, control, llm, sender, profile, supervisor_policy) = {
             let tree = lock(swarm);
             if !tree.agents.is_empty() {
                 return Err("the root is already running".to_string());
@@ -1007,7 +1007,7 @@ impl Swarm {
             (
                 id,
                 tree.log_dir.join(format!("agent-{id}.jsonl")),
-                tree.log_dir.join(format!("agent-{id}.history.json")),
+                tree.log_dir.clone(),
                 Arc::clone(&control),
                 Swarm::client(&tree, id, supervisor.model.as_deref(), effort),
                 tree.sender.clone(),
@@ -1028,7 +1028,8 @@ impl Swarm {
             profile,
             profiles::Role::Supervisor,
             &log_path,
-            history_path,
+            log_dir,
+            0,
             Vec::new(),
             swarm,
         )?;
@@ -1224,7 +1225,8 @@ impl Swarm {
             profile,
             role,
             &log_path,
-            history_path(&log_dir, id),
+            log_dir,
+            0,
             Vec::new(),
             swarm,
         )?;
@@ -1441,13 +1443,15 @@ impl Swarm {
     }
 
     /// Rebuilds the tree of a previous session in this one: live agents come back idle with their
-    /// committed history, dead rows stay dead, pipeline agents stay stopped. `source` has already
-    /// been validated by the caller; the new session's header is already in the log.
-    pub(crate) fn resume_tree(swarm: &Arc<Mutex<Swarm>>, source: &ResumeSource) -> Result<String, String> {
+    /// committed history, dead rows stay dead, pipeline agents stay stopped. A fork replays the
+    /// addressed checkpoint of one agent and the newest checkpoint of every other. `restore` has
+    /// already been validated by the caller; the new session's header is already in the log.
+    pub(crate) fn restore_tree(swarm: &Arc<Mutex<Swarm>>, restore: &Restore) -> Result<String, String> {
         let _reserved = spawning();
+        let source = restore.source();
         let rows = session_store::rows(&source.dir)?;
         if rows.is_empty() {
-            return Err(format!("session {} has no agents to resume", source.id));
+            return Err(format!("session {} has no agents to restore", source.id));
         }
         // Session-invariant, so read once instead of per row: every one of these takes the tree
         // lock, which every other agent thread waits on.
@@ -1463,6 +1467,14 @@ impl Swarm {
                 tree.config.model.clone(),
             )
         };
+        // A resumed or forked session keeps its picker title: it is still the same conversation.
+        let title = session_store::read_tree(&source.dir)?.into_iter().find_map(|record| match record {
+            TreeRecord::Title { text } => Some(text),
+            _ => None,
+        });
+        if let Some(text) = title {
+            lock(swarm).record_tree_record(&TreeRecord::Title { text });
+        }
         let mut pipelines = 0;
         for row in &rows {
             // A dead row has no thread and no inbox: `stop` dropped both in the original session,
@@ -1473,7 +1485,6 @@ impl Swarm {
                 pipelines += 1;
             }
             let records_path = log_dir.join(format!("agent-{}.jsonl", row.id));
-            let history_file = history_path(&log_dir, row.id);
             let control = Arc::new(Control::default());
             // The policy was fixed at spawn: set it directly, no parent merge.
             control.set_policy(row.policy.clone());
@@ -1482,8 +1493,12 @@ impl Swarm {
             } else {
                 let working_dir = config::resolve_dir(&row.dir, &home)
                     .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
-                let history = session_store::load_history(&source.dir.join(format!("agent-{}.history.json", row.id)))
-                    .map_err(|e| format!("cannot resume session {}: {e}", source.id))?;
+                let (turn, history) = match restore {
+                    Restore::Fork { at: Some(at), .. } if at.agent == row.id => {
+                        (at.turn, session_store::checkpoint(&source.dir, row.id, at.turn)?)
+                    }
+                    _ => session_store::newest_checkpoint(&source.dir, row.id)?,
+                };
                 // The profile decides the model and effort, as at spawn; a profile deleted since
                 // then falls back to the configured default and the agent still runs.
                 let found = profiles.get(row.profile.as_str());
@@ -1496,9 +1511,9 @@ impl Swarm {
                     row.id,
                     named,
                 ));
-                // The new session dir gets the replayed history now, so quitting before the next
-                // turn still leaves a session that resumes with its conversation.
-                let _ = session_store::save_history(&history_file, &history);
+                // The new session dir gets every checkpoint up to the one it started from, so
+                // quitting before the next turn still leaves an addressable branch.
+                session_store::copy_checkpoints(&source.dir, &log_dir, row.id, turn)?;
                 let (inbox, handle) = spawn_thread(
                     llm,
                     sender.clone(),
@@ -1511,7 +1526,8 @@ impl Swarm {
                     row.profile.clone(),
                     row.role,
                     &records_path,
-                    history_file,
+                    log_dir.clone(),
+                    turn,
                     history,
                     swarm,
                 )
@@ -1557,10 +1573,18 @@ impl Swarm {
         }
         let total = rows.len();
         let id = log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let verb = if matches!(restore, Restore::Fork { .. }) { "forked" } else { "resumed" };
+        let at = match restore {
+            Restore::Fork { at: Some(at), .. } => format!(" from agent {} checkpoint {}", at.agent, at.turn),
+            _ => String::new(),
+        };
         Ok(if pipelines == 0 {
-            format!("resumed {} as {id}; {total} agent(s) back", source.id)
+            format!("{verb} {} as {id}{at}; {total} agent(s) back", source.id)
         } else {
-            format!("resumed {} as {id}; {total} agent(s) back, {pipelines} pipeline agent(s) left stopped", source.id)
+            format!(
+                "{verb} {} as {id}{at}; {total} agent(s) back, {pipelines} pipeline agent(s) left stopped",
+                source.id
+            )
         })
     }
 
@@ -1916,11 +1940,6 @@ impl Swarm {
     }
 }
 
-/// One agent's committed history, beside its record file: `agent-<id>.history.json`.
-fn history_path(log_dir: &Path, id: usize) -> PathBuf {
-    log_dir.join(format!("agent-{id}.history.json"))
-}
-
 /// Starts one agent thread: its inbox, and the handle proving it lives. `task` is the first
 /// instruction; the root starts with none and waits for the user. `history` is the committed
 /// model history the thread starts with: empty for a fresh agent, replayed for a resumed one.
@@ -1940,7 +1959,8 @@ fn spawn_thread(
     profile: String,
     role: profiles::Role,
     records_path: &Path,
-    history_path: PathBuf,
+    log_dir: PathBuf,
+    checkpoint_turn: usize,
     history: Vec<Message>,
     me: &Arc<Mutex<Swarm>>,
 ) -> Result<(Sender<String>, JoinHandle<()>), String> {
@@ -1975,7 +1995,8 @@ fn spawn_thread(
             working_dir: &agent_dir,
             sender: &sender,
             records,
-            history_path,
+            log_dir,
+            checkpoint_turn,
             history,
             title_written: false,
             calls: 0,
@@ -2027,9 +2048,11 @@ struct AgentRun<'a> {
     working_dir: &'a Path,
     sender: &'a Sender<Event>,
     records: &'a records::Writer,
-    /// Where this agent's committed history is stored: written after every successful turn.
-    history_path: PathBuf,
-    /// The committed history the agent starts with: empty when fresh, replayed when resumed.
+    /// The session dir whose checkpoints hold this agent's committed history.
+    log_dir: PathBuf,
+    /// This agent's last committed turn, so its next success writes the following checkpoint.
+    checkpoint_turn: usize,
+    /// The committed history the agent starts with: empty when fresh, replayed when restored.
     history: Vec<Message>,
     /// Whether the session's Title record was written from one of this agent's turns.
     title_written: bool,
@@ -2163,8 +2186,9 @@ impl AgentRun<'_> {
             // the last good file is exactly the committed state. Written before the event, so a
             // frontend that sees the answer can quit and resume from it. Best-effort.
             if ok {
+                self.checkpoint_turn += 1;
                 let non_system: Vec<Message> = history.iter().filter(|m| m.role != "system").cloned().collect();
-                let _ = session_store::save_history(&self.history_path, &non_system);
+                let _ = session_store::save_checkpoint(&self.log_dir, self.id, self.checkpoint_turn, &non_system);
                 if self.parent.is_none() && !self.title_written {
                     self.title_written = true;
                     if let Some(swarm) = self.swarm.upgrade() {
@@ -3808,6 +3832,57 @@ mod tests {
         }
     }
 
+    /// A source session whose agent 1 is the live root, working in `work`.
+    fn source_session(work: &Path) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = session_store::SessionLog::open(dir.path()).unwrap();
+        log.write(&TreeRecord::Session {
+            at: 1,
+            dir: work.display().to_string(),
+            resumed_from: None,
+            forked_from: None,
+        });
+        log.write(&TreeRecord::Agent {
+            id: 1,
+            name: None,
+            parent: None,
+            depth: 0,
+            dir: work.display().to_string(),
+            task: String::new(),
+            profile: profiles::SUPERVISOR.into(),
+            role: profiles::Role::Supervisor,
+            policy: tools::Policy { allow_tools: vec!["bash".into()], read_only: true, ..Default::default() },
+            stopped: false,
+            archived: false,
+            pipeline: false,
+        });
+        dir
+    }
+
+    /// A tree over its own log dir, restored from `source`, and the notice it reported.
+    fn restored_session(
+        models: Arc<dyn llm::Models>,
+        restore: &session_store::Restore,
+    ) -> (Arc<Mutex<Swarm>>, String, tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let (sender, _queue) = mpsc::channel();
+        let swarm = Arc::new(Mutex::new(Swarm::new(
+            models,
+            catalogue(root.path(), &[]),
+            Arc::new(pipelines::Catalogue::default()),
+            Arc::new(test_config(root.path(), 3)),
+            logs.path().to_path_buf(),
+            sender,
+            Arc::new(mcp::Registry::load(root.path())),
+            Arc::new(approvals::Gate::new(approvals::Tier::Yolo, true)),
+            Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+            None,
+        )));
+        let notice = Swarm::restore_tree(&swarm, restore).unwrap();
+        (swarm, notice, logs, root)
+    }
+
     /// A root spawns a child, both finish turns, the child is stopped; a second Swarm resumes the
     /// tree from the recorded log: the roster matches, dead rows stay dead, and the replayed
     /// history reaches the resumed root's next model call.
@@ -3830,7 +3905,12 @@ mod tests {
         // policies and dirs the tree held, into a fresh session dir.
         let source = tempfile::tempdir().unwrap();
         let mut log = session_store::SessionLog::open(source.path()).unwrap();
-        log.write(&TreeRecord::Session { at: 1, dir: h.root.path().display().to_string(), resumed_from: None });
+        log.write(&TreeRecord::Session {
+            at: 1,
+            dir: h.root.path().display().to_string(),
+            resumed_from: None,
+            forked_from: None,
+        });
         for id in [1usize, 2] {
             let tree = h.swarm.lock().unwrap();
             let agent = tree.agent(id).unwrap();
@@ -3854,8 +3934,8 @@ mod tests {
         log.write(&TreeRecord::State { id: 2, stopped: true, archived: false });
         // The committed histories, as the AgentRun would have saved them: system messages out.
         let replay = vec![llm::Message::user("second question")];
-        session_store::save_history(&source.path().join("agent-1.history.json"), &replay).unwrap();
-        session_store::save_history(&source.path().join("agent-2.history.json"), &[llm::Message::user("dig")]).unwrap();
+        session_store::save_checkpoint(source.path(), 1, 1, &replay).unwrap();
+        session_store::save_checkpoint(source.path(), 2, 1, &[llm::Message::user("dig")]).unwrap();
         drop(log);
 
         // A fresh tree that records what its model receives.
@@ -3881,9 +3961,12 @@ mod tests {
             None,
         )));
         let source_id = source.path().file_name().unwrap().to_string_lossy().into_owned();
-        let notice = Swarm::resume_tree(
+        let notice = Swarm::restore_tree(
             &swarm,
-            &session_store::ResumeSource { id: source_id, dir: source.path().to_path_buf() },
+            &session_store::Restore::Resume(session_store::ResumeSource {
+                id: source_id,
+                dir: source.path().to_path_buf(),
+            }),
         )
         .unwrap();
         assert!(notice.contains("2 agent(s) back"), "{notice}");
@@ -3899,8 +3982,8 @@ mod tests {
         drop(tree);
         // The replayed history lands in the NEW session dir, so quitting before the next turn
         // still leaves a session that resumes with its conversation.
-        let seeded = session_store::load_history(&logs.path().join("agent-1.history.json")).unwrap();
-        assert_eq!(seeded, replay, "the resumed session seeds its own history file");
+        let seeded = session_store::checkpoint(logs.path(), 1, 1).unwrap();
+        assert_eq!(seeded, replay, "the resumed session copies the checkpoint it started from");
 
         // The resumed root's next model call carries the replayed history: system slot first, then
         // the committed user turn.
@@ -3914,6 +3997,98 @@ mod tests {
         let history = &calls[0];
         assert_eq!(history[0].role, "system");
         assert!(history.iter().any(|m| m.role == "user" && m.content.as_deref() == Some("second question")));
+    }
+
+    /// A fork starts from the addressed checkpoint, never a later one, and the source session is
+    /// left byte for byte as it was.
+    #[test]
+    fn a_fork_replays_the_chosen_checkpoint_and_leaves_the_source_alone() {
+        let work = tempfile::tempdir().unwrap();
+        let source = source_session(work.path());
+        let first = vec![llm::Message::user("first")];
+        let second = vec![llm::Message::user("first"), llm::Message::user("second")];
+        session_store::save_checkpoint(source.path(), 1, 1, &first).unwrap();
+        session_store::save_checkpoint(source.path(), 1, 2, &second).unwrap();
+
+        let recorder = Arc::new(llm::testing::Recording::new(Arc::new(Scripted::new(vec![text("forked answer")]))));
+        let (swarm, notice, logs, _root) = restored_session(
+            Arc::new(RecorderModels(Arc::clone(&recorder))),
+            &session_store::Restore::Fork {
+                source: session_store::ResumeSource { id: "source".into(), dir: source.path().to_path_buf() },
+                at: Some(session_store::ForkAt { agent: 1, turn: 1 }),
+            },
+        );
+        assert!(notice.starts_with("forked "), "{notice}");
+        assert!(
+            logs.path().join("checkpoints/agent-1/1.history.json").is_file(),
+            "the branch starts with the checkpoint it replays"
+        );
+
+        swarm.lock().unwrap().tell_root("next instruction").unwrap();
+        let deadline = Instant::now() + WAIT;
+        while recorder.requests.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let calls = recorder.requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let sent: Vec<&str> =
+            calls[0].iter().filter(|m| m.role == "user").filter_map(|m| m.content.as_deref()).collect();
+        assert!(sent.contains(&"first"), "{sent:?}");
+        assert!(!sent.contains(&"second"), "the branch stops at turn 1: {sent:?}");
+
+        let branch_turn = logs.path().join("checkpoints/agent-1/2.history.json");
+        let deadline = Instant::now() + WAIT;
+        while !branch_turn.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(branch_turn.is_file(), "the branch's own turn lands as checkpoint 2");
+        let source_files = fs::read_dir(source.path().join("checkpoints/agent-1")).unwrap().count();
+        assert_eq!(source_files, 2, "the source keeps only its own two checkpoints");
+    }
+
+    /// The address is per agent: the named agent replays its chosen turn, every other its newest.
+    #[test]
+    fn a_fork_replays_only_the_addressed_agent() {
+        let work = tempfile::tempdir().unwrap();
+        let source = source_session(work.path());
+        let mut log = session_store::SessionLog::open(source.path()).unwrap();
+        log.write(&TreeRecord::Agent {
+            id: 2,
+            name: None,
+            parent: Some(1),
+            depth: 1,
+            dir: work.path().display().to_string(),
+            task: "dig".into(),
+            profile: "worker".into(),
+            role: profiles::Role::Worker,
+            policy: tools::Policy { allow_tools: vec!["read_file".into()], read_only: true, ..Default::default() },
+            stopped: false,
+            archived: false,
+            pipeline: false,
+        });
+        drop(log);
+        session_store::save_checkpoint(source.path(), 1, 1, &[llm::Message::user("one")]).unwrap();
+        session_store::save_checkpoint(source.path(), 1, 2, &[llm::Message::user("one"), llm::Message::user("two")])
+            .unwrap();
+        session_store::save_checkpoint(source.path(), 2, 1, &[llm::Message::user("child")]).unwrap();
+
+        let empty = Arc::new(llm::testing::Recording::new(Arc::new(Scripted::new(Vec::new()))));
+        let (swarm, notice, logs, _root) = restored_session(
+            Arc::new(RecorderModels(empty)),
+            &session_store::Restore::Fork {
+                source: session_store::ResumeSource { id: "source".into(), dir: source.path().to_path_buf() },
+                at: Some(session_store::ForkAt { agent: 2, turn: 1 }),
+            },
+        );
+        assert!(notice.contains("from agent 2 checkpoint 1"), "{notice}");
+        assert_eq!(session_store::checkpoint_turns(logs.path(), 1), [1, 2], "an unaddressed agent takes its newest");
+        assert_eq!(
+            session_store::checkpoint(logs.path(), 1, 2).unwrap(),
+            [llm::Message::user("one"), llm::Message::user("two")]
+        );
+        assert_eq!(session_store::checkpoint(logs.path(), 2, 1).unwrap(), [llm::Message::user("child")]);
+        assert_eq!(session_store::checkpoint_turns(logs.path(), 2), [1]);
+        drop(swarm);
     }
 
     fn wait_idle(h: &Harness) {

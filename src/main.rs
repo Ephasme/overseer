@@ -38,7 +38,7 @@ mod version;
 use anyhow::{Context, Result};
 use bounds::Bounds;
 use event::UiEvent;
-use session_store::ResumeSource;
+use session_store::{ForkAt, Restore, ResumeSource};
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -55,6 +55,7 @@ enum Session {
     Fresh,
     Continue,
     Resume(Option<String>),
+    Fork(String),
 }
 
 /// What the run starts from. Cancelled is a clean exit, not a failure: a picker the user backed out
@@ -62,7 +63,7 @@ enum Session {
 #[derive(Debug)]
 enum Start {
     Fresh,
-    Resume(ResumeSource),
+    Restore(Restore),
     Cancelled,
 }
 
@@ -79,26 +80,74 @@ fn session_dir(state: &std::path::Path, id: &str) -> Result<std::path::PathBuf> 
     Ok(dir)
 }
 
-/// Resolves the session a `-c` / `-r` asks for, before anything new is created. `state` is already
-/// resolved so a test can point it at a temp dir.
-fn resume_source(state: &std::path::Path, wanted: &Session) -> Result<Start> {
+/// Resolves the session a `-c` / `-r` / `--fork` asks for, before anything new is created. `state`
+/// is already resolved so a test can point it at a temp dir.
+fn resolve_start(state: &std::path::Path, wanted: &Session) -> Result<Start> {
     match wanted {
         Session::Fresh => Ok(Start::Fresh),
         Session::Continue => match session_store::newest(state) {
-            Some(info) => Ok(Start::Resume(ResumeSource { id: info.id, dir: info.dir })),
+            Some(info) => Ok(Start::Restore(Restore::Resume(ResumeSource { id: info.id, dir: info.dir }))),
             None => anyhow::bail!("no previous session"),
         },
-        Session::Resume(Some(id)) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, id)? })),
+        Session::Resume(Some(id)) => {
+            Ok(Start::Restore(Restore::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, id)? })))
+        }
         Session::Resume(None) => {
             if !tui_available(&Args::default()) {
                 anyhow::bail!("-r needs a terminal; pass the session id instead");
             }
             match tui::picker::run(state)? {
-                Some(id) => Ok(Start::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, &id)? })),
+                Some(id) => {
+                    Ok(Start::Restore(Restore::Resume(ResumeSource { id: id.clone(), dir: session_dir(state, &id)? })))
+                }
                 None => Ok(Start::Cancelled),
             }
         }
+        Session::Fork(arg) => {
+            let (id, at) = match arg.split_once('@') {
+                Some((id, address)) => (id, Some(fork_at(address)?)),
+                None => (arg.as_str(), None),
+            };
+            let dir = session_dir(state, id)?;
+            if let Some(at) = at {
+                fork_target(&dir, id, at)?;
+            }
+            Ok(Start::Restore(Restore::Fork { source: ResumeSource { id: id.to_string(), dir }, at }))
+        }
     }
+}
+
+/// `--checkpoints <id>`: the listing, refused alongside anything that would start a session.
+fn checkpoints_listing(dir: &std::path::Path, id: &str, wanted: &Session, args: &Args) -> Result<String> {
+    if *wanted != Session::Fresh || args.print.is_some() {
+        anyhow::bail!("--checkpoints lists a session; it does not start one");
+    }
+    session_store::checkpoint_report(dir, id).map_err(anyhow::Error::msg)
+}
+
+/// Why a fork address names no state: an absent agent, or a turn past the agent's newest checkpoint.
+fn fork_target(dir: &std::path::Path, id: &str, at: ForkAt) -> Result<()> {
+    let rows = session_store::rows(dir).map_err(anyhow::Error::msg)?;
+    if rows.iter().all(|row| row.id != at.agent) {
+        anyhow::bail!("session {id} has no agent {}", at.agent);
+    }
+    let turns = session_store::checkpoint_turns(dir, at.agent);
+    if at.turn > turns.last().copied().unwrap_or(0) {
+        let available = if turns.is_empty() {
+            "none".to_string()
+        } else {
+            turns.iter().map(usize::to_string).collect::<Vec<_>>().join(" ")
+        };
+        anyhow::bail!("session {id} agent {}: no checkpoint {}; available: {available}", at.agent, at.turn);
+    }
+    Ok(())
+}
+
+/// `<agent>:<turn>`, both numbers; whether they name anything is `fork_target`'s.
+fn fork_at(address: &str) -> Result<ForkAt> {
+    let invalid = || anyhow::anyhow!("not a checkpoint address: {address:?}; use --fork <session>@<agent>:<turn>");
+    let (agent, turn) = address.split_once(':').ok_or_else(&invalid)?;
+    Ok(ForkAt { agent: agent.parse().map_err(|_| invalid())?, turn: turn.parse().map_err(|_| invalid())? })
 }
 
 /// A CLI flag overrides the file's bound; the merge happens here so every reader of the config —
@@ -115,7 +164,7 @@ fn main() -> Result<()> {
         Err(error) => {
             eprintln!("overseer: {error}");
             eprintln!(
-                "usage: overseer [-c | -r [session id]] [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>] [--warn-cost <usd>]"
+                "usage: overseer [-c | -r [session id] | --fork <session>[@<agent>:<turn>]] [--checkpoints <session id>] [-p <prompt>] [--mode text|json] [--max-time <secs>] [--max-cost <usd>] [--warn-cost <usd>]"
             );
             std::process::exit(2);
         }
@@ -123,14 +172,20 @@ fn main() -> Result<()> {
     let home = config::home()?;
     let mut cfg = config::load(&home)?;
     apply_flags(&mut cfg, &args);
-    let api_key = secrets::api_key(&home)?;
     let state = config::state_dir(&cfg.home);
+    // The listing needs no API key and starts no session: it reads a state dir that already exists.
+    if let Some(id) = &args.checkpoints {
+        let dir = session_dir(&state, id)?;
+        println!("{}", checkpoints_listing(&dir, id, &wanted, &args)?);
+        return Ok(());
+    }
+    let api_key = secrets::api_key(&home)?;
     // Resolved before the new session dir exists, so the picker never lists the session it is
     // about to start. A cancelled picker exits cleanly, before any MCP server or thread came up.
-    let resume = match resume_source(&state, &wanted)? {
+    let restore = match resolve_start(&state, &wanted)? {
         Start::Cancelled => return Ok(()),
         Start::Fresh => None,
-        Start::Resume(source) => Some(source),
+        Start::Restore(restore) => Some(restore),
     };
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     // Two runs started in the same second must not share, and truncate, each other's worker logs.
@@ -189,7 +244,7 @@ fn main() -> Result<()> {
             gate,
             shutdown,
             bounds,
-            resume,
+            restore,
         )
     });
 
@@ -222,6 +277,7 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, S
     let mut max_time: Option<u64> = None;
     let mut max_cost: Option<f64> = None;
     let mut warn_cost: Option<f64> = None;
+    let mut checkpoints: Option<String> = None;
     let mut wanted = Session::Fresh;
     let mut items = args.peekable();
     while let Some(arg) = items.next() {
@@ -318,10 +374,26 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(Args, S
                     None => wanted = Session::Resume(None),
                 }
             }
+            "--fork" => {
+                let value = next_value(&mut items, "--fork")?;
+                wanted = Session::Fork(value);
+            }
+            "--fork=" => anyhow::bail!("--fork needs a value"),
+            value if let Some(target) = value.strip_prefix("--fork=") => {
+                wanted = Session::Fork(target.to_owned());
+            }
+            "--checkpoints" => {
+                let value = next_value(&mut items, "--checkpoints")?;
+                checkpoints = Some(value);
+            }
+            "--checkpoints=" => anyhow::bail!("--checkpoints needs a value"),
+            value if let Some(id) = value.strip_prefix("--checkpoints=") => {
+                checkpoints = Some(id.to_owned());
+            }
             other => anyhow::bail!("unexpected argument {other:?}"),
         }
     }
-    Ok((Args { print, mode, max_time, max_cost, warn_cost }, wanted))
+    Ok((Args { print, mode, max_time, max_cost, warn_cost, checkpoints }, wanted))
 }
 
 /// The value of a flag given as its own argument; the next item, which may start with `-`.
@@ -406,7 +478,7 @@ mod tests {
     #[test]
     fn a_missing_session_is_named() {
         let state = tempfile::tempdir().unwrap();
-        let err = resume_source(state.path(), &Session::Resume(Some("nope".into()))).unwrap_err().to_string();
+        let err = resolve_start(state.path(), &Session::Resume(Some("nope".into()))).unwrap_err().to_string();
         assert_eq!(err, "no such session: nope");
     }
 
@@ -414,7 +486,7 @@ mod tests {
     fn an_id_cannot_leave_the_state_dir() {
         let state = tempfile::tempdir().unwrap();
         for id in ["../..", "/etc", ".", "..", "", "a/b"] {
-            let err = resume_source(state.path(), &Session::Resume(Some(id.into()))).unwrap_err().to_string();
+            let err = resolve_start(state.path(), &Session::Resume(Some(id.into()))).unwrap_err().to_string();
             assert!(err.starts_with("not a session id:"), "{id:?} gave {err}");
         }
     }
@@ -425,14 +497,14 @@ mod tests {
         let dir = state.path().join("sessions").join("1700000000-1");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("session.jsonl"), "{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}\n").unwrap();
-        let err = resume_source(state.path(), &Session::Resume(Some("1700000000-1".into()))).unwrap_err().to_string();
+        let err = resolve_start(state.path(), &Session::Resume(Some("1700000000-1".into()))).unwrap_err().to_string();
         assert_eq!(err, "no such session: 1700000000-1");
     }
 
     #[test]
     fn continue_without_any_session_says_so() {
         let state = tempfile::tempdir().unwrap();
-        let err = resume_source(state.path(), &Session::Continue).unwrap_err().to_string();
+        let err = resolve_start(state.path(), &Session::Continue).unwrap_err().to_string();
         assert_eq!(err, "no previous session");
     }
 
@@ -450,11 +522,77 @@ mod tests {
         fs::write(sessions.join("1700000009-9/session.jsonl"), "{\"kind\":\"session\",\"at\":1,\"dir\":\"/tmp\"}\n")
             .unwrap();
 
-        match resume_source(state.path(), &Session::Continue).unwrap() {
-            Start::Resume(source) => assert_eq!(source.id, "1700000001-2"),
+        match resolve_start(state.path(), &Session::Continue).unwrap() {
+            Start::Restore(Restore::Resume(source)) => assert_eq!(source.id, "1700000001-2"),
             other => panic!("continue resolved to {other:?}"),
         }
-        assert!(matches!(resume_source(state.path(), &Session::Fresh).unwrap(), Start::Fresh));
+        assert!(matches!(resolve_start(state.path(), &Session::Fresh).unwrap(), Start::Fresh));
+    }
+
+    #[test]
+    fn fork_takes_a_value_and_the_address_is_parsed_later() {
+        assert_eq!(flags(&["--fork", "1700000000-42"]).unwrap(), Session::Fork("1700000000-42".into()));
+        assert_eq!(flags(&["--fork=1700000000-42@2:1"]).unwrap(), Session::Fork("1700000000-42@2:1".into()));
+        assert!(parse(&["--fork"]).is_err());
+        assert!(parse(&["--fork="]).is_err());
+    }
+
+    #[test]
+    fn checkpoints_takes_a_value() {
+        assert_eq!(parse(&["--checkpoints", "1700000000-42"]).unwrap().checkpoints.as_deref(), Some("1700000000-42"));
+        assert_eq!(parse(&["--checkpoints=1700000000-42"]).unwrap().checkpoints.as_deref(), Some("1700000000-42"));
+        assert!(parse(&["--checkpoints"]).is_err());
+        assert!(parse(&["--checkpoints="]).is_err());
+    }
+
+    /// A session dir with one agent and one checkpoint, as `--fork` addresses it.
+    fn fork_fixture() -> (tempfile::TempDir, String) {
+        let state = tempfile::tempdir().unwrap();
+        let id = "1700000000-42".to_string();
+        let dir = state.path().join("sessions").join(&id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("session.jsonl"), session_log()).unwrap();
+        session_store::save_checkpoint(&dir, 1, 1, &[]).unwrap();
+        (state, id)
+    }
+
+    #[test]
+    fn a_fork_address_is_refused_before_any_session_starts() {
+        let (state, id) = fork_fixture();
+        for bad in ["@2", "@2:", "@2:x", "@2:1:3"] {
+            let err = resolve_start(state.path(), &Session::Fork(format!("{id}{bad}"))).unwrap_err().to_string();
+            assert!(err.starts_with("not a checkpoint address:"), "{bad}: {err}");
+        }
+        let err = resolve_start(state.path(), &Session::Fork(format!("{id}@7:1"))).unwrap_err().to_string();
+        assert_eq!(err, format!("session {id} has no agent 7"));
+        let err = resolve_start(state.path(), &Session::Fork(format!("{id}@1:9"))).unwrap_err().to_string();
+        assert_eq!(err, format!("session {id} agent 1: no checkpoint 9; available: 1"));
+        let err = resolve_start(state.path(), &Session::Fork("nope".into())).unwrap_err().to_string();
+        assert_eq!(err, "no such session: nope");
+        match resolve_start(state.path(), &Session::Fork(format!("{id}@1:1"))).unwrap() {
+            Start::Restore(Restore::Fork { source, at }) => {
+                assert_eq!(source.id, id);
+                assert_eq!(at, Some(ForkAt { agent: 1, turn: 1 }));
+            }
+            other => panic!("a valid fork resolved to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkpoints_lists_only_when_nothing_else_starts_a_session() {
+        let (state, id) = fork_fixture();
+        let dir = state.path().join("sessions").join(&id);
+        let args = Args { checkpoints: Some(id.clone()), ..Args::default() };
+        let listing = checkpoints_listing(&dir, &id, &Session::Fresh, &args).unwrap();
+        assert!(listing.starts_with(&format!("session {id}: 1 agent(s)")), "{listing}");
+        assert!(listing.contains(&format!("--fork {id}@1:1")), "{listing}");
+        for wanted in [Session::Continue, Session::Resume(Some(id.clone())), Session::Fork(id.clone())] {
+            let err = checkpoints_listing(&dir, &id, &wanted, &args).unwrap_err().to_string();
+            assert_eq!(err, "--checkpoints lists a session; it does not start one");
+        }
+        let asked = Args { print: Some("hi".into()), ..Args::default() };
+        let err = checkpoints_listing(&dir, &id, &Session::Fresh, &asked).unwrap_err().to_string();
+        assert_eq!(err, "--checkpoints lists a session; it does not start one");
     }
 
     /// The flags a run can carry, and what `apply_flags` does with them: the tested merge is the
