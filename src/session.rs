@@ -355,11 +355,11 @@ pub(crate) fn run(
                     break;
                 }
             }
-            Event::User(text) => {
+            Event::User(input) => {
                 draining = false;
                 // The guard must not outlive `tell_root`: a `match` scrutinee's temporary lives for
                 // the whole match, and the snapshot below takes the same lock again.
-                let told = lock(&swarm).tell_root(&text);
+                let told = lock(&swarm).tell_root(input);
                 match told {
                     Ok(_) => {
                         let _ = ui.send(UiEvent::Agents(lock(&swarm).snapshot()));
@@ -511,6 +511,65 @@ mod tests {
             }
         };
         assert_eq!(done, UiEvent::Done);
+        handle.join().unwrap().unwrap();
+    }
+
+    /// A picture pasted with a prompt reaches the model on the user message, not as text.
+    #[test]
+    fn a_pasted_picture_reaches_the_model() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let cfg = config::Config {
+            roots: vec![root.path().to_path_buf()],
+            base_url: String::new(),
+            model: "m".into(),
+            theme: Theme::Auto,
+            max_depth: 3,
+            max_time: None,
+            max_cost: None,
+            warn_cost: None,
+            pricing: HashMap::new(),
+            dir: root.path().to_path_buf(),
+            rule_dir: root.path().to_path_buf(),
+            home: root.path().to_path_buf(),
+            approvals: crate::approvals::Tier::Ask,
+            mcp_project: config::McpProject::On,
+            compaction: crate::config::CompactionSettings::default(),
+        };
+        let (input, input_rx) = channel();
+        let (ui, ui_rx) = channel();
+        let mcp = Arc::new(mcp::Registry::load(root.path()));
+        let recording =
+            Arc::new(crate::llm::testing::Recording::new(Arc::new(Scripted::new(vec![text("a screenshot")]))));
+        let llm: Arc<dyn crate::llm::Llm> = recording.clone();
+        let frontend = input.clone();
+        let handle = thread::spawn(move || {
+            run(
+                Arc::new(crate::llm::testing::Fixed(llm)),
+                Arc::new(profiles::Catalogue::default()),
+                Arc::new(pipelines::Catalogue::default()),
+                &cfg,
+                logs.path().to_path_buf(),
+                input,
+                input_rx,
+                ui,
+                mcp,
+                Arc::new(Gate::new(crate::approvals::Tier::Ask, true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(bounds::Bounds::new(None, None, HashMap::new())),
+                None,
+            )
+        });
+        let png = root.path().join("shot.png");
+        frontend
+            .send(Event::User(crate::swarm::Input { text: "what is this?".into(), images: vec![png.clone()] }))
+            .unwrap();
+        assert_eq!(next_answer(&ui_rx), "a screenshot");
+        let requests = recording.requests.lock().unwrap().clone();
+        let last = requests[0].last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.images, [png]);
+        frontend.send(Event::Eof).unwrap();
         handle.join().unwrap().unwrap();
     }
 

@@ -253,12 +253,18 @@ fn quit(app: &mut App, input: &Sender<Event>) {
 }
 
 fn submit(app: &mut App, input: &Sender<Event>) {
+    // Read before `take_prompt`, which spends the chip.
+    let image = app.pending_image();
     let prompt = app.take_prompt();
     if prompt.is_empty() {
         return;
     }
     app.echo(&prompt);
     if let Some(event) = Event::from_line(&prompt) {
+        let event = match image {
+            Some(path) => event.with_image(path),
+            None => event,
+        };
         if matches!(event, Event::Exit) {
             quit(app, input);
         } else if let Err(err) = input.send(event) {
@@ -297,6 +303,23 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         press_with(app, code, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn a_pasted_image_rides_the_prompt_into_the_core() {
+        let path = crate::clipboard::pasted("submit-image.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut app = App::new("m");
+        let id = app.begin_paste().unwrap();
+        app.attach(id, clipboard::Paste::Image(path.clone()));
+        app.insert("what is this?");
+        let (input, queue) = mpsc::channel();
+        submit(&mut app, &input);
+        let event = queue.try_recv().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let Event::User(sent) = event else { panic!("expected a user message: {event:?}") };
+        assert_eq!(sent.images, vec![path]);
+        assert!(sent.text.starts_with("what is this?"), "{}", sent.text);
     }
 
     /// Esc inside an agent view returns to the tree: it neither types into the prompt nor quits.

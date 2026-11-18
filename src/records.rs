@@ -179,6 +179,7 @@ mod tests {
                     role: "assistant".into(),
                     usage: None,
                     summary: None,
+                    images: Vec::new(),
                     content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".into(),

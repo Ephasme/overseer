@@ -2257,6 +2257,11 @@ impl App {
         }
     }
 
+    /// The file the chip holds, read before `take_prompt` spends it: the picture the message carries.
+    pub(super) fn pending_image(&self) -> Option<PathBuf> {
+        self.attachment.as_ref().and_then(Attachment::path).map(Path::to_path_buf)
+    }
+
     /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
         let mut text = self.composer.lines().join("\n").trim().to_string();
@@ -2268,8 +2273,8 @@ impl App {
         // Whatever the chip held is spent: a read that lands after this message belongs to none.
         self.paste = self.paste.wrapping_add(1);
         if let Some(path) = path {
-            // The chat-completions request carries text only: the picture rides along as the path of a
-            // file the model can open with its own tools.
+            // The picture itself rides the message (`pending_image`); the path stays in the text so the
+            // transcript shows what was sent and the model's tools can still open the file.
             let note = format!("[attached image: {}]", path.display());
             text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
         }
@@ -2851,6 +2856,17 @@ mod paste_tests {
         assert!(prompt.contains(".png]"), "{prompt}");
         assert!(app.attachment.is_none(), "the attachment belongs to one message");
         assert!(path.exists(), "the file is the message's: it outlives the chip");
+    }
+
+    #[test]
+    fn the_chip_names_the_file_the_message_carries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        let path = saved(dir.path());
+        land(&mut app, Paste::Image(path.clone()));
+        assert_eq!(app.pending_image(), Some(path));
+        app.take_prompt();
+        assert_eq!(app.pending_image(), None, "the picture belongs to one message");
     }
 }
 

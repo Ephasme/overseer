@@ -285,6 +285,7 @@ mod tests {
             tool_call_id: None,
             usage: None,
             summary: None,
+            images: Vec::new(),
         }
     }
     fn history() -> Vec<Message> {
