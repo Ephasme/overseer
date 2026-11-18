@@ -37,10 +37,15 @@ pub(crate) fn should_compact(tokens: u64, settings: &CompactionSettings) -> bool
     settings.threshold().is_some_and(|threshold| tokens > threshold)
 }
 
-/// `chars / 4` over every message's content and tool-call arguments. An approximation: overseer
-/// has no tokenizer.
+/// What one picture is counted as. Providers bill a picture by its tiles, not its bytes: a
+/// screenshot costs on the order of a thousand tokens whatever its file size.
+const IMAGE_TOKENS: u64 = 1_500;
+
+/// `chars / 4` over every message's content and tool-call arguments, plus a flat cost per picture.
+/// An approximation: overseer has no tokenizer.
 fn estimate_tokens(messages: &[Message]) -> u64 {
     let mut chars = 0usize;
+    let mut images = 0usize;
     for message in messages {
         if let Some(content) = &message.content {
             chars += content.chars().count();
@@ -48,8 +53,10 @@ fn estimate_tokens(messages: &[Message]) -> u64 {
         for call in message.tool_calls.iter().flatten() {
             chars += call.function.arguments.chars().count();
         }
+        images += message.images.len();
     }
-    u64::try_from(chars).unwrap_or(u64::MAX).div_ceil(4)
+    let text = u64::try_from(chars).unwrap_or(u64::MAX).div_ceil(4);
+    text.saturating_add(u64::try_from(images).unwrap_or(u64::MAX).saturating_mul(IMAGE_TOKENS))
 }
 
 /// The context's token count: the last assistant message's reported usage when one carries it,
@@ -285,6 +292,7 @@ mod tests {
             tool_call_id: None,
             usage: None,
             summary: None,
+            images: Vec::new(),
         }
     }
     fn history() -> Vec<Message> {
@@ -371,6 +379,13 @@ mod tests {
         history[2].usage = Some(usage);
         assert_eq!(context_tokens(&history), 999);
         assert_eq!(context_tokens(&history[..2]), estimate_tokens(&history[..2]));
+    }
+
+    #[test]
+    fn a_picture_counts_toward_the_estimate() {
+        let plain = [Message::user("look")];
+        let pictured = [Message::user_with_images("look", &[std::path::PathBuf::from("/nowhere.png")])];
+        assert_eq!(estimate_tokens(&pictured), estimate_tokens(&plain) + IMAGE_TOKENS);
     }
 
     #[test]

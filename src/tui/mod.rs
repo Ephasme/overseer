@@ -253,17 +253,36 @@ fn quit(app: &mut App, input: &Sender<Event>) {
 }
 
 fn submit(app: &mut App, input: &Sender<Event>) {
-    let prompt = app.take_prompt();
-    if prompt.is_empty() {
-        return;
-    }
-    app.echo(&prompt);
-    if let Some(event) = Event::from_line(&prompt) {
-        if matches!(event, Event::Exit) {
-            quit(app, input);
-        } else if let Err(err) = input.send(event) {
-            app.apply(UiEvent::Error(format!("cannot reach the core: {err}")));
+    // Parse what was typed, never the image note `take_prompt` appends: with a chip up, `exit` must
+    // still quit and `/resume 3` must still name agent 3.
+    let Some(event) = Event::from_line(&app.typed()) else {
+        // Nothing typed: a chip alone is still a message, the picture with no words around it.
+        if app.pending_image().is_some() {
+            send_prompt(app, input);
         }
+        return;
+    };
+    if matches!(event, Event::User(_)) {
+        return send_prompt(app, input);
+    }
+    // A command carries no picture: the chip stays for the next prompt instead of being lost.
+    let typed = app.take_typed();
+    app.echo(&typed);
+    if matches!(event, Event::Exit) {
+        quit(app, input);
+    } else if let Err(err) = input.send(event) {
+        app.apply(UiEvent::Error(format!("cannot reach the core: {err}")));
+    }
+}
+
+/// Sends the composer as one user message, with the chip's picture when one is attached.
+fn send_prompt(app: &mut App, input: &Sender<Event>) {
+    // Read before `take_prompt`, which spends the chip.
+    let images: Vec<_> = app.pending_image().into_iter().collect();
+    let text = app.take_prompt();
+    app.echo(&text);
+    if let Err(err) = input.send(Event::User(crate::swarm::Input { text, images })) {
+        app.apply(UiEvent::Error(format!("cannot reach the core: {err}")));
     }
 }
 
@@ -297,6 +316,65 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         press_with(app, code, KeyModifiers::NONE);
+    }
+
+    /// An app holding a chip for a real pasted file; the caller removes the file.
+    fn with_chip(name: &str) -> (App, PathBuf) {
+        let path = crate::clipboard::pasted(name);
+        std::fs::write(&path, crate::clipboard::PNG_SIGNATURE).unwrap();
+        let mut app = App::new("m");
+        let id = app.begin_paste().unwrap();
+        app.attach(id, clipboard::Paste::Image(path.clone()));
+        (app, path)
+    }
+
+    #[test]
+    fn a_pasted_image_rides_the_prompt_into_the_core() {
+        let (mut app, path) = with_chip("submit-image.png");
+        app.insert("what is this?");
+        let (input, queue) = mpsc::channel();
+        submit(&mut app, &input);
+        let event = queue.try_recv().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let Event::User(sent) = event else { panic!("expected a user message: {event:?}") };
+        assert_eq!(sent.images, vec![path]);
+        assert!(sent.text.starts_with("what is this?"), "{}", sent.text);
+    }
+
+    /// A command typed with a chip up is parsed from what was typed, and the chip waits for a prompt.
+    #[test]
+    fn a_command_beside_a_chip_runs_and_keeps_the_picture() {
+        let (mut app, path) = with_chip("submit-command.png");
+        app.insert("/resume 3");
+        let (input, queue) = mpsc::channel();
+        submit(&mut app, &input);
+        let event = queue.try_recv().unwrap();
+        let kept = app.pending_image();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(event, Event::Resume(" 3".into()), "the argument carries no image note");
+        assert_eq!(kept, Some(path), "the picture waits for the next prompt");
+    }
+
+    #[test]
+    fn exit_beside_a_chip_still_quits() {
+        let (mut app, path) = with_chip("submit-exit.png");
+        app.insert("exit");
+        let (input, queue) = mpsc::channel();
+        submit(&mut app, &input);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(queue.try_recv().unwrap(), Event::Exit);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_chip_alone_is_sent_as_a_picture() {
+        let (mut app, path) = with_chip("submit-alone.png");
+        let (input, queue) = mpsc::channel();
+        submit(&mut app, &input);
+        let event = queue.try_recv().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let Event::User(sent) = event else { panic!("expected a user message: {event:?}") };
+        assert_eq!(sent.images, vec![path]);
     }
 
     /// Esc inside an agent view returns to the tree: it neither types into the prompt nor quits.

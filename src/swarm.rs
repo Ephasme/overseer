@@ -147,7 +147,7 @@ struct Gate {
     /// It ended its own turn with `close`: only an instruction from its owner re-opens it.
     closed: bool,
     /// Urgent instructions, read before the inbox so urgency beats the backlog.
-    urgent: VecDeque<String>,
+    urgent: VecDeque<Input>,
 }
 
 impl Control {
@@ -201,10 +201,10 @@ impl Control {
         self.wake.notify_all();
     }
 
-    /// Delivers `text` ahead of the backlog and cuts the running turn short.
-    fn urgent(&self, text: String) {
+    /// Delivers `input` ahead of the backlog and cuts the running turn short.
+    fn urgent(&self, input: Input) {
         let mut gate = self.lock();
-        gate.urgent.push_back(text);
+        gate.urgent.push_back(input);
         self.interrupted.store(true, Ordering::SeqCst);
         self.wake.notify_all();
     }
@@ -244,9 +244,9 @@ impl Control {
     /// The interrupt flag is cleared here, under the gate that sets it, at the dequeue: the order it
     /// announced is the one about to run. Clearing it a statement later would wipe an order that
     /// arrived in between, and the turn would run on after the overseer was told it was cut short.
-    fn next(&self, inbox: &Receiver<String>) -> Option<String> {
+    fn next(&self, inbox: &Receiver<Input>) -> Option<Input> {
         // Read from an inbox that was not paused yet: hold it rather than run it behind the pause.
-        let mut held: Option<String> = None;
+        let mut held: Option<Input> = None;
         loop {
             {
                 let mut gate = self.lock();
@@ -332,9 +332,28 @@ pub(crate) enum CompactionNotice {
     Failed(String),
 }
 
+/// One instruction for an agent: what to do, and any picture the user pasted with it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Input {
+    pub(crate) text: String,
+    pub(crate) images: Vec<PathBuf>,
+}
+
+impl From<&str> for Input {
+    fn from(text: &str) -> Self {
+        Self { text: text.to_string(), images: Vec::new() }
+    }
+}
+
+impl From<String> for Input {
+    fn from(text: String) -> Self {
+        Self { text, images: Vec::new() }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Event {
-    User(String),
+    User(Input),
     /// User typed `exit`: quit now.
     Exit,
     /// Input closed: quit once no worker is busy.
@@ -462,7 +481,7 @@ impl Event {
         if let Some(arg) = line.strip_prefix("/login") {
             return Some(Event::Login(arg.trim().to_string()));
         }
-        Some(Event::User(line.to_string()))
+        Some(Event::User(line.into()))
     }
 }
 
@@ -626,7 +645,7 @@ struct Agent {
     /// Its owner stopped it; the entry stays as a record and the inbox is gone.
     stopped: bool,
     control: Arc<Control>,
-    inbox: Option<Sender<String>>,
+    inbox: Option<Sender<Input>>,
     /// When the current instruction started; `None` once the agent is idle.
     busy_since: Option<Instant>,
     /// The text of its last completed turn: what `agent://<id>` shows. A reply does not replace it.
@@ -1074,11 +1093,11 @@ impl Swarm {
     }
 
     /// The user's own instruction: an instruction to the root, counted like any other.
-    pub(crate) fn tell_root(&mut self, text: &str) -> Result<String, String> {
+    pub(crate) fn tell_root(&mut self, input: impl Into<Input>) -> Result<String, String> {
         if self.agent(Swarm::ROOT).is_none() {
             return Err("the root is not running".to_string());
         }
-        self.deliver_to(Swarm::ROOT, text, true, false)?;
+        self.deliver_to(Swarm::ROOT, input, true, false)?;
         Ok(format!("sent to {}", self.label(Swarm::ROOT)))
     }
 
@@ -1091,7 +1110,7 @@ impl Swarm {
     pub(crate) fn deliver(&mut self, child: usize, kind: AgentEvent, text: &str) {
         let Some(parent) = self.deliver_target(child) else { return };
         let line = self.event_line(child, kind, text);
-        let _ = self.deliver_to(parent, &line, false, false);
+        let _ = self.deliver_to(parent, line.as_str(), false, false);
     }
 
     /// Runs one tree tool for `caller`; `None` when `name` is not one, so the caller falls through
@@ -1604,7 +1623,7 @@ impl Swarm {
         if let Some(refusal) = self.may_address(caller, args.id) {
             return Err(refusal);
         }
-        self.deliver_to(args.id, &args.text, false, args.urgent)
+        self.deliver_to(args.id, args.text.as_str(), false, args.urgent)
     }
 
     fn control(&mut self, caller: usize, args: &ControlArgs) -> Result<String, String> {
@@ -1694,8 +1713,14 @@ impl Swarm {
         }
     }
 
-    /// Queues `text` for one agent, counting it as pending work.
-    fn deliver_to(&mut self, id: usize, text: &str, clear_failure: bool, urgent: bool) -> Result<String, String> {
+    /// Queues `input` for one agent, counting it as pending work.
+    fn deliver_to(
+        &mut self,
+        id: usize,
+        input: impl Into<Input>,
+        clear_failure: bool,
+        urgent: bool,
+    ) -> Result<String, String> {
         let label = self.label(id);
         let agent = self.agent_mut(id).ok_or_else(|| format!("no agent {label}"))?;
         if agent.archived {
@@ -1709,11 +1734,12 @@ impl Swarm {
         }
         // The owner's instruction is the one thing that re-opens an agent that closed itself.
         agent.control.reopen();
+        let input = input.into();
         if urgent {
-            agent.control.urgent(text.to_string());
+            agent.control.urgent(input);
         } else {
             let inbox = agent.inbox.as_ref().ok_or_else(|| format!("{label} is stopped"))?;
-            inbox.send(text.to_string()).map_err(|_| format!("{label} is gone"))?;
+            inbox.send(input).map_err(|_| format!("{label} is gone"))?;
         }
         let busy = agent.pending > 0;
         if !busy {
@@ -1963,7 +1989,7 @@ fn spawn_thread(
     checkpoint_turn: usize,
     history: Vec<Message>,
     me: &Arc<Mutex<Swarm>>,
-) -> Result<(Sender<String>, JoinHandle<()>), String> {
+) -> Result<(Sender<Input>, JoinHandle<()>), String> {
     let records = records::Writer::create(records_path).map_err(|e| config::io_error(records_path.display(), &e))?;
     let (inbox, instructions) = mpsc::channel();
     let tree = Arc::downgrade(me);
@@ -2007,7 +2033,7 @@ fn spawn_thread(
         run.run(streamed.as_ref(), &instructions);
     });
     if let Some(task) = task {
-        inbox.send(task).map_err(|_| format!("{} could not be started", names::label(id, None)))?;
+        inbox.send(task.into()).map_err(|_| format!("{} could not be started", names::label(id, None)))?;
     }
     Ok((inbox, handle))
 }
@@ -2066,7 +2092,7 @@ struct AgentRun<'a> {
 
 impl AgentRun<'_> {
     /// Runs every instruction the agent receives until its owner stops it or the inbox closes.
-    fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<String>) {
+    fn run(&mut self, llm: &dyn Llm, instructions: &Receiver<Input>) {
         let control = self.control;
         let (config, mcp, catalogue, bounds) = {
             let Some(swarm) = self.swarm.upgrade() else { return };
@@ -2127,8 +2153,8 @@ impl AgentRun<'_> {
             // Rebuilt per instruction: a server that connected after this agent started must reach it.
             let tool_defs = prompt::agent_tool_definitions(&mcp, &policy, remaining);
             // Sent before the turn's first delta, so a frontend always reads the instruction first.
-            let _ = self.sender.send(Event::Instruction { id: self.id, text: input.clone() });
-            self.records.write(&records::Record::Instruction { text: input.clone() });
+            let _ = self.sender.send(Event::Instruction { id: self.id, text: input.text.clone() });
+            self.records.write(&records::Record::Instruction { text: input.text.clone() });
             let result = {
                 let context = tools::Context {
                     skills: &skills,
@@ -2153,7 +2179,7 @@ impl AgentRun<'_> {
                     force_compact: Some(control.force_compact_flag()),
                     on_compact: Some(&mut |outcome| compactions.push(outcome)),
                 };
-                let outcome = turn.run(&mut history, &input);
+                let outcome = turn.run(&mut history, &input.text, &input.images);
                 for attempt in compactions {
                     let notice = match attempt {
                         CompactionOutcome::Compacted(report) => CompactionNotice::Compacted {
@@ -2192,7 +2218,8 @@ impl AgentRun<'_> {
                 if self.parent.is_none() && !self.title_written {
                     self.title_written = true;
                     if let Some(swarm) = self.swarm.upgrade() {
-                        lock(&swarm).record_tree_record(&TreeRecord::Title { text: input.chars().take(100).collect() });
+                        lock(&swarm)
+                            .record_tree_record(&TreeRecord::Title { text: input.text.chars().take(100).collect() });
                     }
                 }
             }

@@ -3,6 +3,7 @@ use crate::compaction::{Compaction, CompactionOutcome, context_tokens, should_co
 use crate::llm::{Llm, Message, ToolCall};
 use anyhow::{Result, bail};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Text of the error that means an overseer order ended the turn. No other path may produce this
@@ -38,9 +39,9 @@ impl Turn<'_> {
     ///
     /// The exchange is committed to `history` only on success: a failed model call leaves the
     /// caller's transcript exactly as it was, so a retry does not replay a half-finished turn.
-    pub(crate) fn run(&mut self, history: &mut Vec<Message>, input: &str) -> Result<String> {
+    pub(crate) fn run(&mut self, history: &mut Vec<Message>, input: &str, images: &[PathBuf]) -> Result<String> {
         let mut base = history.len();
-        history.push(Message::user(input));
+        history.push(Message::user_with_images(input, images));
         let mut rounds = 0;
         // One compaction per turn: the keep budget lands the context under the recovery band, so a
         // second attempt in the same turn would only pay for another summary.
@@ -177,7 +178,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        let answer = turn.run(&mut history, "go").unwrap();
+        let answer = turn.run(&mut history, "go", &[]).unwrap();
         assert_eq!(answer, "done");
         assert_eq!(seen, ["bash"]);
         let roles: Vec<&str> = history.iter().map(|m| m.role.as_str()).collect();
@@ -185,6 +186,26 @@ mod tests {
         assert_eq!(history[1].tool_calls.as_ref().map(Vec::len), Some(1), "the assistant message lost its call");
         assert_eq!(history[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(history[2].content.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn an_image_rides_the_user_message() {
+        let llm = Scripted::new(vec![text("a cat")]);
+        let mut history = vec![Message::system("sys".into())];
+        let mut turn = Turn {
+            llm: &llm,
+            tool_defs: &json!([]),
+            execute: &mut |_: &ToolCall| String::new(),
+            cancel: None,
+            on_commit: None,
+            bounds: None,
+            compaction: None,
+            force_compact: None,
+            on_compact: None,
+        };
+        let path = PathBuf::from("/tmp/shot.png");
+        assert_eq!(turn.run(&mut history, "look", std::slice::from_ref(&path)).unwrap(), "a cat");
+        assert_eq!(history[1].images.iter().map(|picture| &picture.path).collect::<Vec<_>>(), [&path]);
     }
 
     #[test]
@@ -213,7 +234,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        assert!(turn.run(&mut history, "go").is_err());
+        assert!(turn.run(&mut history, "go", &[]).is_err());
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
     }
@@ -227,6 +248,7 @@ mod tests {
             tool_call_id: None,
             usage: None,
             summary: None,
+            images: Vec::new(),
         };
         let llm = Scripted::new(vec![empty]);
         let mut history = vec![Message::system("sys".into())];
@@ -241,7 +263,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        let err = turn.run(&mut history, "go").unwrap_err();
+        let err = turn.run(&mut history, "go", &[]).unwrap_err();
         assert!(err.to_string().contains("neither text nor tool calls"), "{err}");
         assert_eq!(history.len(), 1, "an empty reply was committed as an answer");
     }
@@ -271,7 +293,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        let err = turn.run(&mut history, "go").unwrap_err();
+        let err = turn.run(&mut history, "go", &[]).unwrap_err();
         assert_eq!(err.to_string(), "interrupted");
         assert_eq!(ran, 1, "the second call of the batch still ran");
         assert!(history.is_empty(), "an interrupted turn left history behind");
@@ -293,7 +315,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        let err = turn.run(&mut history, "go").unwrap_err();
+        let err = turn.run(&mut history, "go", &[]).unwrap_err();
         assert_eq!(err.to_string(), "session budget exceeded: time");
         assert_eq!(history.len(), 1, "the user line of a refused turn stays out of the history");
     }
@@ -325,7 +347,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        assert_eq!(turn.run(&mut history, "go").unwrap(), "answer");
+        assert_eq!(turn.run(&mut history, "go", &[]).unwrap(), "answer");
         assert!(history.iter().all(|message| message.summary.is_none()));
         assert_eq!(history.len(), 7);
     }
@@ -348,7 +370,7 @@ mod tests {
                 force_compact: None,
                 on_compact: Some(&mut |report| reports.push(report)),
             };
-            assert_eq!(turn.run(&mut history, "go").unwrap(), "answer");
+            assert_eq!(turn.run(&mut history, "go", &[]).unwrap(), "answer");
         }
         assert_eq!(reports.len(), 1, "one compaction, one report");
         let CompactionOutcome::Compacted(report) = &reports[0] else { panic!("no compaction: {:?}", reports[0]) };
@@ -374,7 +396,7 @@ mod tests {
             force_compact: Some(&flag),
             on_compact: None,
         };
-        assert_eq!(turn.run(&mut history, "go").unwrap(), "answer");
+        assert_eq!(turn.run(&mut history, "go", &[]).unwrap(), "answer");
         assert!(!flag.load(Ordering::SeqCst), "the request fired once and cleared itself");
         assert_eq!(history[1].summary.as_deref(), Some("s"));
     }
@@ -412,7 +434,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        assert_eq!(turn.run(&mut history, "go").unwrap(), "answer");
+        assert_eq!(turn.run(&mut history, "go", &[]).unwrap(), "answer");
         assert!(history.iter().all(|message| message.summary.is_none()), "history stayed uncompacted");
         assert_eq!(history.len(), 7);
     }
@@ -444,7 +466,7 @@ mod tests {
             force_compact: None,
             on_compact: None,
         };
-        let err = turn.run(&mut history, "go").unwrap_err();
+        let err = turn.run(&mut history, "go", &[]).unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         assert_eq!(history.len(), 2, "the current turn is gone and the summary stays");
         assert_eq!(history[0].role, "system");

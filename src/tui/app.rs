@@ -2257,23 +2257,20 @@ impl App {
         }
     }
 
-    /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
-    pub(super) fn take_prompt(&mut self) -> String {
-        let mut text = self.composer.lines().join("\n").trim().to_string();
-        let path = match self.attachment.take() {
-            Some(Attachment::Ready { path, .. }) => Some(path),
-            // A read still in flight, or a chip that found nothing, has no file to name.
-            _ => None,
-        };
-        // Whatever the chip held is spent: a read that lands after this message belongs to none.
-        self.paste = self.paste.wrapping_add(1);
-        if let Some(path) = path {
-            // The chat-completions request carries text only: the picture rides along as the path of a
-            // file the model can open with its own tools.
-            let note = format!("[attached image: {}]", path.display());
-            text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
-        }
+    /// The file the chip holds, read before `take_prompt` spends it: the picture the message carries.
+    pub(super) fn pending_image(&self) -> Option<PathBuf> {
+        self.attachment.as_ref().and_then(Attachment::path).map(Path::to_path_buf)
+    }
+
+    /// What the composer holds, trimmed, left in place: the line a command is parsed from.
+    pub(super) fn typed(&self) -> String {
+        self.composer.lines().join("\n").trim().to_string()
+    }
+
+    /// What was typed, trimmed; the composer starts empty and the chip stays for the next prompt.
+    pub(super) fn take_typed(&mut self) -> String {
         let typed = self.composer.lines().join("\n");
+        let text = typed.trim().to_string();
         self.composer = composer();
         self.recall = None;
         self.completion = None;
@@ -2282,6 +2279,25 @@ impl App {
             self.history.push(typed);
         }
         self.dirty = true;
+        text
+    }
+
+    /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
+    pub(super) fn take_prompt(&mut self) -> String {
+        let mut text = self.take_typed();
+        let path = match self.attachment.take() {
+            Some(Attachment::Ready { path, .. }) => Some(path),
+            // A read still in flight, or a chip that found nothing, has no file to name.
+            _ => None,
+        };
+        // Whatever the chip held is spent: a read that lands after this message belongs to none.
+        self.paste = self.paste.wrapping_add(1);
+        if let Some(path) = path {
+            // The picture itself rides the message (`pending_image`); the path stays in the text so the
+            // transcript shows what was sent and the model's tools can still open the file.
+            let note = format!("[attached image: {}]", path.display());
+            text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
+        }
         text
     }
 
@@ -2851,6 +2867,17 @@ mod paste_tests {
         assert!(prompt.contains(".png]"), "{prompt}");
         assert!(app.attachment.is_none(), "the attachment belongs to one message");
         assert!(path.exists(), "the file is the message's: it outlives the chip");
+    }
+
+    #[test]
+    fn the_chip_names_the_file_the_message_carries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new("m");
+        let path = saved(dir.path());
+        land(&mut app, Paste::Image(path.clone()));
+        assert_eq!(app.pending_image(), Some(path));
+        app.take_prompt();
+        assert_eq!(app.pending_image(), None, "the picture belongs to one message");
     }
 }
 

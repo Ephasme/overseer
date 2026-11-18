@@ -63,7 +63,7 @@ Typing `/` at the start of the prompt opens a completion popup of the commands o
 |↑ / ↓|with the completion popup open: the previous or next completion, leaving the caret alone|
 |esc|with the completion popup open: close it and keep what you typed|
 |ctrl+j|new line in the prompt|
-|ctrl+v|attach the image on the clipboard to the prompt; the message carries its path|
+|ctrl+v|attach the image on the clipboard to the prompt; the model receives it as a picture|
 |ctrl+x|drop the attached image|
 |PageUp / PageDown|scroll the view you are in; End follows new output again|
 |F2|hide or show the agent panel|

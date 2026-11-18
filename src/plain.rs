@@ -44,7 +44,7 @@ pub(crate) fn run(ui: Receiver<UiEvent>, input: Sender<Event>, args: &Args) -> a
     if let Some(prompt) = &args.print {
         // The prompt reaches the model verbatim, never the line parser: `exit` is a prompt, not a command.
         input
-            .send(Event::User(prompt.clone()))
+            .send(Event::User(prompt.clone().into()))
             .map_err(|_| anyhow::anyhow!("the core is not running; the prompt was not delivered"))?;
         let _ = input.send(Event::Eof);
     } else {
