@@ -2262,9 +2262,29 @@ impl App {
         self.attachment.as_ref().and_then(Attachment::path).map(Path::to_path_buf)
     }
 
+    /// What the composer holds, trimmed, left in place: the line a command is parsed from.
+    pub(super) fn typed(&self) -> String {
+        self.composer.lines().join("\n").trim().to_string()
+    }
+
+    /// What was typed, trimmed; the composer starts empty and the chip stays for the next prompt.
+    pub(super) fn take_typed(&mut self) -> String {
+        let typed = self.composer.lines().join("\n");
+        let text = typed.trim().to_string();
+        self.composer = composer();
+        self.recall = None;
+        self.completion = None;
+        // History holds what was typed: a recalled temp path would point at a file since dropped.
+        if !typed.is_empty() {
+            self.history.push(typed);
+        }
+        self.dirty = true;
+        text
+    }
+
     /// The prompt as submitted, trimmed, with any pasted image's path; the composer starts empty.
     pub(super) fn take_prompt(&mut self) -> String {
-        let mut text = self.composer.lines().join("\n").trim().to_string();
+        let mut text = self.take_typed();
         let path = match self.attachment.take() {
             Some(Attachment::Ready { path, .. }) => Some(path),
             // A read still in flight, or a chip that found nothing, has no file to name.
@@ -2278,15 +2298,6 @@ impl App {
             let note = format!("[attached image: {}]", path.display());
             text = if text.is_empty() { note } else { format!("{text}\n\n{note}") };
         }
-        let typed = self.composer.lines().join("\n");
-        self.composer = composer();
-        self.recall = None;
-        self.completion = None;
-        // History holds what was typed: a recalled temp path would point at a file since dropped.
-        if !typed.is_empty() {
-            self.history.push(typed);
-        }
-        self.dirty = true;
         text
     }
 

@@ -205,7 +205,7 @@ mod tests {
         };
         let path = PathBuf::from("/tmp/shot.png");
         assert_eq!(turn.run(&mut history, "look", std::slice::from_ref(&path)).unwrap(), "a cat");
-        assert_eq!(history[1].images, [path]);
+        assert_eq!(history[1].images.iter().map(|picture| &picture.path).collect::<Vec<_>>(), [&path]);
     }
 
     #[test]

@@ -483,17 +483,6 @@ impl Event {
         }
         Some(Event::User(line.into()))
     }
-
-    /// Adds the picture the user pasted. A slash command carries none: only a plain prompt can.
-    pub(crate) fn with_image(self, path: PathBuf) -> Self {
-        match self {
-            Event::User(mut input) => {
-                input.images.push(path);
-                Event::User(input)
-            }
-            other => other,
-        }
-    }
 }
 
 /// One worker as the panels show it.

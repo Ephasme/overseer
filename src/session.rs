@@ -568,7 +568,7 @@ mod tests {
         let requests = recording.requests.lock().unwrap().clone();
         let last = requests[0].last().unwrap();
         assert_eq!(last.role, "user");
-        assert_eq!(last.images, [png]);
+        assert_eq!(last.images.iter().map(|picture| &picture.path).collect::<Vec<_>>(), [&png]);
         frontend.send(Event::Eof).unwrap();
         handle.join().unwrap().unwrap();
     }

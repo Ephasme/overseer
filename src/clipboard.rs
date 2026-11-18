@@ -270,10 +270,13 @@ pub(crate) fn read(name: &str) -> Result<String, String> {
     Ok(crate::tools::with_note(text, cut))
 }
 
+/// The eight bytes every PNG file starts with.
+pub(crate) const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
 /// Whether the file starts with the PNG signature: a pasted screenshot is not text to read.
 fn is_png(path: &Path) -> bool {
     let mut head = [0_u8; 8];
-    File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok() && head == *b"\x89PNG\r\n\x1a\n"
+    File::open(path).and_then(|mut file| file.read_exact(&mut head)).is_ok() && head == *PNG_SIGNATURE
 }
 
 /// A path `discard` accepts, for a test that needs its image to be dropped afterwards.

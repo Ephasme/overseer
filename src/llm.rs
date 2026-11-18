@@ -42,10 +42,36 @@ pub(crate) struct Message {
     /// holds the rendered wrapper. `summary.is_some()` is the test that a message is a summary.
     #[serde(skip)]
     pub(crate) summary: Option<String>,
-    /// Pictures sent with this message, by path: the request carries them base64-encoded.
+    /// Pictures sent with this message, each read and encoded once when the message was built.
     /// Skipped both ways: session files keep the text, and a temp file outlives no process.
     #[serde(skip)]
-    pub(crate) images: Vec<PathBuf>,
+    pub(crate) images: Vec<Picture>,
+}
+
+/// One picture on a message: its file, and the data URI it was read into, or why it could not be.
+/// Encoded once, so every model call of every later round reuses the same bytes.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Picture {
+    pub(crate) path: PathBuf,
+    uri: Result<Arc<str>, String>,
+}
+
+impl Picture {
+    pub(crate) fn load(path: PathBuf) -> Self {
+        let uri = data_uri(&path).map(Arc::from);
+        Self { path, uri }
+    }
+}
+
+/// The path and the encoded size only: a failed assertion must not print megabytes of base64.
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let uri = match &self.uri {
+            Ok(uri) => format!("{} bytes", uri.len()),
+            Err(why) => why.clone(),
+        };
+        f.debug_struct("Picture").field("path", &self.path).field("uri", &uri).finish()
+    }
 }
 
 impl Message {
@@ -68,7 +94,7 @@ impl Message {
     }
     /// A user message with the pictures pasted alongside it.
     pub(crate) fn user_with_images(content: &str, images: &[PathBuf]) -> Self {
-        Self { images: images.to_vec(), ..Self::user(content) }
+        Self { images: images.iter().cloned().map(Picture::load).collect(), ..Self::user(content) }
     }
     pub(crate) fn tool(tool_call_id: &str, content: String) -> Self {
         Self { tool_call_id: Some(tool_call_id.into()), ..Self::new("tool", content) }
@@ -481,23 +507,23 @@ impl OpenAiClient {
         stream: bool,
     ) -> Result<reqwest::blocking::Response> {
         let mut payload = self.payload(messages, tools, max_tokens, stream, self.wants_usage())?;
-        let sent = |payload: &Value| {
+        let sent = |payload: &mut Value| {
             if let Some(sink) = &self.debug {
-                sink(&without_image_data(payload).to_string());
+                sink(&debug_text(payload));
             }
             self.http
                 .post(format!("{}/chat/completions", self.base_url))
                 .bearer_auth(&self.api_key)
-                .json(payload)
+                .json(&*payload)
                 .send()
                 .context("request to model failed")
         };
-        let mut response = sent(&payload)?;
+        let mut response = sent(&mut payload)?;
         // A server that rejects `stream_options` with a 400 gets one retry without it: the answer
         // is worth streaming even if its tokens cannot be billed.
         if stream && self.wants_usage() && response.status() == reqwest::StatusCode::BAD_REQUEST {
             payload = self.payload(messages, tools, max_tokens, stream, false)?;
-            response = sent(&payload)?;
+            response = sent(&mut payload)?;
         }
         let status = response.status();
         if stream && !status.is_success() {
@@ -528,42 +554,57 @@ fn wire_messages(messages: &[Message]) -> serde_json::Result<Vec<Value>> {
         .collect()
 }
 
-/// The text first, then one part per picture. A picture that cannot be read becomes a line of
-/// text saying so: a vanished temp file costs the picture, never the turn.
+/// The text first, then one part per picture. A picture that could not be read becomes a line of
+/// text saying so: a vanished or non-PNG file costs the picture, never the turn.
 fn content_parts(message: &Message) -> Vec<Value> {
     let text = message.content.as_deref().filter(|text| !text.trim().is_empty());
-    let pictures = message.images.iter().map(|path| match data_uri(path) {
-        Ok(url) => json!({ "type": "image_url", "image_url": { "url": url } }),
-        Err(why) => json!({ "type": "text", "text": format!("[image unavailable: {}: {why}]", path.display()) }),
+    let pictures = message.images.iter().map(|picture| match &picture.uri {
+        Ok(url) => json!({ "type": "image_url", "image_url": { "url": &**url } }),
+        Err(why) => {
+            json!({ "type": "text", "text": format!("[image unavailable: {}: {why}]", picture.path.display()) })
+        }
     });
     text.map(|text| json!({ "type": "text", "text": text })).into_iter().chain(pictures).collect()
 }
 
+/// The file as a PNG data URI. The bytes are checked, not assumed: a file that is not a PNG would
+/// go out mislabelled and a strict provider would refuse the whole request.
 fn data_uri(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if !bytes.starts_with(crate::clipboard::PNG_SIGNATURE) {
+        return Err("not a PNG file".to_string());
+    }
     Ok(format!("{DATA_URI_PREFIX}{}", STANDARD.encode(bytes)))
 }
 
-/// The payload as the debug sink shows it: each picture's data reduced to its length, or
-/// `OVERSEER_DEBUG=1` would dump megabytes on every call.
-fn without_image_data(payload: &Value) -> Value {
-    let mut copy = payload.clone();
-    let parts = copy
+/// Every picture's data URI in the payload, in message order.
+fn image_urls(payload: &mut Value) -> impl Iterator<Item = &mut Value> {
+    payload
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .into_iter()
         .flatten()
         .filter_map(|message| message.get_mut("content").and_then(Value::as_array_mut))
-        .flatten();
-    for part in parts {
-        if let Some(url) = part.pointer_mut("/image_url/url")
-            && let Some(data) = url.as_str().and_then(|url| url.strip_prefix(DATA_URI_PREFIX))
-            && !data.is_empty()
-        {
-            *url = Value::String(format!("{DATA_URI_PREFIX}[{} base64 chars]", data.len()));
-        }
+        .flatten()
+        .filter_map(|part| part.pointer_mut("/image_url/url"))
+        .filter(|url| url.as_str().is_some_and(|url| url.starts_with(DATA_URI_PREFIX)))
+}
+
+/// The payload as the debug sink shows it: each picture's data reduced to its length, or
+/// `OVERSEER_DEBUG=1` would dump megabytes on every call. The data is swapped out, the text
+/// written, and the data put back: the redaction never copies a picture.
+fn debug_text(payload: &mut Value) -> String {
+    let saved: Vec<Value> = image_urls(payload)
+        .map(|url| {
+            let encoded = url.as_str().map_or(0, |url| url.len().saturating_sub(DATA_URI_PREFIX.len()));
+            std::mem::replace(url, Value::String(format!("{DATA_URI_PREFIX}[{encoded} base64 chars]")))
+        })
+        .collect();
+    let text = payload.to_string();
+    for (url, original) in image_urls(payload).zip(saved) {
+        *url = original;
     }
-    copy
+    text
 }
 
 #[derive(Deserialize)]
@@ -1151,18 +1192,43 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_is_not_a_png_becomes_a_line_of_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake.png");
+        std::fs::write(&fake, b"GIF89a").unwrap();
+        let body = client().payload(&[Message::user_with_images("look", &[fake])], &json!([]), None, false, false);
+        let content = &body.unwrap()["messages"][0]["content"];
+        let line = content[1]["text"].as_str().unwrap();
+        assert!(line.starts_with("[image unavailable:") && line.ends_with("not a PNG file]"), "{content}");
+    }
+
+    #[test]
+    fn a_picture_is_read_once_when_its_message_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, PNG_MAGIC).unwrap();
+        let message = Message::user_with_images("look", std::slice::from_ref(&png));
+        std::fs::remove_file(&png).unwrap();
+        let body = client().payload(&[message], &json!([]), None, false, false).unwrap();
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url", "later calls reuse the encoded bytes");
+    }
+
+    #[test]
     fn the_debug_copy_hides_the_image_data() {
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("shot.png");
         std::fs::write(&png, PNG_MAGIC).unwrap();
-        let body = client().payload(&[Message::user_with_images("x", &[png])], &json!([]), None, false, false).unwrap();
-        let shown = without_image_data(&body);
+        let mut body =
+            client().payload(&[Message::user_with_images("x", &[png])], &json!([]), None, false, false).unwrap();
+        let before = body.clone();
+        let shown: Value = serde_json::from_str(&debug_text(&mut body)).unwrap();
         let encoded = STANDARD.encode(PNG_MAGIC).len();
         assert_eq!(
             shown["messages"][0]["content"][1]["image_url"]["url"],
             format!("data:image/png;base64,[{encoded} base64 chars]")
         );
-        assert_eq!(shown["messages"][0]["content"][0], body["messages"][0]["content"][0]);
+        assert_eq!(shown["messages"][0]["content"][0], before["messages"][0]["content"][0]);
+        assert_eq!(body, before, "the request itself keeps its data");
     }
 
     #[test]
