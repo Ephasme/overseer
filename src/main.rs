@@ -125,14 +125,22 @@ fn checkpoints_listing(dir: &std::path::Path, id: &str, wanted: &Session, args: 
     session_store::checkpoint_report(dir, id).map_err(anyhow::Error::msg)
 }
 
-/// Why a fork address names no state: an absent agent, or a turn past the agent's newest checkpoint.
+/// Why a fork address names no state: an absent agent, one a restore does not bring back
+/// (stopped, archived or pipeline), or a turn the agent holds no checkpoint for. Turn 0, the
+/// empty history before the first commit, always exists.
 fn fork_target(dir: &std::path::Path, id: &str, at: ForkAt) -> Result<()> {
     let rows = session_store::rows(dir).map_err(anyhow::Error::msg)?;
-    if rows.iter().all(|row| row.id != at.agent) {
+    let Some(row) = rows.iter().find(|row| row.id == at.agent) else {
         anyhow::bail!("session {id} has no agent {}", at.agent);
+    };
+    if row.stopped || row.archived || row.pipeline {
+        anyhow::bail!(
+            "session {id} agent {} is not restored by a fork: it is stopped, archived or a pipeline",
+            at.agent
+        );
     }
-    let turns = session_store::checkpoint_turns(dir, at.agent);
-    if at.turn > turns.last().copied().unwrap_or(0) {
+    let turns = session_store::checkpoint_turns(dir, at.agent).map_err(anyhow::Error::msg)?;
+    if at.turn != 0 && !turns.contains(&at.turn) {
         let available = if turns.is_empty() {
             "none".to_string()
         } else {
@@ -567,6 +575,12 @@ mod tests {
         assert_eq!(err, format!("session {id} has no agent 7"));
         let err = resolve_start(state.path(), &Session::Fork(format!("{id}@1:9"))).unwrap_err().to_string();
         assert_eq!(err, format!("session {id} agent 1: no checkpoint 9; available: 1"));
+        // A turn inside a hole left by a failed save is refused too, not only one past the newest.
+        let dir = state.path().join("sessions").join(&id);
+        session_store::save_checkpoint(&dir, 1, 3, &[]).unwrap();
+        let err = resolve_start(state.path(), &Session::Fork(format!("{id}@1:2"))).unwrap_err().to_string();
+        assert_eq!(err, format!("session {id} agent 1: no checkpoint 2; available: 1 3"));
+        assert!(resolve_start(state.path(), &Session::Fork(format!("{id}@1:0"))).is_ok(), "turn 0 always exists");
         let err = resolve_start(state.path(), &Session::Fork("nope".into())).unwrap_err().to_string();
         assert_eq!(err, "no such session: nope");
         match resolve_start(state.path(), &Session::Fork(format!("{id}@1:1"))).unwrap() {
@@ -576,6 +590,16 @@ mod tests {
             }
             other => panic!("a valid fork resolved to {other:?}"),
         }
+        // A stopped agent is not restored, so an address naming it would branch nothing.
+        let mut log = fs::OpenOptions::new().append(true).open(dir.join("session.jsonl")).unwrap();
+        std::io::Write::write_all(&mut log, b"{\"kind\":\"state\",\"id\":1,\"stopped\":true,\"archived\":false}\n")
+            .unwrap();
+        drop(log);
+        let err = resolve_start(state.path(), &Session::Fork(format!("{id}@1:1"))).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("session {id} agent 1 is not restored by a fork: it is stopped, archived or a pipeline")
+        );
     }
 
     #[test]

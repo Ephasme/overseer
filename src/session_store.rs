@@ -324,33 +324,40 @@ fn checkpoint_file(dir: &Path, id: usize, turn: usize) -> Option<PathBuf> {
     (turn == 1 && legacy.is_file() && !self::numbered(dir, id)).then_some(legacy)
 }
 
-/// This agent's turns, ascending, through `checkpoint_file`.
-pub(crate) fn checkpoint_turns(dir: &Path, id: usize) -> Vec<usize> {
+/// This agent's turns, ascending, through `checkpoint_file`. A missing checkpoint dir means no
+/// numbered turn; any other I/O error is returned, so an unlistable dir never reads as empty.
+pub(crate) fn checkpoint_turns(dir: &Path, id: usize) -> Result<Vec<usize>, String> {
     let mut turns: Vec<usize> = Vec::new();
-    if let Ok(entries) = fs::read_dir(checkpoint_dir(dir, id)) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(number) = name.to_str().and_then(|name| name.strip_suffix(".history.json")) else {
-                continue;
-            };
-            let Ok(turn) = number.parse::<usize>() else { continue };
-            if turn > 0 && entry.path().is_file() {
-                turns.push(turn);
+    let path = checkpoint_dir(dir, id);
+    match fs::read_dir(&path) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| config::io_error(path.display(), &e))?;
+                let name = entry.file_name();
+                let Some(number) = name.to_str().and_then(|name| name.strip_suffix(".history.json")) else {
+                    continue;
+                };
+                let Ok(turn) = number.parse::<usize>() else { continue };
+                if turn > 0 && entry.path().is_file() {
+                    turns.push(turn);
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(config::io_error(path.display(), &e)),
     }
     if turns.is_empty() && checkpoint_file(dir, id, 1).is_some() {
-        return vec![1];
+        return Ok(vec![1]);
     }
     turns.sort_unstable();
     turns.dedup();
-    turns
+    Ok(turns)
 }
 
 /// Copy every checkpoint of one agent up to and including `upto` into another session dir, so a
 /// restored session keeps its source's address space; a legacy history lands as turn 1's file.
 pub(crate) fn copy_checkpoints(from: &Path, to: &Path, id: usize, upto: usize) -> Result<(), String> {
-    for turn in checkpoint_turns(from, id).into_iter().filter(|turn| *turn <= upto) {
+    for turn in checkpoint_turns(from, id)?.into_iter().filter(|turn| *turn <= upto) {
         let Some(source) = checkpoint_file(from, id, turn) else { continue };
         let text = fs::read_to_string(&source).map_err(|e| config::io_error(source.display(), &e))?;
         let history: Vec<Message> =
@@ -398,26 +405,28 @@ pub(crate) fn checkpoint(dir: &Path, id: usize, turn: usize) -> Result<Vec<Messa
 
 /// The highest turn, or `(0, Vec::new())` when the agent has no checkpoint.
 pub(crate) fn newest_checkpoint(dir: &Path, id: usize) -> Result<(usize, Vec<Message>), String> {
-    match checkpoint_turns(dir, id).last() {
+    match checkpoint_turns(dir, id)?.last() {
         Some(&turn) => Ok((turn, checkpoint(dir, id, turn)?)),
         None => Ok((0, Vec::new())),
     }
 }
 
 /// `--checkpoints <id>`: one line per agent, with the address that forks it at its newest turn.
+/// A stopped, archived or pipeline agent is not restored, so it gets no address.
 pub(crate) fn checkpoint_report(dir: &Path, id: &str) -> Result<String, String> {
     let rows = rows(dir)?;
     let mut lines = vec![format!("session {}: {} agent(s)", printable(id), rows.len())];
     for row in &rows {
         let label = printable(&names::label(row.id, row.name.as_deref()));
-        let turns = checkpoint_turns(dir, row.id);
+        let turns = checkpoint_turns(dir, row.id)?;
         let state = match turns.last() {
-            Some(&turn) => format!(
+            Some(&turn) if !row.stopped && !row.archived && !row.pipeline => format!(
                 "({} checkpoint(s), newest turn {turn})  --fork {}@{}:{turn}",
                 turns.len(),
                 printable(id),
                 row.id
             ),
+            Some(&turn) => format!("({} checkpoint(s), newest turn {turn})", turns.len()),
             None => "(no checkpoints)".to_string(),
         };
         lines.push(format!("  {label}  {}  {state}", printable(&row.profile)));
@@ -498,14 +507,19 @@ mod tests {
     fn checkpoints_are_numbered_and_the_newest_one_wins() {
         let dir = temp_dir();
         let turns = three_turns(dir.path());
-        assert_eq!(checkpoint_turns(dir.path(), 1), [1, 2, 3]);
+        assert_eq!(checkpoint_turns(dir.path(), 1).unwrap(), [1, 2, 3]);
         assert_eq!(newest_checkpoint(dir.path(), 1).unwrap(), (3, turns[2].clone()));
         assert_eq!(checkpoint(dir.path(), 1, 2).unwrap(), turns[1]);
         assert!(checkpoint(dir.path(), 1, 0).unwrap().is_empty(), "turn 0 is before the first commit");
         let err = checkpoint(dir.path(), 1, 4).unwrap_err();
         assert!(err.contains("no checkpoint 4"), "{err}");
-        assert_eq!(checkpoint_turns(dir.path(), 9), Vec::<usize>::new());
+        assert_eq!(checkpoint_turns(dir.path(), 9).unwrap(), Vec::<usize>::new());
         assert_eq!(newest_checkpoint(dir.path(), 9).unwrap(), (0, Vec::new()));
+        // An unlistable checkpoint dir is an error, never an empty history.
+        fs::create_dir_all(dir.path().join("checkpoints")).unwrap();
+        fs::write(dir.path().join("checkpoints/agent-8"), "").unwrap();
+        assert!(checkpoint_turns(dir.path(), 8).is_err());
+        assert!(newest_checkpoint(dir.path(), 8).is_err());
     }
 
     #[test]
@@ -515,7 +529,7 @@ mod tests {
         let history = vec![Message::user("before checkpoints")];
         fs::write(&legacy, serde_json::to_string(&history).unwrap()).unwrap();
 
-        assert_eq!(checkpoint_turns(dir.path(), 1), [1]);
+        assert_eq!(checkpoint_turns(dir.path(), 1).unwrap(), [1]);
         assert_eq!(checkpoint(dir.path(), 1, 1).unwrap(), history);
         assert_eq!(newest_checkpoint(dir.path(), 1).unwrap().0, 1);
         let read = fs::read(&legacy).unwrap();
@@ -529,7 +543,7 @@ mod tests {
         let to = temp_dir();
         let turns = three_turns(from.path());
         copy_checkpoints(from.path(), to.path(), 1, 2).unwrap();
-        assert_eq!(checkpoint_turns(to.path(), 1), [1, 2]);
+        assert_eq!(checkpoint_turns(to.path(), 1).unwrap(), [1, 2]);
         assert_eq!(checkpoint(to.path(), 1, 2).unwrap(), turns[1]);
         assert!(checkpoint(to.path(), 1, 3).is_err());
     }
@@ -575,13 +589,16 @@ mod tests {
         log.write(&TreeRecord::Session { at: 1, dir: "/tmp".into(), resumed_from: None, forked_from: None });
         log.write(&agent_record(1));
         log.write(&agent_record(2));
+        log.write(&agent_record(3));
+        log.write(&TreeRecord::State { id: 3, stopped: true, archived: false });
         drop(log);
         three_turns(dir.path());
         save_checkpoint(dir.path(), 2, 1, &[Message::user("child")]).unwrap();
+        save_checkpoint(dir.path(), 3, 1, &[Message::user("stopped")]).unwrap();
 
         let report = checkpoint_report(dir.path(), "1700000000-42").unwrap();
         let lines: Vec<&str> = report.lines().collect();
-        assert_eq!(lines[0], "session 1700000000-42: 2 agent(s)");
+        assert_eq!(lines[0], "session 1700000000-42: 3 agent(s)");
         assert_eq!(
             lines[1],
             "  harbor falcon 7 (1)  worker  (3 checkpoint(s), newest turn 3)  --fork 1700000000-42@1:3"
@@ -590,6 +607,8 @@ mod tests {
             lines[2],
             "  harbor falcon 7 (2)  worker  (1 checkpoint(s), newest turn 1)  --fork 1700000000-42@2:1"
         );
+        // A stopped agent is not restored, so the report gives it no address.
+        assert_eq!(lines[3], "  harbor falcon 7 (3)  worker  (1 checkpoint(s), newest turn 1)");
     }
 
     #[test]

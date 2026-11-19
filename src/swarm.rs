@@ -2210,11 +2210,14 @@ impl AgentRun<'_> {
             };
             // Only an Ok turn commits: an Err turn already truncated `history` back to `base`, so
             // the last good file is exactly the committed state. Written before the event, so a
-            // frontend that sees the answer can quit and resume from it. Best-effort.
+            // frontend that sees the answer can quit and resume from it. Best-effort, but the turn
+            // number advances only once the file is on disk, so a failed save leaves no hole.
             if ok {
-                self.checkpoint_turn += 1;
+                let turn = self.checkpoint_turn + 1;
                 let non_system: Vec<Message> = history.iter().filter(|m| m.role != "system").cloned().collect();
-                let _ = session_store::save_checkpoint(&self.log_dir, self.id, self.checkpoint_turn, &non_system);
+                if session_store::save_checkpoint(&self.log_dir, self.id, turn, &non_system).is_ok() {
+                    self.checkpoint_turn = turn;
+                }
                 if self.parent.is_none() && !self.title_written {
                     self.title_written = true;
                     if let Some(swarm) = self.swarm.upgrade() {
@@ -4108,13 +4111,17 @@ mod tests {
             },
         );
         assert!(notice.contains("from agent 2 checkpoint 1"), "{notice}");
-        assert_eq!(session_store::checkpoint_turns(logs.path(), 1), [1, 2], "an unaddressed agent takes its newest");
+        assert_eq!(
+            session_store::checkpoint_turns(logs.path(), 1).unwrap(),
+            [1, 2],
+            "an unaddressed agent takes its newest"
+        );
         assert_eq!(
             session_store::checkpoint(logs.path(), 1, 2).unwrap(),
             [llm::Message::user("one"), llm::Message::user("two")]
         );
         assert_eq!(session_store::checkpoint(logs.path(), 2, 1).unwrap(), [llm::Message::user("child")]);
-        assert_eq!(session_store::checkpoint_turns(logs.path(), 2), [1]);
+        assert_eq!(session_store::checkpoint_turns(logs.path(), 2).unwrap(), [1]);
         drop(swarm);
     }
 
