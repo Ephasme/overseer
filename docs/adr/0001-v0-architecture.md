@@ -116,7 +116,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - `write_file`: `path`, `content`; parent directories are created. The write goes through a temporary file renamed over the target, so a crash mid-write leaves the old contents, and an existing file keeps its permissions.
 - `edit_file`: `path`, `old_string`, `new_string`; `old_string` must occur exactly once, or the call fails without writing.
 - Unknown fields are rejected, so a model typo comes back as an error result instead of being silently ignored.
-- A registry can be confined to the session directory; path arguments (and `workdir`) that resolve outside it are then refused before the tool runs. Off by default, since v0 has no sandbox.
+- A registry can be confined to the session directory; path arguments (and `workdir`) that resolve outside it are then refused before the tool runs. Off by default, since v0 has no sandbox. The check is lexical and the root must be absolute: a symlink inside the directory that points outside it is not followed for this decision.
 - Every failure — unknown tool, arguments that do not match the schema, a missing file, a non-zero exit — is a tool result with `ok: false`. The registry never returns an error.
 - A call takes a progress sink, which receives each command line as it is printed (the `tool_progress` event, phase 5), and a cancellation token, which kills a running command's process group.
 - Unix only: the process group comes from `tokio::process::Command::process_group` and is killed with `nix::sys::signal::killpg`.

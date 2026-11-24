@@ -18,6 +18,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Rooted at `cwd`, which should be absolute: relative paths are resolved against it.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
