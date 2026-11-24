@@ -70,6 +70,9 @@ Every tool call in an `assistant_message` gets a `tool_result`, because the API 
 
 ### Storage: SeaORM 2, SQLite or Postgres chosen at runtime
 
+> Superseded by [ADR 0004](0004-event-log-graven.md): the log is graven over SQLite, not SeaORM over Postgres.
+
+
 The backend is selected by `DATABASE_URL` (`sqlite://…` or `postgres://…`) in a single binary. Migrations use `sea-orm-migration`'s schema builder only, never raw SQL, so one migration set serves both backends, and run at startup. Event payloads are a `json` column.
 
 ```

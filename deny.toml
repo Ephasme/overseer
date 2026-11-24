@@ -1,5 +1,8 @@
 [graph]
 all-features = true
+# graven's manifest carries no license field and it is not published: it is our own private
+# repository, so it is out of the license and ban graph rather than allowed crate-wide.
+exclude = ["graven"]
 
 [advisories]
 yanked = "deny"
