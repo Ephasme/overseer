@@ -21,10 +21,15 @@ jobs:
             echo "GRAVEN_SSH_KEY is not set: the build cannot fetch the private graven-rs repository" >&2
             exit 1
           fi
-          eval "$(ssh-agent -s)"
+          eval "$(ssh-agent -s)" >/dev/null
           printf '%s\n' "$GRAVEN_SSH_KEY" | ssh-add -
           mkdir -p ~/.ssh
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+          # Each step is its own shell: hand the agent's socket to the steps that run cargo.
+          {
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID"
+          } >> "$GITHUB_ENV"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
