@@ -11,6 +11,9 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub send_reasoning: bool,
+    /// Model calls one turn may make; the agent's own default when absent.
+    #[serde(default)]
+    pub max_steps: Option<usize>,
 }
 
 impl Config {
@@ -57,6 +60,7 @@ mod tests {
         assert_eq!(config.base_url, "http://x/v1");
         assert_eq!(config.model, "m");
         assert!(!config.send_reasoning);
+        assert!(config.max_steps.is_none());
     }
 
     #[test]

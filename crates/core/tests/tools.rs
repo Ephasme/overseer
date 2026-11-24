@@ -362,3 +362,42 @@ async fn reading_a_huge_file_stays_bounded() {
         "tail marker present"
     );
 }
+
+#[tokio::test]
+async fn dropping_the_call_kills_the_process_group() {
+    let (_dir, registry) = registry();
+    let cancel = CancellationToken::new();
+    let mut seen: Vec<String> = Vec::new();
+    {
+        let mut sink = |line: &str| seen.push(line.to_owned());
+        let mut call = Box::pin(registry.call(
+            "bash",
+            r#"{"command":"echo $$; sleep 30"}"#,
+            &mut sink,
+            &cancel,
+        ));
+        tokio::select! {
+            outcome = &mut call => panic!("finished: {outcome:?}"),
+            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+    }
+    let pid: i32 = seen
+        .iter()
+        .find_map(|line| line.trim().parse().ok())
+        .expect("the command printed its pid");
+    let mut gone = false;
+    for _ in 0..40 {
+        let alive = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "process group {pid} survived the drop");
+}

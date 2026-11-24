@@ -1,0 +1,4 @@
+#!/bin/sh
+# The gate CI runs, before the commit instead of after the push.
+set -eu
+just check

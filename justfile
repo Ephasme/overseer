@@ -6,13 +6,17 @@ default:
 # Whole gate, as run by CI.
 check: check-rust check-web
 
-check-rust: fmt-check clippy test-rust shear deny
+check-rust: fmt-check clippy doc test-rust shear deny
 
 fmt-check:
     cargo fmt --all --check
 
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
+
+# Broken intra-doc links rot silently; treat them as errors.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 test-rust:
     cargo nextest run --workspace --locked --no-tests=pass
@@ -50,3 +54,11 @@ web-e2e-install:
 
 web-e2e:
     cd web && bun run e2e
+
+# Install the repo hooks: gate before a commit, not after a push.
+hooks:
+    git config core.hooksPath .githooks
+
+# Capture one real streamed completion as a fixture.
+record name prompt:
+    python3 scripts/record.py {{name}} {{prompt}}

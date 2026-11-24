@@ -104,16 +104,16 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 ### bash tool
 
 - A fresh `bash -c <command>` per call, in its own process group, cwd = session cwd or the call's optional `workdir` (resolved against it). No state carries over between calls.
-- Not a login shell; environment inherited from the server, plus `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`. stdin is `/dev/null`.
+- Not a login shell; environment inherited from the server, plus `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`. stdin is `/dev/null`. Every variable whose name starts with `OVERSEER_` is removed first: the model must not be able to read the harness's own configuration.
 - stdout and stderr share one pipe, so their interleaving is preserved. Lines are broadcast as `tool_progress` while the command runs.
-- Timeout 120 s by default, overridable per call up to 600 s. Timeout and cancel kill the whole process group.
+- Timeout 120 s by default, overridable per call up to 600 s. Timeout, cancel and dropping the call all kill the whole process group.
 - Output returned to the model is capped at 30 KB, keeping head and tail around a marker giving the number of bytes dropped.
 
 ### Tool arguments
 
 - `bash`: `command` (required), `workdir` (resolved against the session cwd), `timeout_seconds` (default 120, clamped to 1–600).
 - `read_file`: `path`, `start_line`, `end_line` (1-based, inclusive; the whole file by default). Output is numbered lines, capped like every tool output.
-- `write_file`: `path`, `content`; parent directories are created.
+- `write_file`: `path`, `content`; parent directories are created. The write goes through a temporary file renamed over the target, so a crash mid-write leaves the old contents, and an existing file keeps its permissions.
 - `edit_file`: `path`, `old_string`, `new_string`; `old_string` must occur exactly once, or the call fails without writing.
 - Unknown fields are rejected, so a model typo comes back as an error result instead of being silently ignored.
 - Every failure — unknown tool, arguments that do not match the schema, a missing file, a non-zero exit — is a tool result with `ok: false`. The registry never returns an error.

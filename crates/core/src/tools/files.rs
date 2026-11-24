@@ -27,12 +27,9 @@ pub(crate) async fn write(cwd: &Path, args: WriteArgs) -> ToolOutcome {
     {
         return ToolOutcome::error(format!("cannot create {}: {error}", parent.display()));
     }
-    match fs::write(&path, &args.content).await {
-        Ok(()) => ToolOutcome::ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            path.display()
-        )),
+    let bytes = args.content.len();
+    match write_atomic(&path, args.content).await {
+        Ok(()) => ToolOutcome::ok(format!("wrote {bytes} bytes to {}", path.display())),
         Err(error) => ToolOutcome::error(format!("cannot write {}: {error}", path.display())),
     }
 }
@@ -55,7 +52,7 @@ pub(crate) async fn edit(cwd: &Path, args: EditArgs) -> ToolOutcome {
         )),
         1 => {
             let edited = text.replacen(&args.old_string, &args.new_string, 1);
-            match fs::write(&path, edited).await {
+            match write_atomic(&path, edited).await {
                 Ok(()) => ToolOutcome::ok(format!("edited {}", path.display())),
                 Err(error) => {
                     ToolOutcome::error(format!("cannot write {}: {error}", path.display()))
@@ -99,6 +96,36 @@ fn number_lines(text: &str, start: Option<usize>, end: Option<usize>) -> String 
     out.finish()
 }
 
+/// Writes through a temporary file in the same directory and renames over the target, so a crash
+/// mid-write leaves the previous contents intact. An existing file keeps its permissions.
+async fn write_atomic(path: &Path, content: String) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic_blocking(&path, &content))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn write_atomic_blocking(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // A rename would replace the link itself; writing through it is what a user means.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return std::fs::write(path, content);
+    }
+
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        file.as_file().set_permissions(metadata.permissions())?;
+    }
+    file.write_all(content.as_bytes())?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
@@ -137,5 +164,35 @@ mod tests {
     #[test]
     fn an_empty_file_numbers_to_nothing() {
         assert_eq!(number_lines("", None, None), "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_file_keeps_its_mode_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::tools::registry::WriteArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sh");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = super::write(
+            dir.path(),
+            WriteArgs {
+                path: "s.sh".into(),
+                content: "new".into(),
+            },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "mode preserved");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temp left"
+        );
     }
 }
