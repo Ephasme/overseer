@@ -109,6 +109,17 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - Timeout 120 s by default, overridable per call up to 600 s. Timeout and cancel kill the whole process group.
 - Output returned to the model is capped at 30 KB, keeping head and tail around a marker giving the number of bytes dropped.
 
+### Tool arguments
+
+- `bash`: `command` (required), `workdir` (resolved against the session cwd), `timeout_seconds` (default 120, clamped to 1–600).
+- `read_file`: `path`, `start_line`, `end_line` (1-based, inclusive; the whole file by default). Output is numbered lines, capped like every tool output.
+- `write_file`: `path`, `content`; parent directories are created.
+- `edit_file`: `path`, `old_string`, `new_string`; `old_string` must occur exactly once, or the call fails without writing.
+- Unknown fields are rejected, so a model typo comes back as an error result instead of being silently ignored.
+- Every failure — unknown tool, arguments that do not match the schema, a missing file, a non-zero exit — is a tool result with `ok: false`. The registry never returns an error.
+- A call takes a progress sink, which receives each command line as it is printed (the `tool_progress` event, phase 5), and a cancellation token, which kills a running command's process group.
+- Unix only: the process group comes from `tokio::process::Command::process_group` and is killed with `nix::sys::signal::killpg`.
+
 ## Consequences
 
 - **Anyone who can reach the port executes arbitrary commands as the user.** Localhost binding and Host/Origin filtering stop other machines and web pages, not other local users or processes. Any non-local exposure, or use on a shared machine, requires a new ADR adding authentication first.
