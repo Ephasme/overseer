@@ -167,7 +167,9 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
-    pub(crate) fn parse(value: &str) -> Self {
+    /// Parses the wire value; anything undocumented is kept as [`FinishReason::Other`].
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
         match value {
             "stop" => Self::Stop,
             "length" => Self::Length,
@@ -260,6 +262,8 @@ mod tests {
     }
 }
 ```
+
+`parse` is public rather than `pub(crate)` on purpose: the lib target compiled without `cfg(test)` would report it as dead code (`-D dead_code` fails the gate), and phase 3's history rebuild parses a stored `finish_reason` string back into this type.
 
 - [ ] **Step 6: Run the tests**
 
