@@ -737,7 +737,7 @@ test("home renders the shell", async ({ page }) => {
 ```
 
 Run: `bun run e2e`
-Expected: FAIL: no config, so no `baseURL` and `page.goto("/")` errors with `Cannot navigate to invalid URL`.
+Expected: FAIL, with a `ZodError` at `src/env.ts:7`. With no config, Playwright scans the whole `web/` tree for `*.test.ts` / `*.spec.ts` ([`testDir` defaults to the config's directory](https://playwright.dev/docs/api/class-testconfig#test-config-test-dir)), so it also loads the Vitest file `src/env.test.ts`, where `import.meta.env` is undefined. The config's `testDir: "e2e"` is what keeps the two runners apart.
 
 - [ ] **Step 3: Write `web/playwright.config.ts`**
 
