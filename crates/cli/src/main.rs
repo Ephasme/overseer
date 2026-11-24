@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let tools = ToolRegistry::new(&cwd);
     let mut agent_config = AgentConfig::new(default_system_prompt(&cwd));
     if let Some(max_steps) = config.max_steps {
-        agent_config.max_steps = max_steps;
+        agent_config.max_steps = max_steps.max(1);
     }
     let mut agent = Agent::new(client, tools, agent_config);
     let cancel = CancellationToken::new();

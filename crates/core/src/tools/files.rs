@@ -108,6 +108,11 @@ async fn write_atomic(path: &Path, content: String) -> std::io::Result<()> {
 fn write_atomic_blocking(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
+    // A rename would replace the link itself; writing through it is what a user means.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return std::fs::write(path, content);
+    }
+
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
