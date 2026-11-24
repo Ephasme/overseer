@@ -1007,6 +1007,15 @@ async fn edit_file_refuses_a_missing_or_ambiguous_match() {
 }
 ```
 
+Then update the two assertions Task 2 wrote, which now describe four tools instead of one:
+
+```rust
+    assert_eq!(names, ["bash", "read_file", "write_file", "edit_file"]);
+```
+```rust
+    assert!(outcome.output.contains("available tools: bash, read_file"), "{}", outcome.output);
+```
+
 Run: `cargo nextest run -p overseer-core --test tools`
 Expected: FAIL: `read_file`, `write_file` and `edit_file` answer "unknown tool", so the first assertion on `whole.output` fails.
 
