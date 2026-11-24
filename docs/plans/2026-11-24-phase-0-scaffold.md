@@ -8,7 +8,7 @@
 
 **Architecture:** cargo workspace under `crates/`, web app under `web/`, `justfile` at the root as the only entry point. No product code: the only behaviour is a placeholder page and one test per test runner, proving each runner is wired.
 
-**Tech Stack:** Rust 1.100 (edition 2024), clippy, rustfmt, cargo-nextest, cargo-shear, cargo-deny, just; bun, TypeScript 7, Vite 8, React 19 + React Compiler, TanStack Router, Tailwind 4, shadcn/ui (Base UI), Zod 4, Biome 2, Vitest 5, Playwright; GitHub Actions.
+**Tech Stack:** Rust 1.100 (edition 2024), clippy, rustfmt, cargo-nextest, cargo-shear, cargo-deny, just; bun 1.4.4 as package manager and script runner, Node 26 as the JS runtime, TypeScript 7, Vite 8, React 19 + React Compiler, TanStack Router, Tailwind 4, shadcn/ui (Base UI), Zod 4, Biome 2, Vitest 5, Playwright; GitHub Actions.
 
 **Spec:** [ADR 0001](../adr/0001-v0-architecture.md), [ADR 0002](../adr/0002-toolchain-and-frontend-stack.md), [rough plan](2026-11-24-overseer-v0.md) (phase 0 row).
 
@@ -19,11 +19,13 @@
 - Clippy always runs with `--workspace --all-targets -- -D warnings`.
 - Crate names: `overseer-core`, `overseer-store`, `overseer-server`, `overseer-cli`. `server` and `cli` are binaries, `core` and `store` libraries.
 - No dependency is added in phase 0 that no code uses: `cargo shear` must pass. axum, tokio, SeaORM, utoipa, TanStack Query and the codegen tools arrive with the phase that first uses them.
-- JS dependencies are pinned to exact versions (no `^`), `bun.lock` committed.
+- JS dependencies are pinned to exact versions (no `^`), `bun.lock` committed and installed with `--frozen-lockfile` everywhere but the step that adds a dependency.
+- JS runtime: Node `26.13.1`, pinned in `web/.node-version`. `vite`, `vitest`, `tsc` and `playwright` start with `#!/usr/bin/env node`, and bun honours that line, so `bun run <script>` executes them on Node, not bun. bun is the package manager and script launcher only. Vitest 5 requires Node `^22.12 || ^24 || >=26`.
+- bun version: `1.4.4`, pinned in `web/package.json` as `"packageManager": "bun@1.4.4"`; `oven-sh/setup-bun` reads it from there.
 - Exact JS versions: `react` / `react-dom` 19.3.1, `typescript` 7.0.2, `vite` 8.3.8, `@vitejs/plugin-react` 6.3.0, `@rolldown/plugin-babel` 0.3.1, `@babel/core` 8.1.3, `babel-plugin-react-compiler` 1.0.0, `@tanstack/react-router` 1.170.46, `@tanstack/router-plugin` 1.169.0, `tailwindcss` / `@tailwindcss/vite` 4.3.5, `zod` 4.6.7, `@biomejs/biome` 2.6.8, `vitest` 5.1.1, `jsdom` 31.0.1, `@testing-library/react` 16.3.3, `@playwright/test` 1.65.1, `@types/react` / `@types/react-dom` 19.3.0, `@types/node` 26.6.6, `shadcn` CLI 4.23.0.
 - Vite dev server: port `5173`, `strictPort`, proxies `/api` to `http://127.0.0.1:7878` (the server's default port, used from phase 5).
 - Commit messages in English, Conventional Commits.
-- Tools already on this machine: `just` 1.58, `cargo-nextest` 0.9.151, `cargo-shear` 1.14.1, `cargo-deny` 0.20.2, bun 1.4.4. Not checked on a fresh machine; CI installs its own.
+- Tools already on this machine: `just` 1.58, `cargo-nextest` 0.9.151, `cargo-shear` 1.14.1, `cargo-deny` 0.20.2, bun 1.4.4, fnm (reads `.node-version`). Not checked on a fresh machine; CI pins its own (Task 6).
 
 ## File map
 
@@ -31,12 +33,13 @@
 |---|---|---|
 | `.gitignore` | ignore Rust build output | 1 |
 | `web/.gitignore` | ignore web build output; also Biome's ignore source | 3 |
+| `web/.node-version` | pin Node 26.13.1 for fnm and CI | 3 |
 | `rust-toolchain.toml` | pin Rust 1.100 + components | 1 |
 | `Cargo.toml` | workspace, shared package metadata, lints | 1 |
 | `crates/{core,store}/{Cargo.toml,src/lib.rs}` | empty library crates | 1 |
 | `crates/{server,cli}/{Cargo.toml,src/main.rs}` | empty binary crates | 1 |
 | `deny.toml` | cargo-deny policy | 2 |
-| `justfile` | every gate recipe | 2, 3, 5, 6 |
+| `justfile` | every gate recipe | 2, 3, 5 |
 | `web/package.json`, `web/bun.lock` | JS deps and scripts | 3–6 |
 | `web/tsconfig.json` | TS 7 strict config | 3 |
 | `web/biome.json` | lint + format config | 3 |
@@ -99,7 +102,6 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 ```
@@ -151,11 +153,11 @@ fn main() {}
 Run:
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace --no-tests=pass
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo nextest run --workspace --locked --no-tests=pass
 cargo shear
 ```
-Expected: all exit 0. nextest prints `0 tests run`; shear prints `no issues found`.
+Expected: all exit 0. nextest prints `0 tests run`; shear prints `no issues found`. `--locked` fails instead of silently rewriting `Cargo.lock`; it is used by every gate command from here on.
 
 - [ ] **Step 7: Verify the lints are inherited**
 
@@ -165,7 +167,7 @@ Temporarily add to `crates/core/src/lib.rs`:
 pub fn f(x: &Vec<u8>) -> usize { unsafe { x.len() } }
 ```
 
-Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Run: `cargo clippy --workspace --all-targets --locked -- -D warnings`
 Expected: FAIL with four errors: `usage of an unsafe block` (the `forbid`), `writing &Vec instead of &[_]` (`ptr_arg`), `this function could have a #[must_use] attribute` (`pedantic`), and `unnecessary unsafe block`. Then empty `crates/core/src/lib.rs` again and re-run: exit 0.
 
 - [ ] **Step 8: Commit**
@@ -185,7 +187,7 @@ git commit -m "build: scaffold Rust workspace with shared lints"
 
 **Interfaces:**
 - Consumes: the workspace from Task 1.
-- Produces: `just` recipes `fmt-check`, `clippy`, `test-rust`, `shear`, `deny`, `check-rust`, and `check` (extended in Tasks 3, 5 and 6). CI calls these exact names.
+- Produces: `just` recipes `fmt-check`, `clippy`, `test-rust`, `shear`, `deny`, `check-rust`, and `check` (extended in Tasks 3 and 5). CI calls `check-rust`, `web-install`, `web-e2e-install` and `check-web`.
 
 - [ ] **Step 1: Write `deny.toml`**
 
@@ -223,7 +225,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 ```
 
-`multiple-versions` stays at `warn`: SeaORM and axum pull duplicate crates that would make `deny` fail on things this repo cannot fix. `unused-allowed-license = "allow"` keeps the list stable while the dependency set is still small.
+`multiple-versions` stays at `warn`: SeaORM and axum pull duplicate crates that would make `deny` fail on things this repo cannot fix. `unused-allowed-license = "allow"` keeps the list stable while the dependency set is still small. `allow-wildcard-paths` exempts path dependencies between the workspace's own crates, which are private (`publish = false`), from the wildcard ban ([cargo-deny docs](https://github.com/EmbarkStudios/cargo-deny/blob/main/docs/src/checks/bans/cfg.md)).
 
 - [ ] **Step 2: Write the `justfile`**
 
@@ -242,10 +244,10 @@ fmt-check:
     cargo fmt --all --check
 
 clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test-rust:
-    cargo nextest run --workspace --no-tests=pass
+    cargo nextest run --workspace --locked --no-tests=pass
 
 shear:
     cargo shear
@@ -283,7 +285,7 @@ git commit -m "build: add cargo-deny policy and just gate for Rust"
 ### Task 3: Web app skeleton (Vite, React, TS 7, router, Zod, Biome, Vitest)
 
 **Files:**
-- Create: `web/.gitignore`, `web/package.json`, `web/bun.lock`
+- Create: `web/.gitignore`, `web/.node-version`, `web/package.json`, `web/bun.lock`
 - Create: `web/tsconfig.json`, `web/biome.json`, `web/vite.config.ts`, `web/index.html`
 - Create: `web/src/index.css`, `web/src/main.tsx`, `web/src/env.ts`, `web/src/env.test.ts`
 - Create: `web/src/routes/__root.tsx`, `web/src/routes/index.tsx`
@@ -298,7 +300,7 @@ git commit -m "build: add cargo-deny policy and just gate for Rust"
   - package scripts `dev`, `build`, `typecheck`, `lint`, `format`, `test`, `e2e`.
   - just recipes `web-install`, `web-lint`, `web-typecheck`, `web-test`, `web-build`, `check-web`.
 
-- [ ] **Step 1: Create `web/.gitignore` and `web/package.json`**
+- [ ] **Step 1: Create `web/.gitignore`, `web/.node-version` and `web/package.json`**
 
 `web/.gitignore`:
 
@@ -309,6 +311,15 @@ test-results/
 playwright-report/
 ```
 
+`web/.node-version`:
+
+```
+26.13.1
+```
+
+Run from `web/`: `fnm use --install-if-missing && node --version`
+Expected: `v26.13.1`. Every later web step runs in a shell where this holds; fnm switches on `cd` into `web/` only if its shell hook has `--use-on-cd`, so check `node --version` before running any web command.
+
 `web/package.json`:
 
 ```json
@@ -316,17 +327,20 @@ playwright-report/
   "name": "overseer-web",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "lint": "biome ci .",
+    "lint": "biome ci --error-on-warnings .",
     "format": "biome check --write .",
     "test": "vitest run",
     "e2e": "playwright test"
   }
 }
 ```
+
+`--error-on-warnings`: Biome exits 0 on rules whose default severity is `warn` ([Biome linter docs](https://biomejs.dev/linter/#change-rule-severity)); without the flag those diagnostics never fail the gate.
 
 - [ ] **Step 2: Install dependencies with exact versions**
 
@@ -536,7 +550,7 @@ createRoot(root).render(
 - [ ] **Step 10: Build, which also generates the route tree**
 
 Run: `bun run build`
-Expected: `✓ built`, and `web/src/routeTree.gen.ts` now exists. It is committed: `tsc` imports it, and `tsc` runs before any build in CI.
+Expected: `✓ built`, and `web/src/routeTree.gen.ts` now exists. It is committed: `tsc` imports it and runs before the build in the gate, so a fresh clone must type-check without generating it first. The gate's `web-routes-drift` recipe (Step 13) fails when a route was added without committing the regenerated tree.
 
 - [ ] **Step 11: Verify the React Compiler is active**
 
@@ -562,7 +576,7 @@ Replace the `check:` line and append the web recipes:
 # Whole gate, as run by CI.
 check: check-rust check-web
 
-check-web: web-lint web-typecheck web-test web-build
+check-web: web-lint web-typecheck web-test web-build web-routes-drift
 
 web-install:
     cd web && bun install --frozen-lockfile
@@ -578,7 +592,13 @@ web-test:
 
 web-build:
     cd web && bun run build
+
+# The build regenerates the route tree; a diff means it was not committed.
+web-routes-drift:
+    git diff --exit-code -- web/src/routeTree.gen.ts
 ```
+
+`web-routes-drift` must run after `web-build` and reads the worktree, so it also fails while the regenerated tree is merely unstaged: commit or stage it before running the gate locally.
 
 Run: `just check`
 Expected: exit 0.
@@ -615,15 +635,18 @@ Expected: `Project initialization completed.` It writes `components.json` (`"sty
 
 - [ ] **Step 2: Pin what the CLI added**
 
-The CLI adds `^` ranges. Pin each of them to the version `bun.lock` resolved:
+The CLI adds `^` ranges. Pin each one to the version it wrote, then reinstall from the lockfile to prove it is consistent:
 
 ```bash
 for p in @base-ui/react class-variance-authority cn lucide-react tw-animate-css @fontsource-variable/geist shadcn; do
   v=$(jq -r --arg p "$p" '.dependencies[$p]' package.json | tr -d '^~')
   bun add --exact "$p@$v"
 done
+bun install --frozen-lockfile
 ```
-Expected: no `^` left in `package.json` (`grep -c '\^' package.json` prints `0`).
+Expected: `grep -c '"[\^~]' package.json` prints `0`, and the frozen install exits 0.
+
+The CLI's version for each package is whatever is latest on the day it runs; record the resolved versions in the commit body so the next reader can see what landed.
 
 `shadcn` is a runtime dependency on purpose: `index.css` imports `shadcn/tailwind.css` from it.
 
@@ -697,7 +720,7 @@ bun add --exact --dev @playwright/test@1.65.1
 bunx playwright install chromium
 ```
 
-Playwright's runner executes under Node even when started with `bunx`; that is expected and works.
+Playwright's CLI starts with `#!/usr/bin/env node`, so the runner executes on Node 26 (`web/.node-version`) even when launched through bun.
 
 - [ ] **Step 2: Write the failing spec**
 
@@ -738,10 +761,14 @@ Expected: PASS, `1 passed`.
 
 - [ ] **Step 4: Add the recipe to the gate**
 
-In the `justfile`, change `check-web` and append `web-e2e`:
+In the `justfile`, change `check-web` and append two recipes:
 
 ```just
-check-web: web-lint web-typecheck web-test web-build web-e2e
+check-web: web-lint web-typecheck web-test web-build web-routes-drift web-e2e
+
+# Browser binaries are not in bun.lock; this installs the build matching @playwright/test.
+web-e2e-install:
+    cd web && bunx playwright install chromium
 
 web-e2e:
     cd web && bun run e2e
@@ -765,7 +792,7 @@ git commit -m "test: wire Playwright end-to-end runner"
 - Create: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: just recipes `check-rust`, `web-install`, `check-web`.
+- Consumes: just recipes `check-rust`, `web-install`, `web-e2e-install`, `check-web`; `web/.node-version`; `packageManager` in `web/package.json`.
 - Produces: one workflow, jobs `rust` and `web`, on every push to `main` and every pull request. Phase 4 adds a Postgres service container to `rust`; phase 6 adds the OpenAPI drift check.
 
 - [ ] **Step 1: Write `.github/workflows/ci.yml`**
@@ -792,27 +819,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-nextest,cargo-shear,cargo-deny
+          tool: just@1.58,cargo-nextest@0.9.151,cargo-shear@1.14.1,cargo-deny@0.20.2
       - run: just check-rust
 
   web:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: web/.node-version
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version-file: web/package.json
       - uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just@1.58
       - run: just web-install
-      - name: Install Playwright browser
+      - name: Install Playwright system dependencies
         working-directory: web
-        run: bunx playwright install --with-deps chromium
+        run: bunx playwright install-deps chromium
+      - run: just web-e2e-install
       - run: just check-web
 ```
 
-Action majors checked on 2026-11-24: `actions/checkout` v7, `Swatinem/rust-cache` v2, `taiki-e/install-action` v2, `oven-sh/setup-bun` v2.
+Tool versions are pinned to the ones the plan was checked against: `install-action` installs the latest release otherwise, so a cargo-deny or nextest release could break CI with no change in the repo. `setup-node` puts Node 26 first on `PATH`; without it the runner's default Node (24 on `ubuntu-latest`, which is Ubuntu 26.04) would run Vite and Vitest.
+
+Action majors checked on 2026-11-24: `actions/checkout` v7, `actions/setup-node` v7, `Swatinem/rust-cache` v2, `taiki-e/install-action` v2, `oven-sh/setup-bun` v2.
 
 `rustup toolchain install` with no argument installs the toolchain named in `rust-toolchain.toml`, with its components.
 
@@ -836,7 +869,7 @@ The repository has no remote yet. Creating one and pushing is Loup's call: ask b
 
 ## Phase 0 done when
 
-- `just check` exits 0 on a fresh clone after `just web-install` and `bunx playwright install chromium`.
+- `just check` exits 0 on a fresh clone, run with Node 26.13.1 active, after `just web-install` and `just web-e2e-install`.
 - Each runner is proven live by one test: nextest (0 tests, passes), Vitest (`env.test.ts`), Playwright (`home.spec.ts`).
 - The lint, unsafe and deny checks were each seen failing on a planted violation (Task 1 Step 7, Task 2 Step 4).
 - CI is green on GitHub, once a remote exists.
