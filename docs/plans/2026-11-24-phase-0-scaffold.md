@@ -123,7 +123,7 @@ publish.workspace = true
 workspace = true
 ```
 
-`crates/core/src/lib.rs` and `crates/store/src/lib.rs`: empty files.
+`crates/core/src/lib.rs` and `crates/store/src/lib.rs`: a single newline each (a zero-byte file fails `cargo fmt --check`, which wants the trailing newline).
 
 - [ ] **Step 5: Write the two binary crates**
 
