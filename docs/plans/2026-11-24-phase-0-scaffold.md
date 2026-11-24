@@ -22,7 +22,7 @@
 - JS dependencies are pinned to exact versions (no `^`), `bun.lock` committed and installed with `--frozen-lockfile` everywhere but the step that adds a dependency.
 - JS runtime: Node `26.13.1`, pinned in `web/.node-version`. `vite`, `vitest`, `tsc` and `playwright` start with `#!/usr/bin/env node`, and bun honours that line, so `bun run <script>` executes them on Node, not bun. bun is the package manager and script launcher only. Vitest 5 requires Node `^22.12 || ^24 || >=26`.
 - bun version: `1.4.4`, pinned in `web/package.json` as `"packageManager": "bun@1.4.4"`; `oven-sh/setup-bun` reads it from there.
-- Exact JS versions: `react` / `react-dom` 19.3.1, `typescript` 7.0.2, `vite` 8.3.8, `@vitejs/plugin-react` 6.3.0, `@rolldown/plugin-babel` 0.3.1, `@babel/core` 8.1.3, `babel-plugin-react-compiler` 1.0.0, `@tanstack/react-router` 1.170.46, `@tanstack/router-plugin` 1.169.0, `tailwindcss` / `@tailwindcss/vite` 4.3.5, `zod` 4.6.7, `@biomejs/biome` 2.6.8, `vitest` 5.1.1, `jsdom` 31.0.1, `@testing-library/react` 16.3.3, `@playwright/test` 1.65.1, `@types/react` / `@types/react-dom` 19.3.0, `@types/node` 26.6.6, `shadcn` CLI 4.23.0.
+- Exact JS versions: `react` / `react-dom` 19.3.1, `typescript` 7.0.2, `vite` 8.3.8, `@vitejs/plugin-react` 6.3.0, `@rolldown/plugin-babel` 0.3.1, `@babel/core` 8.1.3, `babel-plugin-react-compiler` 1.0.0, `@tanstack/react-router` 1.170.46, `@tanstack/router-plugin` 1.169.0, `tailwindcss` / `@tailwindcss/vite` 4.3.5, `zod` 4.6.7, `@biomejs/biome` 2.6.8, `vitest` 5.1.1, `jsdom` 31.0.1, `@playwright/test` 1.65.1, `@types/react` / `@types/react-dom` 19.3.0, `@types/node` 26.6.6, `shadcn` CLI 4.23.0. Testing Library arrives with the first component test (phase 7): nothing on the JS side enforces what `cargo shear` enforces on the Rust side, so an unused package stays until someone notices.
 - Vite dev server: port `5173`, `strictPort`, proxies `/api` to `http://127.0.0.1:7878` (the server's default port, used from phase 5).
 - Commit messages in English, Conventional Commits.
 - Tools already on this machine: `just` 1.58, `cargo-nextest` 0.9.151, `cargo-shear` 1.14.1, `cargo-deny` 0.20.2, bun 1.4.4, fnm (reads `.node-version`). Not checked on a fresh machine; CI pins its own (Task 6).
@@ -41,7 +41,7 @@
 | `deny.toml` | cargo-deny policy | 2 |
 | `justfile` | every gate recipe | 2, 3, 5 |
 | `web/package.json`, `web/bun.lock` | JS deps and scripts | 3–6 |
-| `web/tsconfig.json` | TS 7 strict config | 3 |
+| `web/tsconfig.base.json`, `web/tsconfig.json`, `web/tsconfig.node.json` | TS 7 strict options; browser and Node programs kept apart | 3 |
 | `web/biome.json` | lint + format config | 3 |
 | `web/vite.config.ts` | Vite, React + Compiler, router plugin, Tailwind, proxy, Vitest | 3, 4 |
 | `web/index.html`, `web/src/main.tsx`, `web/src/routes/*` | app shell, one route | 3 |
@@ -286,7 +286,7 @@ git commit -m "build: add cargo-deny policy and just gate for Rust"
 
 **Files:**
 - Create: `web/.gitignore`, `web/.node-version`, `web/package.json`, `web/bun.lock`
-- Create: `web/tsconfig.json`, `web/biome.json`, `web/vite.config.ts`, `web/index.html`
+- Create: `web/tsconfig.base.json`, `web/tsconfig.json`, `web/tsconfig.node.json`, `web/biome.json`, `web/vite.config.ts`, `web/index.html`
 - Create: `web/src/index.css`, `web/src/main.tsx`, `web/src/env.ts`, `web/src/env.test.ts`
 - Create: `web/src/routes/__root.tsx`, `web/src/routes/index.tsx`
 - Create (generated): `web/src/routeTree.gen.ts`
@@ -350,22 +350,21 @@ bun add --exact react@19.3.1 react-dom@19.3.1 @tanstack/react-router@1.170.46 zo
 bun add --exact --dev typescript@7.0.2 vite@8.3.8 @vitejs/plugin-react@6.3.0 \
   @rolldown/plugin-babel@0.3.1 @babel/core@8.1.3 babel-plugin-react-compiler@1.0.0 \
   @tanstack/router-plugin@1.169.0 tailwindcss@4.3.5 @tailwindcss/vite@4.3.5 \
-  @biomejs/biome@2.6.8 vitest@5.1.1 jsdom@31.0.1 @testing-library/react@16.3.3 \
+  @biomejs/biome@2.6.8 vitest@5.1.1 jsdom@31.0.1 \
   @types/react@19.3.0 @types/react-dom@19.3.0 @types/node@26.6.6
 ```
 Expected: `bun.lock` created; `package.json` versions have no `^`.
 
-- [ ] **Step 3: Write `web/tsconfig.json`**
+- [ ] **Step 3: Write the three tsconfig files**
+
+`web/tsconfig.base.json` (options shared by both programs):
 
 ```json
 {
   "compilerOptions": {
     "target": "ES2023",
-    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "jsx": "react-jsx",
-    "types": ["vite/client"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -376,14 +375,42 @@ Expected: `bun.lock` created; `package.json` versions have no `^`.
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "paths": { "@/*": ["./src/*"] }
-  },
-  "include": ["src", "e2e", "vite.config.ts", "playwright.config.ts"]
+    "noEmit": true
+  }
 }
 ```
 
-One file, not Vite's split `tsconfig.app.json` / `tsconfig.node.json`: there is one `tsc --noEmit` run and nothing is emitted. TS 7 drops `baseUrl`; `paths` resolves relative to the tsconfig.
+`web/tsconfig.json` (browser code: DOM, Vite client types, no Node):
+
+```json
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["src"]
+}
+```
+
+`web/tsconfig.node.json` (configs and Playwright specs, which run on Node):
+
+```json
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": ["e2e", "vite.config.ts", "playwright.config.ts"]
+}
+```
+
+In `web/package.json`, set `"typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"`.
+
+Two programs, because one program covering both would let `vite.config.ts` load `@types/node` into browser code: `process.env.HOME` in `src/` would type-check and fail at runtime. Check it: put `export const leak = process.env.HOME;` in a file under `src/`; `bun run typecheck` must fail with `TS2591: Cannot find name 'process'`; delete the file. TS 7 drops `baseUrl`; `paths` resolves relative to the tsconfig.
 
 - [ ] **Step 4: Write `web/biome.json`**
 
@@ -648,7 +675,7 @@ Expected: `grep -c '"[\^~]' package.json` prints `0`, and the frozen install exi
 
 The CLI's version for each package is whatever is latest on the day it runs; record the resolved versions in the commit body so the next reader can see what landed.
 
-`shadcn` is a runtime dependency on purpose: `index.css` imports `shadcn/tailwind.css` from it.
+Then move `shadcn` to `devDependencies`: `bun remove shadcn && bun add --exact --dev shadcn@<version>`. The CLI puts it in `dependencies`, but its only use in the app is `index.css`'s `@import "shadcn/tailwind.css"`, which Tailwind resolves at build time, like `tailwindcss` itself.
 
 - [ ] **Step 3: Add one component to prove the pipeline**
 
@@ -805,6 +832,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -812,27 +842,34 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: just@1.58,cargo-nextest@0.9.151,cargo-shear@1.14.1,cargo-deny@0.20.2
       - run: just check-rust
 
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version-file: web/.node-version
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version-file: web/package.json
-      - uses: taiki-e/install-action@v2
+      - uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('web/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: just@1.58
       - run: just web-install
@@ -843,9 +880,14 @@ jobs:
       - run: just check-web
 ```
 
+- `permissions: contents: read`: no job writes to the repository, so the token gets read access only.
+- Third-party actions are pinned to commit SHAs, tag in a comment: a tag can be moved to other code, a SHA cannot. `actions/*` stay on major tags.
+- `timeout-minutes: 20` per job: the default is 6 h, which a hung Playwright `webServer` would use up.
+- bun's package cache is cached on `bun.lock`. Playwright browsers are not cached: [Playwright advises against it](https://playwright.dev/docs/ci#caching-browsers), since restoring takes about as long as downloading and system dependencies cannot be cached anyway.
+
 Tool versions are pinned to the ones the plan was checked against: `install-action` installs the latest release otherwise, so a cargo-deny or nextest release could break CI with no change in the repo. `setup-node` puts Node 26 first on `PATH`; without it the runner's default Node (24 on `ubuntu-latest`, which is Ubuntu 26.04) would run Vite and Vitest.
 
-Action majors checked on 2026-11-24: `actions/checkout` v7, `actions/setup-node` v7, `Swatinem/rust-cache` v2, `taiki-e/install-action` v2, `oven-sh/setup-bun` v2.
+Action versions checked on 2026-11-24: `actions/checkout` v7, `actions/setup-node` v7, `actions/cache` v6, `Swatinem/rust-cache` v2.9.3, `taiki-e/install-action` v2.90.8, `oven-sh/setup-bun` v2.2.0.
 
 `rustup toolchain install` with no argument installs the toolchain named in `rust-toolchain.toml`, with its components.
 

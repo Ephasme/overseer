@@ -42,11 +42,11 @@ A parse failure is an error surfaced in the UI and logged, never coerced or igno
 
 ### Web client
 
-- Package manager and script runner: bun. `bun.lock` committed.
+- Package manager and script launcher: bun, version pinned by `packageManager`; `bun.lock` committed. The tools themselves (Vite, Vitest, `tsc`, Playwright) declare `#!/usr/bin/env node` and run on Node, pinned in `web/.node-version`.
 - Build: Vite 8, single-page app; no SSR, the server serves the static bundle.
 - React 19 with the React Compiler; no hand-written `useMemo`/`useCallback` for performance.
-- TypeScript 7 (native `tsc`), `strict` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. Type-checking is a gate step of its own; Vite does not type-check.
-- Lint and format: Biome 2, one `biome.json`, recommended rules as errors.
+- TypeScript 7 (native `tsc`), `strict` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. Type-checking is a gate step of its own; Vite does not type-check. Browser code and Node-side files (configs, Playwright specs) are separate programs, so Node globals never type-check in browser code.
+- Lint and format: Biome 2, one `biome.json`, recommended rules; the gate fails on warnings as well as errors.
 - Routing: TanStack Router, file-based, with typed search params.
 - Server state: TanStack Query, via the generated query hooks, for REST. SSE goes through one in-house `EventSource` hook that parses and folds events into session state; SSE data never goes through the Query cache.
 - Design system: shadcn/ui on Base UI, styled with Tailwind 4. Components are copied into `web/src/components/ui` by the shadcn CLI and owned by the repo.
@@ -75,6 +75,8 @@ GitHub Actions, one workflow, two jobs:
 
 - **rust**: the Rust gate plus store tests against Postgres in a service container.
 - **web**: OpenAPI drift check, Biome, `tsc`, Vitest, Playwright (needs the server binary, so it builds it).
+
+The token is read-only (`permissions: contents: read`), third-party actions are pinned to commit SHAs, and every job has a timeout.
 
 ## Consequences
 
