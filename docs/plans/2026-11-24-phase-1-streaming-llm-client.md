@@ -1840,3 +1840,15 @@ git commit -m "docs: send reasoning back only when the client asks for it"
 - `cargo nextest run -p overseer-core` reports 34 tests passed across 3 binaries: 17 in the library (2 finish-reason, 8 SSE, 7 request body), 10 fixture replays, 7 client tests.
 - Every provider shape in `tests/fixtures/llm/` replays to the documented completion, including at a 1-byte chunk size.
 - The client sends `Authorization` only when a key is set, and never puts the key in an error.
+
+---
+
+## As built: deviations from the steps above
+
+Executing the plan found three defects in its own decomposition, all the same kind: a module written before its caller is dead code, and the gate runs `-D dead_code`. The code is unchanged; the commits are ordered differently.
+
+- `FinishReason::parse` is `pub`, not `pub(crate)` (Task 1, and the note there explains why).
+- Task 3 built only the chunk structs in `wire.rs`, plus `assemble.rs` and the fixtures. The request builder (`request_body`, `message_json`, `tool_call_json`) and its seven tests moved into Task 4, next to the client that calls them.
+- Task 5's content (client, `llm_client.rs`, the dev-dependencies) merged into Task 4. The dev-dependencies `tokio` and `wiremock` were added in that same task, in both the workspace table and the crate, because `cargo shear` fails on an unused dependency of either kind.
+
+Commits as landed: vocabulary, SSE parser, assembler with fixtures, client with request builder, ADR amendment.

@@ -99,7 +99,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 
 - One OpenAI-compatible `/chat/completions` endpoint, streaming, with tool calls.
 - Tools: `bash`, `read_file`, `write_file`, `edit_file`. No sandbox, no approval step. Tool calls in one model reply run in order, one at a time.
-- Model reasoning is read from `reasoning_content` or `reasoning`, streamed as `reasoning_delta`, stored on `assistant_message`, and never sent back to the model.
+- Model reasoning is read from `reasoning_content` or `reasoning`, streamed as `reasoning_delta` and stored on `assistant_message`. It is sent back as `reasoning_content` only when the client's `send_reasoning` is set, off by default: `DeepSeek` answers HTTP 400 on a tool-carrying request that omits it ([Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)), while a provider that rejects unknown message fields fails with it on.
 
 ### bash tool
 
@@ -119,7 +119,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - After a crash during a tool call, the model is told the call may have partly run. Whether it did, nobody knows: the command's side effects are not tracked.
 - The model cannot `cd` or `export` across bash calls; it chains commands or passes `workdir`.
 - A server started outside a login shell (launchd, systemd) inherits a minimal `PATH`, and bash calls see the same.
-- Some providers require reasoning to be sent back during a tool-call loop. Against one of those, the request fails until sending it back is added.
+- `send_reasoning` off is the wrong setting for a `DeepSeek`-backed model: its second call in a tool loop fails with HTTP 400 until the flag is turned on. Which setting an endpoint needs is found by trying one tool turn against it, not by reading its documentation alone.
 - A release build needs the web client built first; CI builds `web/` before the `embed-web` binary.
 - SSE is one-way. Features that need client input during a turn (approvals, steering) go through extra POST routes. Moving to WebSocket replaces one route and leaves the agent core untouched.
 - A web client means no terminal UI in v0; debugging the loop alone goes through a headless CLI over the core crate.
