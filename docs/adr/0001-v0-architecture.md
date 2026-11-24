@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-24
+- Build status: phases 0–3 of the [v0 plan](../plans/2026-11-24-overseer-v0.md) are in — core crate, four tools, turn loop, CLI. `crates/server` and `crates/store` are stubs, so the HTTP, session-actor and storage sections are the accepted design, not shipped code.
 
 ## Context
 
@@ -13,7 +14,7 @@ overseer is a coding agent harness built from scratch. v0 must stream model outp
 
 One Rust server (tokio, axum) owns all state and runs the agent loop. A React + TypeScript web app (Vite) only displays state and sends commands. A turn keeps running when no client is connected.
 
-The agent loop lives in a crate with no HTTP or database dependency and emits events through a trait. Persistence and transport plug in behind it.
+The agent loop lives in a crate with no HTTP server or database dependency — it owns the model client, not the transport to clients — and emits events through a trait. Persistence and transport plug in behind it.
 
 ### Session actor
 
@@ -99,7 +100,21 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 
 - One OpenAI-compatible `/chat/completions` endpoint, streaming, with tool calls.
 - Tools: `bash`, `read_file`, `write_file`, `edit_file`. No sandbox, no approval step. Tool calls in one model reply run in order, one at a time.
+- Only `choices[0]` is read; a provider `refusal` delta is folded into the assistant text instead of getting an event of its own.
 - Model reasoning is read from `reasoning_content` or `reasoning`, streamed as `reasoning_delta` and stored on `assistant_message`. It is sent back as `reasoning_content` only when the client's `send_reasoning` is set, off by default: `DeepSeek` answers HTTP 400 on a tool-carrying request that omits it ([Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)), while a provider that rejects unknown message fields fails with it on.
+
+### Configuration
+
+`~/.config/overseer/config.toml`, or `OVERSEER_CONFIG` when set; with `HOME` unset it falls back to `overseer.toml` in the working directory:
+
+```toml
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-5.5"
+send_reasoning = false   # optional
+max_steps = 25           # optional
+```
+
+Unknown keys are rejected, so a typo fails at startup instead of being ignored. The API key never goes in this file: it is `OVERSEER_API_KEY`, falling back to `OPENROUTER_API_KEY` so a shell already set up for `OpenRouter` needs no extra variable. An empty value counts as unset, and no key at all is valid for a local endpoint that needs none.
 
 ### bash tool
 
@@ -113,7 +128,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 
 - `bash`: `command` (required), `workdir` (resolved against the session cwd), `timeout_seconds` (default 120, clamped to 1–600).
 - `read_file`: `path`, `start_line`, `end_line` (1-based, inclusive; the whole file by default). Output is numbered lines, capped like every tool output.
-- `write_file`: `path`, `content`; parent directories are created. The write goes through a temporary file renamed over the target, so a crash mid-write leaves the old contents, and an existing file keeps its permissions.
+- `write_file`: `path`, `content`; parent directories are created. The write goes through a temporary file renamed over the target, so a crash mid-write leaves the old contents, and an existing file keeps its permissions. A symlink is the exception: it is written through in place, because a rename would replace the link itself.
 - `edit_file`: `path`, `old_string`, `new_string`; `old_string` must occur exactly once, or the call fails without writing.
 - Unknown fields are rejected, so a model typo comes back as an error result instead of being silently ignored.
 - A registry can be confined to the session directory; path arguments (and `workdir`) that resolve outside it are then refused before the tool runs. Off by default, since v0 has no sandbox. The check is lexical and the root must be absolute: a symlink inside the directory that points outside it is not followed for this decision.
@@ -124,7 +139,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 ### Turn loop
 
 - A turn ends with exactly one `turn_end`, reason `done`, `cancelled`, `max_iterations` or `error`.
-- At most 25 model calls per turn; the 26th never happens.
+- At most `max_steps` model calls per turn, 25 unless the config overrides it; the call after the limit never happens.
 - Tool calls of one reply run in order, one at a time; every call gets a `tool_result`, including on a cancelled turn ("cancelled before running").
 - One cancellation token reaches the model stream and the running tool.
 - No compaction: a request the endpoint rejects for length ends the turn with `error`.
@@ -140,7 +155,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - The model cannot `cd` or `export` across bash calls; it chains commands or passes `workdir`.
 - A server started outside a login shell (launchd, systemd) inherits a minimal `PATH`, and bash calls see the same.
 - `send_reasoning` off is the wrong setting for a `DeepSeek`-backed model: its second call in a tool loop fails with HTTP 400 until the flag is turned on. Which setting an endpoint needs is found by trying one tool turn against it, not by reading its documentation alone.
-- A release build needs the web client built first; CI builds `web/` before the `embed-web` binary.
+- *(planned)* A release build needs the web client built first; CI builds `web/` before the `embed-web` binary.
 - SSE is one-way. Features that need client input during a turn (approvals, steering) go through extra POST routes. Moving to WebSocket replaces one route and leaves the agent core untouched.
 - A web client means no terminal UI in v0; debugging the loop alone goes through a headless CLI over the core crate.
 

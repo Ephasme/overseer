@@ -23,4 +23,4 @@ just smoke   # the CLI end to end against a scripted model, no key needed
 just mock    # the scripted model on its own
 ```
 
-Architecture: [ADR 0001](docs/adr/0001-v0-architecture.md), [ADR 0002](docs/adr/0002-toolchain-and-frontend-stack.md).
+Architecture: [ADR 0001](docs/adr/0001-v0-architecture.md), [ADR 0002](docs/adr/0002-toolchain-and-frontend-stack.md), [ADR 0003](docs/adr/0003-release-pipeline.md).
