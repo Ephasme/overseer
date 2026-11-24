@@ -1,0 +1,157 @@
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+
+use super::ToolOutcome;
+use super::cap::OutputBuffer;
+use super::paths::resolve;
+use super::registry::BashArgs;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Runs one `bash -c` in its own process group, streaming lines to `progress` while collecting at
+/// most [`super::OUTPUT_LIMIT`] bytes for the model.
+enum End {
+    Finished,
+    TimedOut,
+    Cancelled,
+}
+
+pub(crate) async fn run(
+    cwd: &Path,
+    args: BashArgs,
+    progress: &mut (dyn FnMut(&str) + Send),
+    cancel: &CancellationToken,
+) -> ToolOutcome {
+    let dir = args
+        .workdir
+        .as_deref()
+        .map_or_else(|| cwd.to_path_buf(), |workdir| resolve(cwd, workdir));
+    let timeout = timeout_for(args.timeout_seconds);
+
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        // The shell merges stderr into the stdout pipe, so the two interleave as the command wrote
+        // them; two pipes cannot preserve that order.
+        .arg(format!("exec 2>&1\n{}", args.command))
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Own process group, so a timeout or cancel kills the whole tree, not just bash.
+        .process_group(0)
+        .kill_on_drop(true);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return ToolOutcome::error(format!("cannot start bash: {error}")),
+    };
+    let group = child.id().map(|pid| Pid::from_raw(pid.cast_signed()));
+    let Some(stdout) = child.stdout.take() else {
+        return ToolOutcome::error("bash produced no stdout pipe");
+    };
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut output = OutputBuffer::default();
+
+    // The read future borrows `output` and `progress`; the block ends that borrow before the
+    // collected output is finished and returned.
+    let end = {
+        let read = read_lines(&mut lines, &mut output, progress);
+        tokio::pin!(read);
+        tokio::select! {
+            () = &mut read => End::Finished,
+            () = tokio::time::sleep(timeout) => End::TimedOut,
+            () = cancel.cancelled() => End::Cancelled,
+        }
+    };
+
+    if !matches!(end, End::Finished)
+        && let Some(group) = group
+    {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    let status = child.wait().await;
+    let output = output.finish();
+
+    match end {
+        End::TimedOut => ToolOutcome::error(with_output(
+            &output,
+            &format!(
+                "[timed out after {}s; process group killed]",
+                timeout.as_secs()
+            ),
+        )),
+        End::Cancelled => {
+            ToolOutcome::error(with_output(&output, "[cancelled; process group killed]"))
+        }
+        End::Finished => match status {
+            Ok(status) if status.success() => ToolOutcome::ok(with_output(&output, "")),
+            Ok(status) => ToolOutcome::error(with_output(
+                &output,
+                &format!("[exit status: {}]", status.code().unwrap_or(-1)),
+            )),
+            Err(error) => ToolOutcome::error(with_output(
+                &output,
+                &format!("[cannot collect exit status: {error}]"),
+            )),
+        },
+    }
+}
+
+async fn read_lines(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    output: &mut OutputBuffer,
+    progress: &mut (dyn FnMut(&str) + Send),
+) {
+    while let Ok(Some(line)) = lines.next_line().await {
+        progress(&line);
+        output.push(&line);
+        output.push("\n");
+    }
+}
+
+fn with_output(output: &str, note: &str) -> String {
+    match (output.is_empty(), note.is_empty()) {
+        (true, true) => "(no output)".to_owned(),
+        (true, false) => note.to_owned(),
+        (false, true) => output.to_owned(),
+        (false, false) => format!("{output}\n{note}"),
+    }
+}
+
+fn timeout_for(seconds: Option<u64>) -> Duration {
+    Duration::from_secs(
+        seconds
+            .unwrap_or(DEFAULT_TIMEOUT.as_secs())
+            .clamp(1, MAX_TIMEOUT.as_secs()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_TIMEOUT, MAX_TIMEOUT, timeout_for};
+
+    #[test]
+    fn default_timeout_is_two_minutes() {
+        assert_eq!(timeout_for(None), DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn requested_timeout_is_clamped_to_one_second_and_ten_minutes() {
+        assert_eq!(timeout_for(Some(0)).as_secs(), 1);
+        assert_eq!(timeout_for(Some(300)).as_secs(), 300);
+        assert_eq!(timeout_for(Some(99_999)), MAX_TIMEOUT);
+    }
+}
