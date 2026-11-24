@@ -120,6 +120,14 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - A call takes a progress sink, which receives each command line as it is printed (the `tool_progress` event, phase 5), and a cancellation token, which kills a running command's process group.
 - Unix only: the process group comes from `tokio::process::Command::process_group` and is killed with `nix::sys::signal::killpg`.
 
+### Turn loop
+
+- A turn ends with exactly one `turn_end`, reason `done`, `cancelled`, `max_iterations` or `error`.
+- At most 25 model calls per turn; the 26th never happens.
+- Tool calls of one reply run in order, one at a time; every call gets a `tool_result`, including on a cancelled turn ("cancelled before running").
+- One cancellation token reaches the model stream and the running tool.
+- No compaction: a request the endpoint rejects for length ends the turn with `error`.
+
 ## Consequences
 
 - **Anyone who can reach the port executes arbitrary commands as the user.** Localhost binding and Host/Origin filtering stop other machines and web pages, not other local users or processes. Any non-local exposure, or use on a shared machine, requires a new ADR adding authentication first.
