@@ -33,7 +33,7 @@ async fn offers_the_four_built_in_tools_with_schemas() {
         .iter()
         .map(|definition| definition.name.as_str())
         .collect();
-    assert_eq!(names, ["bash"]);
+    assert_eq!(names, ["bash", "read_file", "write_file", "edit_file"]);
     for definition in &definitions {
         assert_eq!(
             definition.parameters["type"], "object",
@@ -245,5 +245,97 @@ async fn bash_output_is_capped_with_a_marker() {
         outcome.output.contains("bytes omitted"),
         "{}",
         &outcome.output[..80]
+    );
+}
+
+#[tokio::test]
+async fn read_file_numbers_lines_and_selects_a_range() {
+    let (dir, registry) = registry();
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let whole = call(&registry, "read_file", json!({ "path": "a.txt" })).await;
+    assert_eq!(whole.output, "1\tone\n2\ttwo\n3\tthree\n");
+    let range = call(
+        &registry,
+        "read_file",
+        json!({ "path": "a.txt", "start_line": 2, "end_line": 3 }),
+    )
+    .await;
+    assert_eq!(range.output, "2\ttwo\n3\tthree\n");
+}
+
+#[tokio::test]
+async fn reading_a_missing_file_is_an_error_result() {
+    let (_dir, registry) = registry();
+    let outcome = call(&registry, "read_file", json!({ "path": "nope.txt" })).await;
+    assert!(!outcome.ok);
+    assert!(outcome.output.contains("cannot read"), "{}", outcome.output);
+}
+
+#[tokio::test]
+async fn write_file_creates_parent_directories() {
+    let (dir, registry) = registry();
+    let outcome = call(
+        &registry,
+        "write_file",
+        json!({ "path": "a/b/c.txt", "content": "hi" }),
+    )
+    .await;
+    assert!(outcome.ok, "{}", outcome.output);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
+        "hi"
+    );
+    assert!(
+        outcome.output.contains("wrote 2 bytes"),
+        "{}",
+        outcome.output
+    );
+}
+
+#[tokio::test]
+async fn edit_file_replaces_one_exact_occurrence() {
+    let (dir, registry) = registry();
+    std::fs::write(dir.path().join("a.txt"), "let x = 1;\nlet y = 2;\n").unwrap();
+    let outcome = call(
+        &registry,
+        "edit_file",
+        json!({ "path": "a.txt", "old_string": "let y = 2;", "new_string": "let y = 3;" }),
+    )
+    .await;
+    assert!(outcome.ok, "{}", outcome.output);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "let x = 1;\nlet y = 3;\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_refuses_a_missing_or_ambiguous_match() {
+    let (dir, registry) = registry();
+    std::fs::write(dir.path().join("a.txt"), "same\nsame\n").unwrap();
+    let missing = call(
+        &registry,
+        "edit_file",
+        json!({ "path": "a.txt", "old_string": "other", "new_string": "x" }),
+    )
+    .await;
+    assert!(!missing.ok);
+    assert!(missing.output.contains("not found"), "{}", missing.output);
+    let ambiguous = call(
+        &registry,
+        "edit_file",
+        json!({ "path": "a.txt", "old_string": "same", "new_string": "x" }),
+    )
+    .await;
+    assert!(!ambiguous.ok);
+    assert!(
+        ambiguous.output.contains("appears 2 times"),
+        "{}",
+        ambiguous.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "same\nsame\n",
+        "a refused edit writes nothing"
     );
 }

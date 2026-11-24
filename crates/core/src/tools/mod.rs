@@ -6,6 +6,7 @@
 
 mod bash;
 mod cap;
+mod files;
 mod paths;
 mod registry;
 
