@@ -71,3 +71,7 @@ mock:
 # End to end: CLI against the fake model, no key, no network.
 smoke:
     bash scripts/smoke.sh
+
+# Optimized binaries, as CI ships them.
+release:
+    cargo build --release --locked -p overseer-cli -p overseer-fake-llm
