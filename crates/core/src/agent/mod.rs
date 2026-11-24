@@ -45,7 +45,10 @@ pub fn default_system_prompt(cwd: &Path) -> String {
 enum Reply {
     Done(Completion),
     /// The caller cancelled mid-stream; `text` and `reasoning` are what had arrived.
-    Cancelled { text: String, reasoning: String },
+    Cancelled {
+        text: String,
+        reasoning: String,
+    },
 }
 
 /// One conversation with one model and one tool registry.

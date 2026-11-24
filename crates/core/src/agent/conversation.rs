@@ -102,14 +102,21 @@ mod tests {
         assert_eq!(
             conversation.messages(),
             [
-                Message::System { content: "sys".into() },
-                Message::User { content: "hi".into() },
+                Message::System {
+                    content: "sys".into()
+                },
+                Message::User {
+                    content: "hi".into()
+                },
                 Message::Assistant {
                     content: String::new(),
                     reasoning: Some("think".into()),
                     tool_calls: vec![tool_call()],
                 },
-                Message::Tool { tool_call_id: "call_1".into(), content: "a.rs".into() },
+                Message::Tool {
+                    tool_call_id: "call_1".into(),
+                    content: "a.rs".into()
+                },
             ]
         );
     }
@@ -119,9 +126,16 @@ mod tests {
         let mut conversation = Conversation::new("sys");
         conversation.push(AgentEvent::TextDelta("x".into()));
         conversation.push(AgentEvent::ReasoningDelta("y".into()));
-        conversation.push(AgentEvent::ToolProgress { call_id: "c".into(), line: "z".into() });
-        conversation.push(AgentEvent::TurnEnd { reason: TurnEndReason::Done });
-        conversation.push(AgentEvent::Error { message: "boom".into() });
+        conversation.push(AgentEvent::ToolProgress {
+            call_id: "c".into(),
+            line: "z".into(),
+        });
+        conversation.push(AgentEvent::TurnEnd {
+            reason: TurnEndReason::Done,
+        });
+        conversation.push(AgentEvent::Error {
+            message: "boom".into(),
+        });
         assert_eq!(conversation.messages().len(), 1);
     }
 
@@ -135,12 +149,17 @@ mod tests {
                 tool_calls: vec![],
                 interrupted: false,
             },
-            AgentEvent::TurnEnd { reason: TurnEndReason::Done },
+            AgentEvent::TurnEnd {
+                reason: TurnEndReason::Done,
+            },
         ];
         let mut live = Conversation::new("sys");
         for event in &events {
             live.push(event.clone());
         }
-        assert_eq!(Conversation::from_events("sys", &events).messages(), live.messages());
+        assert_eq!(
+            Conversation::from_events("sys", &events).messages(),
+            live.messages()
+        );
     }
 }
