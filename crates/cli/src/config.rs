@@ -23,13 +23,21 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
     }
 
-    /// The model's API key, from the environment; absent is a valid configuration for a local
-    /// endpoint that needs none.
+    /// The model's API key. `OVERSEER_API_KEY` wins, `OPENROUTER_API_KEY` is the fallback, so a
+    /// shell already set up for `OpenRouter` needs no extra variable. Absent is a valid configuration
+    /// for a local endpoint that needs none.
     #[must_use]
     pub fn api_key() -> Option<String> {
-        std::env::var("OVERSEER_API_KEY")
-            .ok()
+        Self::api_key_from(
+            std::env::var("OVERSEER_API_KEY").ok(),
+            std::env::var("OPENROUTER_API_KEY").ok(),
+        )
+    }
+
+    fn api_key_from(primary: Option<String>, fallback: Option<String>) -> Option<String> {
+        primary
             .filter(|key| !key.is_empty())
+            .or_else(|| fallback.filter(|key| !key.is_empty()))
     }
 
     /// `OVERSEER_CONFIG` if set, otherwise `~/.config/overseer/config.toml`.
@@ -69,5 +77,16 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "base_url = \"u\"\nmodel = \"m\"\nextra = 1\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn the_openrouter_key_is_the_fallback() {
+        let key = |primary: Option<&str>, fallback: Option<&str>| {
+            Config::api_key_from(primary.map(str::to_owned), fallback.map(str::to_owned))
+        };
+        assert_eq!(key(Some("a"), Some("b")).as_deref(), Some("a"));
+        assert_eq!(key(None, Some("b")).as_deref(), Some("b"));
+        assert_eq!(key(Some(""), Some("b")).as_deref(), Some("b"));
+        assert_eq!(key(None, None), None);
     }
 }
