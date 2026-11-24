@@ -117,11 +117,30 @@ fn build_command(dir: &Path, command_text: &str) -> Command {
         .env("PAGER", "cat")
         .env("GIT_PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("OVERSEER_API_KEY")
         // Own process group, so a timeout or cancel kills the whole tree, not just bash.
         .process_group(0)
         .kill_on_drop(true);
+    strip_harness_env(&mut command, harness_env_names());
     command
+}
+
+fn strip_harness_env(command: &mut Command, names: impl IntoIterator<Item = String>) {
+    for name in names {
+        command.env_remove(name);
+    }
+}
+
+/// The harness's own configuration, which a command must not be able to read: every variable
+/// starting with `OVERSEER_` that this process holds.
+fn harness_env_names() -> Vec<String> {
+    std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| is_harness_var(name))
+        .collect()
+}
+
+fn is_harness_var(name: &str) -> bool {
+    name.starts_with("OVERSEER_")
 }
 
 async fn read_lines(
@@ -157,16 +176,37 @@ fn timeout_for(seconds: Option<u64>) -> Duration {
 mod tests {
     use std::path::Path;
 
-    use super::{DEFAULT_TIMEOUT, MAX_TIMEOUT, build_command, timeout_for};
+    use super::{
+        DEFAULT_TIMEOUT, MAX_TIMEOUT, build_command, is_harness_var, strip_harness_env, timeout_for,
+    };
+
+    #[test]
+    fn only_harness_variables_are_stripped() {
+        assert!(is_harness_var("OVERSEER_API_KEY"));
+        assert!(is_harness_var("OVERSEER_CONFIG"));
+        assert!(!is_harness_var("OVERSEER"));
+        assert!(!is_harness_var("PATH"));
+        assert!(!is_harness_var("GITHUB_TOKEN"));
+    }
 
     #[test]
     fn the_harness_api_key_is_not_in_the_command_environment() {
-        let command = build_command(Path::new("/tmp"), "true");
-        let removed = command
+        use tokio::process::Command;
+
+        let mut probe = Command::new("bash");
+        strip_harness_env(&mut probe, ["OVERSEER_API_KEY".to_owned()]);
+        let removed = probe
             .as_std()
             .get_envs()
             .any(|(name, value)| name == "OVERSEER_API_KEY" && value.is_none());
         assert!(removed, "OVERSEER_API_KEY must be removed, not inherited");
+
+        let built = build_command(Path::new("/tmp"), "true");
+        let leaked = built
+            .as_std()
+            .get_envs()
+            .any(|(name, _)| is_harness_var(&name.to_string_lossy()));
+        assert!(!leaked, "no OVERSEER_ variable may survive");
     }
 
     #[test]
