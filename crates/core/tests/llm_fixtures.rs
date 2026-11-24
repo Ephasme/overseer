@@ -202,3 +202,47 @@ fn malformed_chunk_is_a_decode_error() {
     let error = assembler.apply("{not json").unwrap_err();
     assert!(matches!(error, LlmError::Decode { .. }), "{error:?}");
 }
+
+/// A one-byte chunking crosses every byte boundary there is, so any two-chunk split must replay
+/// to the same events.
+#[test]
+fn every_fixture_replays_identically_at_one_byte_chunks() {
+    for name in [
+        "text.sse",
+        "tool_calls.sse",
+        "reasoning_deepseek.sse",
+        "reasoning_openrouter.sse",
+        "no_done.sse",
+    ] {
+        let whole = replay(name, usize::MAX);
+        let bytewise = replay(name, 1);
+        assert_eq!(bytewise.0, whole.0, "{name}: events differ");
+        assert_eq!(
+            bytewise.1.is_some(),
+            whole.1.is_some(),
+            "{name}: error presence differs"
+        );
+    }
+}
+
+#[test]
+fn garbage_input_never_panics() {
+    let mut assembler = Assembler::default();
+    for data in [
+        "",
+        "{",
+        "[]",
+        "null",
+        "{\"choices\":null}",
+        "{\"choices\":[{\"delta\":null}]}",
+        "{\"error\":\"x\"}",
+        "not json at all",
+    ] {
+        let _ = assembler.apply(data);
+    }
+    let mut parser = SseParser::default();
+    for byte in 0..=255u8 {
+        let _ = parser.push(&[byte; 32]);
+    }
+    let _ = parser.finish();
+}

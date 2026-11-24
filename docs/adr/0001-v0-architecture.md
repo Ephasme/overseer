@@ -106,7 +106,7 @@ Every mutating route takes a JSON body. A cross-origin page can only send one af
 - A fresh `bash -c <command>` per call, in its own process group, cwd = session cwd or the call's optional `workdir` (resolved against it). No state carries over between calls.
 - Not a login shell; environment inherited from the server, plus `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`. stdin is `/dev/null`. Every variable whose name starts with `OVERSEER_` is removed first: the model must not be able to read the harness's own configuration.
 - stdout and stderr share one pipe, so their interleaving is preserved. Lines are broadcast as `tool_progress` while the command runs.
-- Timeout 120 s by default, overridable per call up to 600 s. Timeout and cancel kill the whole process group.
+- Timeout 120 s by default, overridable per call up to 600 s. Timeout, cancel and dropping the call all kill the whole process group.
 - Output returned to the model is capped at 30 KB, keeping head and tail around a marker giving the number of bytes dropped.
 
 ### Tool arguments

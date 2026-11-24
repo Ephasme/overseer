@@ -43,6 +43,7 @@ pub(crate) async fn run(
         Err(error) => return ToolOutcome::error(format!("cannot start bash: {error}")),
     };
     let group = child.id().map(|pid| Pid::from_raw(pid.cast_signed()));
+    let mut guard = GroupGuard(group);
     let Some(stdout) = child.stdout.take() else {
         return ToolOutcome::error("bash produced no stdout pipe");
     };
@@ -74,6 +75,9 @@ pub(crate) async fn run(
         .await;
     }
     let status = child.wait().await;
+    // The command finished under its own control: children it left behind are its business, not
+    // the harness's. Dropping this future instead skips this line, and the guard kills the group.
+    guard.disarm();
     let output = output.finish();
 
     match end {
@@ -141,6 +145,25 @@ fn harness_env_names() -> Vec<String> {
 
 fn is_harness_var(name: &str) -> bool {
     name.starts_with("OVERSEER_")
+}
+
+/// Kills the command's process group if dropped while still armed — the path taken when the caller
+/// drops the tool future instead of cancelling through the token. Disarmed once the command has
+/// been reaped, so children a finished command left behind survive as before.
+struct GroupGuard(Option<Pid>);
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+    }
 }
 
 async fn read_lines(
