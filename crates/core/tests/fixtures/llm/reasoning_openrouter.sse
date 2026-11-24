@@ -1,0 +1,12 @@
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"anthropic/claude","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Think first.","reasoning_details":[{"type":"reasoning.text","text":"Think first.","format":"anthropic-claude-v1","index":0}]},"finish_reason":null}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"anthropic/claude","choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop","native_finish_reason":"end_turn"}]}
+
+data: {"id":"gen-1","object":"chat.completion.chunk","created":1,"model":"anthropic/claude","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}
+
+data: [DONE]
+

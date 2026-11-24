@@ -1,0 +1,2 @@
+data: {"id":"c4","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Cut"},"finish_reason":null}]}
+
