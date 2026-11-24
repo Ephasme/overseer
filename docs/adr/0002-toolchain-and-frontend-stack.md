@@ -56,7 +56,13 @@ A parse failure is an error surfaced in the UI and logged, never coerced or igno
 
 - Rust: unit and integration tests under nextest. Store tests run on in-memory SQLite and, when `TEST_DATABASE_URL` is set, on Postgres.
 - Web unit tests: Vitest + Testing Library. The SSE reducer and the tool-call cards are tested directly.
-- End-to-end: Playwright against the real server binary, with a mock LLM endpoint serving recorded SSE streams; no network, no real model.
+- End-to-end: Playwright against the real server binary, pointed at the fake model below; no network, no real model.
+
+### Test harness for the client
+
+- **Fake model.** A scripted OpenAI-compatible `/chat/completions` endpoint, a binary of the workspace, replays scenario files (plain reply, reasoning, tool calls, long bash output, provider error, slow stream). The real server, session actors, SSE and database run unchanged against it: only the model is fake, so the client always speaks the real protocol and there is no second API implementation to drift.
+- **`just dev-mock`** starts the server on the fake model, plus Vite, for manual work on the UI. Playwright uses the same scenarios.
+- **Storybook** shows each UI state with no backend: streaming text, tool card running, failed or truncated, reconnecting, interrupted session. A story is fed a fixture event log typed by the generated schemas, and every story also runs as a Vitest component test.
 
 ### Task runner and gate
 
