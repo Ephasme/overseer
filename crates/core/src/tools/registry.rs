@@ -94,8 +94,11 @@ impl ToolRegistry {
     }
 
     /// Runs one call. `progress` receives the command's lines as they arrive (bash only); `cancel`
-    /// kills a running command. Never returns an error: a failure is a `ToolOutcome` with `ok`
-    /// false.
+    /// kills a running command's process group. Never returns an error: a failure is a
+    /// `ToolOutcome` with `ok` false.
+    ///
+    /// Cancel through `cancel`, not by dropping this future: dropping kills the `bash` process but
+    /// not the children it started.
     pub async fn call(
         &self,
         name: &str,

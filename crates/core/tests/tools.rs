@@ -1,9 +1,10 @@
 //! Drives the registry the way the agent loop will: name, JSON arguments, a progress sink, a
 //! cancellation token.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use overseer_core::tools::{ToolOutcome, ToolRegistry};
+use overseer_core::tools::{OUTPUT_LIMIT, ToolOutcome, ToolRegistry};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -337,5 +338,27 @@ async fn edit_file_refuses_a_missing_or_ambiguous_match() {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "same\nsame\n",
         "a refused edit writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn reading_a_huge_file_stays_bounded() {
+    let (dir, registry) = registry();
+    let mut text = String::new();
+    for line in 0..40_000 {
+        writeln!(text, "line {line} with enough text to matter").expect("writing to a String");
+    }
+    std::fs::write(dir.path().join("big.txt"), &text).unwrap();
+    let outcome = call(&registry, "read_file", json!({ "path": "big.txt" })).await;
+    assert!(outcome.ok, "{}", outcome.output);
+    assert!(
+        outcome.output.len() <= OUTPUT_LIMIT + 64,
+        "{}",
+        outcome.output.len()
+    );
+    assert!(outcome.output.starts_with("    1\tline 0"), "head kept");
+    assert!(
+        outcome.output.contains("bytes omitted"),
+        "tail marker present"
     );
 }

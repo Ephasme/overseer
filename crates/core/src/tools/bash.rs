@@ -36,22 +36,7 @@ pub(crate) async fn run(
         .map_or_else(|| cwd.to_path_buf(), |workdir| resolve(cwd, workdir));
     let timeout = timeout_for(args.timeout_seconds);
 
-    let mut command = Command::new("bash");
-    command
-        .arg("-c")
-        // The shell merges stderr into the stdout pipe, so the two interleave as the command wrote
-        // them; two pipes cannot preserve that order.
-        .arg(format!("exec 2>&1\n{}", args.command))
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env("PAGER", "cat")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        // Own process group, so a timeout or cancel kills the whole tree, not just bash.
-        .process_group(0)
-        .kill_on_drop(true);
+    let mut command = build_command(&dir, &args.command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -77,10 +62,16 @@ pub(crate) async fn run(
         }
     };
 
-    if !matches!(end, End::Finished)
-        && let Some(group) = group
-    {
-        let _ = killpg(group, Signal::SIGKILL);
+    if !matches!(end, End::Finished) {
+        if let Some(group) = group {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+        // Whatever the command wrote before the kill is still in the pipe: read it, bounded.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_lines(&mut lines, &mut output, progress),
+        )
+        .await;
     }
     let status = child.wait().await;
     let output = output.finish();
@@ -108,6 +99,29 @@ pub(crate) async fn run(
             )),
         },
     }
+}
+
+/// The command the model's text runs in. `OVERSEER_API_KEY` is removed: the model must not be
+/// able to read the harness's own credential out of the environment.
+fn build_command(dir: &Path, command_text: &str) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        // The shell merges stderr into the stdout pipe, so the two interleave as the command wrote
+        // them; two pipes cannot preserve that order.
+        .arg(format!("exec 2>&1\n{command_text}"))
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("OVERSEER_API_KEY")
+        // Own process group, so a timeout or cancel kills the whole tree, not just bash.
+        .process_group(0)
+        .kill_on_drop(true);
+    command
 }
 
 async fn read_lines(
@@ -141,7 +155,19 @@ fn timeout_for(seconds: Option<u64>) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TIMEOUT, MAX_TIMEOUT, timeout_for};
+    use std::path::Path;
+
+    use super::{DEFAULT_TIMEOUT, MAX_TIMEOUT, build_command, timeout_for};
+
+    #[test]
+    fn the_harness_api_key_is_not_in_the_command_environment() {
+        let command = build_command(Path::new("/tmp"), "true");
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(name, value)| name == "OVERSEER_API_KEY" && value.is_none());
+        assert!(removed, "OVERSEER_API_KEY must be removed, not inherited");
+    }
 
     #[test]
     fn default_timeout_is_two_minutes() {

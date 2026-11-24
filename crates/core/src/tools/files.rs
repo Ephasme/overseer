@@ -4,7 +4,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::ToolOutcome;
-use super::cap::cap_output;
+use super::cap::OutputBuffer;
 use super::paths::resolve;
 use super::registry::{EditArgs, ReadArgs, WriteArgs};
 
@@ -13,11 +13,7 @@ pub(crate) async fn read(cwd: &Path, args: ReadArgs) -> ToolOutcome {
     match fs::read(&path).await {
         Ok(bytes) => {
             let text = String::from_utf8_lossy(&bytes);
-            ToolOutcome::ok(cap_output(&number_lines(
-                &text,
-                args.start_line,
-                args.end_line,
-            )))
+            ToolOutcome::ok(number_lines(&text, args.start_line, args.end_line))
         }
         Err(error) => ToolOutcome::error(format!("cannot read {}: {error}", path.display())),
     }
@@ -73,7 +69,9 @@ pub(crate) async fn edit(cwd: &Path, args: EditArgs) -> ToolOutcome {
     }
 }
 
-/// Numbers the selected lines `  12\ttext`, padding to the width of the last line number.
+/// Numbers the selected lines `  12\ttext`, padding to the width of the last line number. Writes
+/// through [`OutputBuffer`], so a huge file costs bounded memory even though its lines are all
+/// visited.
 fn number_lines(text: &str, start: Option<usize>, end: Option<usize>) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -86,12 +84,19 @@ fn number_lines(text: &str, start: Option<usize>, end: Option<usize>) -> String 
         return format!("[no lines: start_line {first} is after end_line {last}]");
     }
     let width = last.to_string().len();
-    let mut out = String::new();
+    let mut out = OutputBuffer::default();
     for (offset, line) in lines[first - 1..last].iter().enumerate() {
-        writeln!(out, "{:>width$}\t{line}", first + offset, width = width)
-            .expect("writing to a String cannot fail");
+        let mut numbered = String::new();
+        writeln!(
+            numbered,
+            "{:>width$}\t{line}",
+            first + offset,
+            width = width
+        )
+        .expect("writing to a String cannot fail");
+        out.push(&numbered);
     }
-    out
+    out.finish()
 }
 
 #[cfg(test)]
