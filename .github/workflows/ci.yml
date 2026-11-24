@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.58,cargo-nextest@0.9.151,cargo-shear@1.14.1,cargo-deny@0.20.2
+      - run: just check-rust
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: web/.node-version
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: web/package.json
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.58
+      - run: just web-install
+      - name: Install Playwright system dependencies
+        working-directory: web
+        run: bunx playwright install-deps chromium
+      - run: just web-e2e-install
+      - run: just check-web
