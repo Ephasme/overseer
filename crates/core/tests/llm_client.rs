@@ -49,6 +49,7 @@ async fn posts_a_streaming_request_with_auth_and_returns_the_completion() {
         .and(path("/v1/chat/completions"))
         .and(header("authorization", "Bearer sk-test"))
         .and(header("accept", "text/event-stream"))
+        .and(header("x-title", "overseer"))
         .and(body_partial_json(json!({
             "model": "test-model",
             "stream": true,

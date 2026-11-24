@@ -76,6 +76,8 @@ impl Client {
             .http
             .post(&self.url)
             .header(reqwest::header::ACCEPT, "text/event-stream")
+            // OpenRouter uses this for app attribution; other OpenAI-compatible endpoints ignore it.
+            .header("x-title", "overseer")
             .json(&body);
         if let Some(key) = &self.config.api_key {
             builder = builder.bearer_auth(key);
