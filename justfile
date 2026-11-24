@@ -62,3 +62,12 @@ hooks:
 # Capture one real streamed completion as a fixture.
 record name prompt:
     python3 scripts/record.py {{name}} {{prompt}}
+
+# Scripted model, for working without a key.
+mock:
+    cargo build -p overseer-fake-llm
+    target/debug/overseer-fake-llm
+
+# End to end: CLI against the fake model, no key, no network.
+smoke:
+    bash scripts/smoke.sh
