@@ -1,0 +1,10 @@
+data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":"Compare 9.11"},"finish_reason":null}]}
+
+data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":null,"reasoning_content":" and 9.8."},"finish_reason":null}]}
+
+data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":"9.8 is greater.","reasoning_content":null},"finish_reason":null}]}
+
+data: {"id":"c3","object":"chat.completion.chunk","created":1,"model":"deepseek-flash","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19}}
+
+data: [DONE]
+
