@@ -108,6 +108,7 @@ impl Agent {
                             text,
                             reasoning: (!reasoning.is_empty()).then_some(reasoning),
                             tool_calls: Vec::new(),
+                            usage: None,
                             interrupted: true,
                         },
                     );
@@ -125,6 +126,7 @@ impl Agent {
                     text: reply.content,
                     reasoning: reply.reasoning,
                     tool_calls: calls.clone(),
+                    usage: reply.usage,
                     interrupted: false,
                 },
             );

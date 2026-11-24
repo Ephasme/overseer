@@ -1,4 +1,4 @@
-use crate::llm::ToolCall;
+use crate::llm::{ToolCall, Usage};
 
 /// Why a turn stopped. The turn always ends with exactly one `TurnEnd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub enum AgentEvent {
         text: String,
         reasoning: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Token usage the endpoint reported for this reply, when it reported any.
+        usage: Option<Usage>,
         /// True when the turn was cancelled mid-reply; `text` is then what had arrived.
         interrupted: bool,
     },

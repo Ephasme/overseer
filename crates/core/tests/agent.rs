@@ -128,6 +128,15 @@ async fn a_plain_answer_ends_the_turn_after_one_model_call() {
         Some(&AgentEvent::UserMessage { text: "hi".into() })
     );
     assert_eq!(assistant_messages(&events), [("Hello, world", false)]);
+    let usage = events.iter().find_map(|event| match event {
+        AgentEvent::AssistantMessage { usage, .. } => *usage,
+        _ => None,
+    });
+    assert_eq!(
+        usage.map(|usage| (usage.prompt_tokens, usage.completion_tokens)),
+        Some((12, 3)),
+        "the endpoint's usage reaches the event"
+    );
     assert_eq!(tool_results(&events), Vec::new());
     let bodies = request_bodies(&server).await;
     assert_eq!(bodies.len(), 1);
@@ -274,4 +283,54 @@ async fn cancelling_during_a_tool_kills_it_and_records_its_result() {
     assert_eq!(results.len(), 1);
     assert!(!results[0].1);
     assert!(results[0].2.contains("cancelled"), "{}", results[0].2);
+}
+
+/// A model that sends one text delta and then stalls, so the turn can be cancelled mid-stream.
+async fn slow_chunk_server() -> String {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket
+            .write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Partial\"},\"finish_reason\":null}]}\n\n")
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn cancelling_mid_stream_keeps_the_partial_reply() {
+    let base_url = slow_chunk_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::new(ClientConfig::new(base_url, "m")).unwrap();
+    let mut agent = Agent::new(
+        client,
+        ToolRegistry::new(dir.path()),
+        AgentConfig::new("be brief"),
+    );
+
+    let cancel = CancellationToken::new();
+    let mut events = Vec::new();
+    let mut turn = Box::pin(agent.run_turn("hi", &mut events, &cancel));
+    tokio::select! {
+        reason = &mut turn => panic!("turn finished before the cancel: {reason:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(300)) => cancel.cancel(),
+    }
+    assert_eq!(turn.await, TurnEndReason::Cancelled);
+    assert_eq!(
+        assistant_messages(&events),
+        [("Partial", true)],
+        "the partial reply is recorded as interrupted"
+    );
 }
