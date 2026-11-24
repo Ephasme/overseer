@@ -256,3 +256,12 @@ async fn only_request_body(server: &MockServer) -> Value {
     assert_eq!(requests.len(), 1);
     requests[0].body_json().unwrap()
 }
+
+#[test]
+fn debug_never_prints_the_api_key() {
+    let mut config = ClientConfig::new("https://example.test/v1", "m");
+    config.api_key = Some("sk-secret-value".into());
+    let rendered = format!("{config:?}");
+    assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+}

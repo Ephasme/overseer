@@ -9,7 +9,7 @@ use super::wire::request_body;
 /// Longest prefix of an error response body kept in `LlmError::Status`.
 const ERROR_BODY_LIMIT: usize = 2048;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Endpoint root, for example `https://openrouter.ai/api/v1`; `/chat/completions` is appended.
     pub base_url: String,
@@ -22,6 +22,20 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Longest wait for the next bytes of a response, headers included.
     pub read_timeout: Duration,
+}
+
+/// Redacted on purpose: `Client` derives `Debug`, and a key in a log line is a leaked key.
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("send_reasoning", &self.send_reasoning)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -99,6 +113,11 @@ pub struct ChatStream {
 }
 
 impl ChatStream {
+    /// Next event, `None` once the stream is spent.
+    ///
+    /// Not cancellation-safe mid-await: dropping this future while it waits for bytes can drop the
+    /// chunk that was in flight. Cancel a call by dropping the whole `ChatStream`, which aborts the
+    /// request.
     pub async fn next(&mut self) -> Option<Result<LlmEvent, LlmError>> {
         loop {
             if let Some(event) = self.pending.pop_front() {

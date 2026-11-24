@@ -4,6 +4,9 @@
 /// `: OPENROUTER PROCESSING` keep-alives) and other fields are dropped. Bytes are
 /// buffered until a full line is available, so a chunk boundary inside a line,
 /// inside a `\r\n`, or inside a multi-byte UTF-8 character is harmless.
+///
+/// The buffer grows until a newline arrives, with no cap: an endpoint that streams bytes without
+/// ever ending a line grows memory for as long as it keeps sending.
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
