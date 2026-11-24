@@ -107,7 +107,7 @@ impl Store {
         }
     }
 
-    /// Every session id, unordered.
+    /// Every session id, in order of first event.
     ///
     /// # Errors
     ///
