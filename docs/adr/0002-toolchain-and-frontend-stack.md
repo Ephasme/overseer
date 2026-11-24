@@ -42,11 +42,11 @@ A parse failure is an error surfaced in the UI and logged, never coerced or igno
 
 ### Web client
 
-- Package manager and script runner: bun. `bun.lock` committed.
+- Package manager and script launcher: bun, version pinned by `packageManager`; `bun.lock` committed. The tools themselves (Vite, Vitest, `tsc`, Playwright) declare `#!/usr/bin/env node` and run on Node, pinned in `web/.node-version`.
 - Build: Vite 8, single-page app; no SSR, the server serves the static bundle.
 - React 19 with the React Compiler; no hand-written `useMemo`/`useCallback` for performance.
-- TypeScript 7 (native `tsc`), `strict` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. Type-checking is a gate step of its own; Vite does not type-check.
-- Lint and format: Biome 2, one `biome.json`, recommended rules as errors.
+- TypeScript 7 (native `tsc`), `strict` plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. Type-checking is a gate step of its own; Vite does not type-check. Browser code and Node-side files (configs, Playwright specs) are separate programs, so Node globals never type-check in browser code.
+- Lint and format: Biome 2, one `biome.json`, recommended rules; the gate fails on warnings as well as errors.
 - Routing: TanStack Router, file-based, with typed search params.
 - Server state: TanStack Query, via the generated query hooks, for REST. SSE goes through one in-house `EventSource` hook that parses and folds events into session state; SSE data never goes through the Query cache.
 - Design system: shadcn/ui on Base UI, styled with Tailwind 4. Components are copied into `web/src/components/ui` by the shadcn CLI and owned by the repo.
@@ -56,7 +56,13 @@ A parse failure is an error surfaced in the UI and logged, never coerced or igno
 
 - Rust: unit and integration tests under nextest. Store tests run on in-memory SQLite and, when `TEST_DATABASE_URL` is set, on Postgres.
 - Web unit tests: Vitest + Testing Library. The SSE reducer and the tool-call cards are tested directly.
-- End-to-end: Playwright against the real server binary, with a mock LLM endpoint serving recorded SSE streams; no network, no real model.
+- End-to-end: Playwright against the real server binary, pointed at the fake model below; no network, no real model.
+
+### Test harness for the client
+
+- **Fake model.** A scripted OpenAI-compatible `/chat/completions` endpoint, a binary of the workspace, replays scenario files (plain reply, reasoning, tool calls, long bash output, provider error, slow stream). The real server, session actors, SSE and database run unchanged against it: only the model is fake, so the client always speaks the real protocol and there is no second API implementation to drift.
+- **`just dev-mock`** starts the server on the fake model, plus Vite, for manual work on the UI. Playwright uses the same scenarios.
+- **Storybook** shows each UI state with no backend: streaming text, tool card running, failed or truncated, reconnecting, interrupted session. A story is fed a fixture event log typed by the generated schemas, and every story also runs as a Vitest component test.
 
 ### Task runner and gate
 
@@ -69,6 +75,8 @@ GitHub Actions, one workflow, two jobs:
 
 - **rust**: the Rust gate plus store tests against Postgres in a service container.
 - **web**: OpenAPI drift check, Biome, `tsc`, Vitest, Playwright (needs the server binary, so it builds it).
+
+The token is read-only (`permissions: contents: read`), third-party actions are pinned to commit SHAs, and every job has a timeout.
 
 ## Consequences
 
