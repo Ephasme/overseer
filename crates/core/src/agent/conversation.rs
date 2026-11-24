@@ -92,6 +92,7 @@ mod tests {
             text: String::new(),
             reasoning: Some("think".into()),
             tool_calls: vec![tool_call()],
+            usage: None,
             interrupted: false,
         });
         conversation.push(AgentEvent::ToolResult {
@@ -147,6 +148,7 @@ mod tests {
                 text: "hello".into(),
                 reasoning: None,
                 tool_calls: vec![],
+                usage: None,
                 interrupted: false,
             },
             AgentEvent::TurnEnd {

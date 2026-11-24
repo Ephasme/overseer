@@ -401,3 +401,56 @@ async fn dropping_the_call_kills_the_process_group() {
     }
     assert!(gone, "process group {pid} survived the drop");
 }
+
+#[tokio::test]
+async fn confinement_refuses_paths_outside_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(dir.path()).confined();
+
+    let escape = call(
+        &registry,
+        "write_file",
+        json!({ "path": "../escape.txt", "content": "x" }),
+    )
+    .await;
+    assert!(!escape.ok);
+    assert!(escape.output.contains("outside"), "{}", escape.output);
+    assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
+
+    let inside = call(
+        &registry,
+        "write_file",
+        json!({ "path": "sub/../ok.txt", "content": "x" }),
+    )
+    .await;
+    assert!(inside.ok, "{}", inside.output);
+    assert!(dir.path().join("ok.txt").exists());
+
+    let workdir = call(
+        &registry,
+        "bash",
+        json!({ "command": "pwd", "workdir": "../.." }),
+    )
+    .await;
+    assert!(!workdir.ok, "{}", workdir.output);
+}
+
+/// The schemas are the model-facing contract: pin the property names so an edit cannot silently
+/// rename one and change what the model is told.
+#[tokio::test]
+async fn tool_schemas_pin_their_property_names() {
+    let (_dir, registry) = registry();
+    let definitions = registry.definitions();
+    let props = |index: usize| -> Vec<&str> {
+        let object = definitions[index].parameters["properties"]
+            .as_object()
+            .expect("properties object");
+        let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(props(0), ["command", "timeout_seconds", "workdir"]);
+    assert_eq!(props(1), ["end_line", "path", "start_line"]);
+    assert_eq!(props(2), ["content", "path"]);
+    assert_eq!(props(3), ["new_string", "old_string", "path"]);
+}

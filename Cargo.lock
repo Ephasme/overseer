@@ -814,6 +814,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "overseer-fake-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
+
+[[package]]
 name = "overseer-server"
 version = "0.1.0"
 

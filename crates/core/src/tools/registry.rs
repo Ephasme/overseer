@@ -13,12 +13,39 @@ use crate::llm::ToolDefinition;
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     cwd: PathBuf,
+    /// When set, a path argument that resolves outside `cwd` is refused instead of honoured.
+    confined: bool,
 }
 
 impl ToolRegistry {
+    /// Rooted at `cwd`, which should be absolute: relative paths are resolved against it.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            confined: false,
+        }
+    }
+
+    /// Refuses every path argument that resolves outside the session directory.
+    #[must_use]
+    pub fn confined(mut self) -> Self {
+        self.confined = true;
+        self
+    }
+
+    /// `Some(message)` when a path argument escapes a confined root.
+    fn scope_check(&self, path: Option<&str>) -> Option<String> {
+        if !self.confined {
+            return None;
+        }
+        let path = path?;
+        let root = normalize(&self.cwd);
+        if normalize(&self.cwd.join(path)).starts_with(&root) {
+            None
+        } else {
+            Some(format!("path {path:?} is outside the session directory"))
+        }
     }
 
     /// The tools as the model sees them, in the order they are offered.
@@ -108,19 +135,31 @@ impl ToolRegistry {
     ) -> ToolOutcome {
         match name {
             "bash" => match parse::<BashArgs>(arguments) {
-                Ok(args) => bash::run(&self.cwd, args, progress, cancel).await,
+                Ok(args) => match self.scope_check(args.workdir.as_deref()) {
+                    Some(message) => ToolOutcome::error(message),
+                    None => bash::run(&self.cwd, args, progress, cancel).await,
+                },
                 Err(message) => ToolOutcome::error(message),
             },
             "read_file" => match parse::<ReadArgs>(arguments) {
-                Ok(args) => files::read(&self.cwd, args).await,
+                Ok(args) => match self.scope_check(Some(&args.path)) {
+                    Some(message) => ToolOutcome::error(message),
+                    None => files::read(&self.cwd, args).await,
+                },
                 Err(message) => ToolOutcome::error(message),
             },
             "write_file" => match parse::<WriteArgs>(arguments) {
-                Ok(args) => files::write(&self.cwd, args).await,
+                Ok(args) => match self.scope_check(Some(&args.path)) {
+                    Some(message) => ToolOutcome::error(message),
+                    None => files::write(&self.cwd, args).await,
+                },
                 Err(message) => ToolOutcome::error(message),
             },
             "edit_file" => match parse::<EditArgs>(arguments) {
-                Ok(args) => files::edit(&self.cwd, args).await,
+                Ok(args) => match self.scope_check(Some(&args.path)) {
+                    Some(message) => ToolOutcome::error(message),
+                    None => files::edit(&self.cwd, args).await,
+                },
                 Err(message) => ToolOutcome::error(message),
             },
             other => {
@@ -136,6 +175,24 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+/// Lexical normalization: resolves `.` and `..` without touching the filesystem, so a confined
+/// check cannot be defeated by a path that does not exist yet.
+fn normalize(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn parse<A: for<'de> Deserialize<'de>>(arguments: &str) -> Result<A, String> {
